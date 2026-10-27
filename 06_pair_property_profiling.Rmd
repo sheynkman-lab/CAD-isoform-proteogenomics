@@ -1,0 +1,628 @@
+---
+title: "Per-pair protein-property profiling of risk and nonrisk isoform pairs"
+output: html_document
+---
+
+## Purpose
+
+For every risk/nonrisk isoform pair this script asks which predicted protein property most
+strongly distinguishes the two members of the pair. The isoform-level property table from
+`03_protein_feature_annotation.Rmd` holds, for each pair, the risk-minus-nonrisk difference
+of every property (Pfam domain content, intrinsic disorder, NetSurfP-3.0 relative solvent
+accessibility and secondary structure, DeepLoc compartment probabilities, PTM counts,
+AAindex residue indices, AlphaFold3 geometry). Because the properties live on incomparable
+scales, each difference is divided by the standard deviation of that property across all
+pairs, so that a scaled difference of 1 means "one SD of between-pair variation". Redundant
+predictors of the same property (for example NetSurfP and AlphaFold3 estimates of coil
+content) are collapsed to the strongest, properties are grouped into five families (fold and
+disorder, localization, PTM, residue biochemistry, domain content), and the property with the
+largest absolute scaled difference defines the pair's dominant change; pairs whose strongest
+change is below 1 SD are classed as minimal/mixed. The same scaled differences are averaged
+into oriented property axes for the heatmaps, and a per-pair sequence/structure similarity
+table is derived from the AlphaFold3 pairwise alignment metrics.
+
+## Manuscript outputs produced
+
+- Methods, "Per-pair property profiling" (feature exclusion, 30 % missingness rule,
+  SD scaling, ±3 cap, family grouping, 1-SD gate; 82 of 94 pairs with a dominant change).
+- Fig. 4h (direction of the dominant property change) — drawn by
+  `10_figure_and_table_generation.Rmd` from `per_pair_dominant_mode.csv`.
+- Extended Data Fig. 5d (property-difference heatmap, 94 pairs) and Extended Data Fig. 7a
+  (same heatmap for the 13 AP-MS bait pairs) — drawn by script 10 from the signature exports.
+- Supplementary Table 16 (dominant mode, property axes and similarity per pair) — assembled
+  by script 10 from `per_pair_dominant_mode.csv`, `pair_property_signatures_long.csv` and
+  `pair_structure_vs_sequence_similarity.csv`.
+
+## Inputs
+
+- `OUT_PROPERTY_ISOFORM_WIDE` — isoform-level property table, one row per pair, written by
+  script 03 (`<property>__delta`, `<property>__risk_value`, `<property>__nonrisk_value`).
+- `OUT_PAIRS_UNIFIED_FLAGGED` — unified pair table with the `include_in_isoform_stats` flag
+  (one pair per gene for genes with several pairs), written by script 02.
+- `F_APMS_BAIT_PAIRS` — the 13 isoform pairs cloned as AP-MS baits (gene, risk PB, nonrisk PB).
+
+## Outputs (all in `RES_06`)
+
+- `per_pair_dominant_mode.csv` — dominant change mode per pair (script 10: Fig. 4h, Table S16).
+- `pair_groupings_table.csv` — pair keys with mode, family and strength (script 10).
+- `pair_property_signatures_long.csv` — oriented axis scores per pair (script 10: ED Fig. 5d,
+  Table S16).
+- `apms_pair_property_signatures_long.csv`, `apms_bait_pairs.csv` — the same scores for the
+  13 AP-MS bait pairs, on the same scale (script 10: ED Fig. 7a).
+- `property_axis_order.csv` — axis order and family for the heatmaps (script 10).
+- `pair_structure_vs_sequence_similarity.csv` — per-pair sequence identity and TM-score
+  (script 10: ED Fig. 5d, ED Fig. 7a, Table S16).
+- `property_base_axis_map.csv`, `property_feature_sd.csv`, `property_feature_category.csv` —
+  provenance tables documenting the axis mapping, the scaling denominators and the feature
+  categories used.
+
+## Run order
+
+Requires `02_junction_isoform_mapping_and_pairs.Rmd` and `03_protein_feature_annotation.Rmd`.
+Feeds `10_figure_and_table_generation.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(stringsAsFactors = FALSE)
+```
+
+```{r libraries}
+source("config.R")
+library(tidyverse)
+set.seed(42)
+ensure_dir(RES_06)
+```
+
+# 1. Parameters
+
+The parameters below are the analysis choices stated in Methods ("Per-pair property
+profiling"). They are defined once here so that every downstream step uses the same values.
+
+```{r params}
+# Only the risk - nonrisk difference columns ("__delta") enter the profiling; the raw per-side
+# values are used solely to derive the similarity table.
+FEATURE_REP <- "delta"
+
+# Restrict to the pairs flagged include_in_isoform_stats (one pair per gene where a gene has
+# several), giving the 94 sQTL-derived pairs plus the manual AP-MS pairs.
+RESTRICT_TO_INCLUDED <- TRUE
+
+# Methods: "features with more than 30 % missing values were dropped".
+MAX_FEATURE_NA <- 0.30
+
+# Methods: "features measuring global similarity, size or prediction confidence were
+# excluded from profiling" -- they describe how different the isoforms are overall, not
+# which property differs.
+EXCLUDE_FEATURE_REGEX <- paste(c(
+  "pct_identity", "tm_score", "query_coverage", "length_ratio",
+  "n_gap_openings", "aligned_length",
+  "aa_mw", "aa_length",
+  "mean_plddt", "mean_pae", "nsp_mean_rsa",
+  "total_gap_length"
+), collapse = "|")
+
+# Methods: "pairs whose strongest change was below 1 s.d. were classified as minimal/mixed".
+GATE <- 1.0
+
+pair_key <- c("gene_name", "pair_type", "risk_pb", "nonrisk_pb")
+ID_COLS  <- c(pair_key, "cad_sqtl_junction")
+```
+
+# 2. Load the per-pair property table and the pair flags
+
+The property table has one row per (pair, CAD sQTL junction); pairs with several junctions
+are averaged to one row below. The flagged pair table supplies `include_in_isoform_stats`,
+which keeps one pair per gene so that genes with several colocalized clusters do not count
+more than once in the population statistics.
+
+```{r load}
+require_files(OUT_PROPERTY_ISOFORM_WIDE, OUT_PAIRS_UNIFIED_FLAGGED, F_APMS_BAIT_PAIRS)
+
+iso_wide <- read_csv(OUT_PROPERTY_ISOFORM_WIDE, show_col_types = FALSE)
+
+include_lookup <- NULL
+if (RESTRICT_TO_INCLUDED) {
+  flagged <- read_csv(OUT_PAIRS_UNIFIED_FLAGGED, show_col_types = FALSE)
+  stopifnot(all(c("risk_pb", "nonrisk_pb", "include_in_isoform_stats") %in% names(flagged)))
+  include_lookup <- flagged %>%
+    group_by(risk_pb, nonrisk_pb) %>%
+    summarise(include_in_isoform_stats = any(include_in_isoform_stats, na.rm = TRUE),
+              .groups = "drop")
+}
+cat(sprintf("property table: %d rows x %d columns\n", nrow(iso_wide), ncol(iso_wide)))
+```
+
+# 3. Build the per-pair feature matrix
+
+One row per pair and one column per property difference. Features are removed if they are
+too sparse (the 30 % rule), have zero variance (no information to scale), or measure global
+similarity, size or prediction confidence rather than a specific property.
+
+```{r feature_matrix}
+value_suffix <- "__delta$"
+
+pick_features <- function(df) {
+  feat_cols <- names(df)[str_detect(names(df), value_suffix)]
+  feat_cols <- feat_cols[vapply(df[feat_cols], is.numeric, logical(1))]
+  df %>% select(any_of(ID_COLS), all_of(feat_cols))
+}
+feat_mat <- pick_features(iso_wide)
+
+# Collapse to one row per pair (a pair may be listed under more than one junction).
+feat_cols_all <- setdiff(names(feat_mat), ID_COLS)
+feat_mat <- feat_mat %>%
+  group_by(across(any_of(pair_key))) %>%
+  summarise(across(all_of(feat_cols_all), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+if (!is.null(include_lookup)) {
+  before <- nrow(feat_mat)
+  feat_mat <- feat_mat %>%
+    left_join(include_lookup, by = c("risk_pb", "nonrisk_pb")) %>%
+    filter(is.na(include_in_isoform_stats) | include_in_isoform_stats) %>%
+    select(-any_of("include_in_isoform_stats"))
+  cat(sprintf("include_in_isoform_stats restriction: %d -> %d pairs\n", before, nrow(feat_mat)))
+}
+
+# Drop sparse features (> MAX_FEATURE_NA missing).
+feat_cols <- setdiff(names(feat_mat), pair_key)
+na_frac   <- vapply(feat_mat[feat_cols], function(x) mean(is.na(x) | is.nan(x)), numeric(1))
+feat_cols <- setdiff(feat_cols, names(na_frac)[na_frac > MAX_FEATURE_NA])
+
+# Drop zero-variance features (cannot be scaled).
+var0 <- feat_cols[vapply(feat_mat[feat_cols],
+                         function(x) { x <- x[is.finite(x)]; length(x) < 2 || sd(x) == 0 },
+                         logical(1))]
+feat_cols <- setdiff(feat_cols, var0)
+
+# Drop similarity / size / confidence features.
+feat_cols <- feat_cols[!str_detect(feat_cols, EXCLUDE_FEATURE_REGEX)]
+
+cat(sprintf("feature matrix: %d pairs x %d property differences\n",
+            nrow(feat_mat), length(feat_cols)))
+```
+
+# 4. Property categories, families and display names
+
+Each feature is assigned to a category from its name, and categories are merged into the five
+families used in the manuscript. Structure and disorder form one family because their
+predictors are strongly collinear (a more disordered isoform is also less helical and more
+solvent exposed), so counting them separately would double-weight a single change.
+
+```{r property_categories}
+categorize <- function(feat) {
+  stem <- str_remove(feat, "__(delta|risk_value|nonrisk_value)$")
+  dplyr::case_when(
+    str_detect(stem, "helix|sheet|coil|rsa|plddt|radius_of_gyration|secondary") ~ "Structure",
+    str_detect(stem, "idr|disorder")                                            ~ "Disorder",
+    str_detect(stem, "pfam|domain")                                             ~ "Domains",
+    str_detect(stem, "ptm")                                                     ~ "PTM",
+    str_detect(stem, paste0("deeploc|membrane|signal|cytoplasm|nucleus|extracellular|",
+                            "mitochond|^loc_|localiz|lysosome|peroxisome|golgi|^er_|plastid")) ~ "Localization",
+    str_detect(stem, "tm_score|pct_identity|coverage|gap|length_ratio|aligned") ~ "StructSimilarity",
+    str_detect(stem, "aa_length|^length|n_exons")                               ~ "Size",
+    str_detect(stem, paste0("hydropath|polarity|volume|flexibility|grantham|kyte|zimmerman|",
+                            "aa_hydro|aa_mw|aa_charge"))                        ~ "Biochemical",
+    TRUE                                                                        ~ "Other"
+  )
+}
+feat_category <- tibble(feature = feat_cols, category = categorize(feat_cols)) %>%
+  # AlphaFold3 loop fraction is a secondary-structure measure; surface charge is a
+  # biochemical property rather than a structural one.
+  mutate(category = dplyr::case_when(
+    str_detect(feature, "pct_loop")       ~ "Structure",
+    str_detect(feature, "surface_charge") ~ "Biochemical",
+    TRUE                                  ~ category))
+
+family_of <- function(category) dplyr::case_when(
+  category %in% c("Structure", "Disorder") ~ "Fold & disorder",
+  category == "Localization"               ~ "Localization",
+  category == "Biochemical"                ~ "Biochemistry",
+  category == "Domains"                    ~ "Domains",
+  category == "PTM"                        ~ "PTM",
+  TRUE                                     ~ "Other"
+)
+feat_category <- feat_category %>% mutate(family = family_of(category))
+
+# Readable property names for the exported tables.
+pretty_prop <- c(
+  nsp_pct_rsa  = "RSA (%)", nsp_mean_rsa = "RSA (mean)",
+  nsp_pct_sheet = "β-sheet", nsp_pct_helix = "α-helix", nsp_pct_coil = "coil",
+  idr_percent = "IDR%", idr_pct_disordered = "disorder",
+  pfam_n_domains = "domain count", pfam_n_unique_domains = "unique domains",
+  ptm_total = "PTM count", ptm_pct_exposed = "exposed PTMs",
+  radius_of_gyration = "radius of gyration",
+  hydropathy = "hydropathy", polarity = "polarity",
+  volume = "volume", flexibility = "flexibility")
+nice <- function(stem) {
+  out <- ifelse(stem %in% names(pretty_prop), pretty_prop[stem],
+                str_replace_all(str_remove(stem, "^(af3_|nsp_|deeploc_|iso_)"), "_", " "))
+  unname(out)
+}
+
+# Methods: "redundant predictors of the same property were collapsed to the strongest".
+# Features describing global divergence (alignment statistics) and the AlphaFold3 pTM
+# fold-confidence score are excluded from the profiling at this stage.
+PROFILE_EXCLUDE <- paste(c(
+  "total_gap_length", "n_gap", "aligned_length", "pct_identity",
+  "tm_score", "coverage", "length_ratio", "annot_overlap",
+  "af3_iso_ptm$", "af3_ptm$"
+), collapse = "|")
+
+# Predictor-agnostic base property: af3_/af3_iso_/nsp_ variants of one property collapse to
+# a single stem, and AlphaFold3 "loop" is unified with NetSurfP "coil".
+base_stem_of <- function(stem) {
+  b <- stringr::str_remove(stem, "^(af3_iso_|af3_|nsp_|iso_)")
+  stringr::str_replace(b, "pct_loop", "pct_coil")
+}
+
+# One row per (pair, base property): the predictor variant with the largest |scaled delta|.
+make_dedup <- function(pr) {
+  pr %>%
+    filter(is.finite(scaled_delta), !str_detect(stem, PROFILE_EXCLUDE)) %>%
+    mutate(base = base_stem_of(stem), family = family_of(category)) %>%
+    group_by(across(all_of(pair_key)), base) %>%
+    slice_max(abs_scaled, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+# Axis -> family lookup used when the signature axes are exported.
+AXIS_FAMILY <- c(
+  "Disorder/openness" = "Fold & disorder", "Domain content" = "Domains",
+  "PTM load" = "PTM", "Hydrophobicity" = "Biochemistry",
+  "Surface charge" = "Biochemistry", "Residue bulk" = "Biochemistry",
+  "Loc: membrane" = "Localization", "Loc: secreted" = "Localization",
+  "Loc: nucleus" = "Localization", "Loc: mitochondrion" = "Localization",
+  "Loc: peroxisome" = "Localization", "Loc: ER" = "Localization")
+```
+
+# 5. Scaled property differences
+
+Each risk-minus-nonrisk difference is divided by the standard deviation of that property
+across all pairs, so that properties measured in different units become comparable; the sign
+records whether the risk-associated isoform has the higher (positive) or lower (negative)
+value. Properties are then ranked within each pair by absolute scaled difference, and the
+collapsed table `dd` (one row per pair and base property) is the input to every later step.
+
+```{r scaled_deltas}
+# Scaling denominator: SD of each property difference across pairs.
+delta_sd <- vapply(feat_mat[feat_cols], function(x) {
+  x <- x[is.finite(x)]; if (length(x) < 2) NA_real_ else sd(x)
+}, numeric(1))
+delta_sd[!is.finite(delta_sd) | delta_sd == 0] <- NA
+
+pair_long <- feat_mat %>%
+  select(all_of(pair_key), all_of(feat_cols)) %>%
+  pivot_longer(all_of(feat_cols), names_to = "feature", values_to = "delta") %>%
+  mutate(
+    stem         = str_remove(feature, "__delta$"),
+    sd_feat      = delta_sd[feature],
+    scaled_delta = delta / sd_feat,
+    abs_scaled   = abs(scaled_delta),
+    direction    = case_when(delta > 0 ~ "risk_higher",
+                             delta < 0 ~ "risk_lower",
+                             TRUE      ~ "no_change"),
+    dir_sign     = case_when(delta > 0 ~  1L,
+                             delta < 0 ~ -1L,
+                             TRUE      ~  0L)) %>%
+  left_join(feat_category, by = "feature") %>%
+  filter(is.finite(scaled_delta))
+
+pair_ranked <- pair_long %>%
+  group_by(across(all_of(pair_key))) %>%
+  arrange(desc(abs_scaled), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  ungroup()
+
+dd <- make_dedup(pair_ranked)
+# The dominant-mode call takes the second-ranked row per pair; duplicated rows would make
+# that a copy of the first and collapse the clarity margin to zero.
+stopifnot(!any(duplicated(dd[intersect(c(pair_key, "stem", "feature"), names(dd))])))
+```
+
+# 6. Oriented property axes
+
+For the heatmaps, base properties are grouped into interpretable axes with a fixed orientation
+so that a positive score always means the risk-associated isoform shifts toward the named pole
+(more disordered/open, more domains, more PTMs, more hydrophobic, more positive surface, bulkier
+residues, more of a compartment). Helix and sheet content, polarity and flexibility enter with
+negative orientation because they move opposite to the axis they describe. Each axis score is
+the mean oriented scaled difference of its member properties.
+
+```{r signature_axes}
+AXIS_MAP <- tibble::tribble(
+  ~axis,                ~base_regex,                                 ~orient,
+  "Disorder/openness",  "idr|disorder",                               1,
+  "Disorder/openness",  "^pct_coil$",                                 1,
+  "Disorder/openness",  "^pct_rsa$",                                  1,
+  "Disorder/openness",  "radius_of_gyration",                         1,
+  "Disorder/openness",  "^pct_helix$",                               -1,
+  "Disorder/openness",  "^pct_sheet$",                               -1,
+  "Domain content",     "^pfam_n_domains$|^pfam_n_unique_domains$",    1,
+  "PTM load",           "^ptm_",                                      1,
+  "Hydrophobicity",     "^hydropathy$",                               1,
+  "Hydrophobicity",     "^polarity$",                                -1,
+  "Surface charge",     "surface_charge",                             1,
+  "Residue bulk",       "^volume$",                                   1,
+  "Residue bulk",       "^flexibility$",                             -1,
+  "Loc: membrane",      "cell_membrane",                              1,
+  "Loc: secreted",      "extracellular",                              1,
+  "Loc: nucleus",       "deeploc_nucleus",                            1,
+  "Loc: mitochondrion", "mitochond",                                  1,
+  "Loc: peroxisome",    "peroxisome",                                 1,
+  "Loc: ER",            "endoplasmic|reticulum",                      1
+)
+AXIS_LEVELS <- unique(AXIS_MAP$axis)
+
+# Each base property maps to the first matching axis; unmapped properties are not plotted.
+base_axis <- bind_rows(lapply(unique(dd$base), function(b) {
+  hit <- which(stringr::str_detect(b, AXIS_MAP$base_regex))
+  if (length(hit)) tibble(base = b, axis = AXIS_MAP$axis[hit[1]], orient = AXIS_MAP$orient[hit[1]])
+  else             tibble(base = b, axis = NA_character_, orient = NA_real_)
+})) %>% filter(!is.na(axis))
+cat(sprintf("%d base properties mapped to %d axes\n", nrow(base_axis), length(AXIS_LEVELS)))
+
+# Per-pair oriented signature: mean(orient * scaled_delta) within each axis.
+sig_long <- dd %>%
+  inner_join(base_axis, by = "base") %>%
+  mutate(oriented = orient * scaled_delta) %>%
+  group_by(across(all_of(pair_key)), axis) %>%
+  summarise(score = mean(oriented, na.rm = TRUE), .groups = "drop")
+```
+
+# 7. Dominant change mode per pair
+
+The dominant mode is the base property with the largest absolute scaled difference in the pair,
+reported as an oriented axis (the mode map extends the heatmap axes to every DeepLoc
+compartment) with its family and direction. A pair whose strongest change is below `GATE`
+(1 SD) is classed as minimal/mixed, because no single property separates the two isoforms
+more than the typical between-pair spread.
+
+```{r dominant_change_mode}
+MODE_MAP <- tibble::tribble(
+  ~mode_axis,           ~base_regex,                                 ~orient,
+  "Disorder/openness",  "idr|disorder",                               1,
+  "Disorder/openness",  "^pct_coil$",                                 1,
+  "Disorder/openness",  "^pct_rsa$",                                  1,
+  "Disorder/openness",  "radius_of_gyration",                         1,
+  "Disorder/openness",  "^pct_helix$",                               -1,
+  "Disorder/openness",  "^pct_sheet$",                               -1,
+  "Domain content",     "^pfam_n_domains$|^pfam_n_unique_domains$",    1,
+  "PTM load",           "^ptm_",                                      1,
+  "Hydrophobicity",     "^hydropathy$",                               1,
+  "Hydrophobicity",     "^polarity$",                                -1,
+  "Surface charge",     "surface_charge",                             1,
+  "Residue bulk",       "^volume$",                                   1,
+  "Residue bulk",       "^flexibility$",                             -1,
+  "Loc: membrane",      "cell_membrane",                              1,
+  "Loc: secreted",      "extracellular",                              1,
+  "Loc: nucleus",       "deeploc_nucleus",                            1,
+  "Loc: cytoplasm",     "cytoplasm",                                  1,
+  "Loc: mitochondrion", "mitochond",                                  1,
+  "Loc: peroxisome",    "peroxisome",                                 1,
+  "Loc: ER",            "endoplasmic|reticulum",                      1,
+  "Loc: Golgi",         "golgi",                                      1,
+  "Loc: lysosome",      "lysosome",                                   1
+)
+MODE_PHRASE <- tibble::tribble(
+  ~mode_axis,           ~up,                       ~down,
+  "Disorder/openness",  "more disordered/exposed", "more ordered/compact",
+  "Domain content",     "gains domains",           "loses domains",
+  "PTM load",           "more PTMs",               "fewer PTMs",
+  "Hydrophobicity",     "more hydrophobic",        "more polar",
+  "Surface charge",     "more positive surface",   "more negative surface",
+  "Residue bulk",       "bulkier/rigid",           "smaller/flexible",
+  "Loc: membrane",      "more membrane",           "less membrane",
+  "Loc: secreted",      "more secreted",           "less secreted",
+  "Loc: nucleus",       "more nuclear",            "less nuclear",
+  "Loc: cytoplasm",     "more cytoplasmic",        "less cytoplasmic",
+  "Loc: mitochondrion", "more mitochondrial",      "less mitochondrial",
+  "Loc: peroxisome",    "more peroxisomal",        "less peroxisomal",
+  "Loc: ER",            "more ER",                 "less ER",
+  "Loc: Golgi",         "more Golgi",              "less Golgi",
+  "Loc: lysosome",      "more lysosomal",          "less lysosomal",
+  "Other",              "higher (other property)", "lower (other property)"
+)
+mode_family_of <- function(ax) dplyr::case_when(
+  str_detect(ax, "^Loc:")                                      ~ "Localization",
+  ax == "Disorder/openness"                                    ~ "Fold & disorder",
+  ax == "Domain content"                                       ~ "Domains",
+  ax == "PTM load"                                             ~ "PTM",
+  ax %in% c("Hydrophobicity", "Surface charge", "Residue bulk") ~ "Biochemistry",
+  TRUE                                                         ~ "Other")
+mode_phrase <- function(ax, ori) {
+  i <- match(ax, MODE_PHRASE$mode_axis)
+  ifelse(ori > 0, MODE_PHRASE$up[i], MODE_PHRASE$down[i])
+}
+
+# Base property -> first matching mode axis ("Other" if none).
+base_mode <- bind_rows(lapply(unique(dd$base), function(b) {
+  hit <- which(stringr::str_detect(b, MODE_MAP$base_regex))
+  if (length(hit)) tibble(base = b, mode_axis = MODE_MAP$mode_axis[hit[1]], orient = MODE_MAP$orient[hit[1]])
+  else             tibble(base = b, mode_axis = "Other", orient = 1)
+}))
+
+pair_modes <- dd %>%
+  left_join(base_mode, by = "base") %>%
+  mutate(oriented = orient * scaled_delta) %>%
+  group_by(across(all_of(pair_key))) %>%
+  arrange(desc(abs_scaled), .by_group = TRUE) %>%
+  summarise(
+    mode_axis       = dplyr::first(mode_axis),
+    mode_oriented   = dplyr::first(oriented),
+    mode_strength   = dplyr::first(abs_scaled),
+    top_property    = nice(dplyr::first(stem)),
+    second_axis     = dplyr::nth(mode_axis, 2),
+    second_strength = dplyr::nth(abs_scaled, 2),
+    .groups = "drop") %>%
+  mutate(
+    clarity     = mode_strength - dplyr::coalesce(second_strength, 0),
+    gated       = mode_strength < GATE,
+    mode_dir    = ifelse(mode_oriented > 0, "up", "down"),
+    mode_sign   = ifelse(mode_oriented > 0, 1L, -1L),
+    mode_family = ifelse(gated, "Minimal", mode_family_of(mode_axis)),
+    mode_label  = ifelse(gated, "minimal / mixed change", mode_phrase(mode_axis, mode_oriented)),
+    mode        = ifelse(gated, "Minimal / mixed", paste0(mode_axis, " ", mode_dir)),
+    # Display variant with arrows, used only for figure labels.
+    mode_display = ifelse(gated, "Minimal / mixed",
+                          paste0(mode_axis, " ", ifelse(mode_oriented > 0, "↑", "↓"))))
+
+# Keep the row order of the feature matrix.
+pair_modes <- feat_mat %>% select(all_of(pair_key)) %>% left_join(pair_modes, by = pair_key)
+write_excel_csv(pair_modes, OUT_PAIR_DOMINANT_MODE)
+
+n_sqtl <- sum(pair_modes$pair_type != "manual_apms")
+cat(sprintf("pairs: %d (%d sQTL-derived); with a dominant mode: %d; minimal/mixed: %d\n",
+            nrow(pair_modes), n_sqtl,
+            sum(!pair_modes$gated & pair_modes$pair_type != "manual_apms"),
+            sum(pair_modes$gated  & pair_modes$pair_type != "manual_apms")))
+
+# Compact grouping table (one row per pair) for the figure script.
+grouping_tbl <- pair_modes %>%
+  select(any_of(c(pair_key, "mode_family", "mode", "mode_dir", "mode_sign",
+                  "mode_label", "top_property", "mode_strength", "clarity", "gated"))) %>%
+  arrange(mode_family, mode, desc(mode_strength))
+write_excel_csv(grouping_tbl, OUT_PAIR_GROUPINGS)
+```
+
+# 8. Sequence and structure similarity per pair
+
+The AlphaFold3 pairwise alignment metrics (TM-score and percent identity between the risk and
+nonrisk models) are excluded from the profiling but are reported alongside the heatmaps and in
+Supplementary Table 16, because they show how different the two isoforms are overall. The
+metrics may be stored in the per-side value columns or in the single `__delta` slot of the
+property table, so the populated slot is selected at run time.
+
+```{r similarity_table}
+STRUCT_BASE <- "af3_pair_tm_score"      # structural similarity: TM-score, risk vs nonrisk model
+SEQ_BASE    <- "af3_pair_pct_identity"  # sequence similarity: % identity over the alignment
+
+num <- function(x) suppressWarnings(as.numeric(x))
+
+# Report which of the candidate columns hold finite values for a metric.
+slot_report <- function(base) {
+  cand <- paste0(base, c("__risk_value", "__nonrisk_value", "__delta"))
+  cand <- cand[cand %in% names(iso_wide)]
+  tibble(column   = cand,
+         n_finite = vapply(cand, function(c) sum(is.finite(num(iso_wide[[c]]))), integer(1)))
+}
+
+# Use the per-side columns when populated (averaging both perspectives), otherwise the
+# best-populated single slot.
+pick_pair_value <- function(base) {
+  rep <- slot_report(base)
+  rep <- rep[rep$n_finite > 0, , drop = FALSE]
+  if (!nrow(rep)) stop("no finite values in any slot for ", base)
+  persp <- rep$column[grepl("__risk_value|__nonrisk_value", rep$column)]
+  use   <- if (length(persp)) persp else rep$column[which.max(rep$n_finite)]
+  m <- vapply(use, function(c) num(iso_wide[[c]]), numeric(nrow(iso_wide)))
+  if (is.null(dim(m))) m <- matrix(m, ncol = 1)
+  list(value = rowMeans(m, na.rm = TRUE), used = use)
+}
+
+ps <- pick_pair_value(STRUCT_BASE)
+pq <- pick_pair_value(SEQ_BASE)
+
+sim_tbl <- iso_wide %>%
+  mutate(.struct = ps$value,
+         # seq_sim is a GLOBAL identity: identical residues over the longer isoform
+         # (% identity x aligned length / max isoform length), so that a pair in which one
+         # isoform is a truncation of the other scores low even if the aligned part matches.
+         .seq = pq$value * num(af3_pair_aligned_length__delta) /
+                pmax(num(aa_length__risk_value), num(aa_length__nonrisk_value)),
+         .seq_local  = pq$value,                       # local identity over the alignment
+         .len_ratio  = num(af3_pair_length_ratio__delta)) %>%
+  group_by(across(all_of(pair_key))) %>%
+  summarise(struct_sim    = mean(.struct,    na.rm = TRUE),
+            seq_sim       = mean(.seq,       na.rm = TRUE),
+            seq_sim_local = mean(.seq_local, na.rm = TRUE),
+            length_ratio  = mean(.len_ratio, na.rm = TRUE), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.), NA, .))) %>%
+  filter(is.finite(struct_sim), is.finite(seq_sim))
+write_csv(sim_tbl, OUT_PAIR_SIMILARITY)
+cat(sprintf("similarity table: %d pairs\n", nrow(sim_tbl)))
+```
+
+# 9. Exports for the figure script
+
+Two heatmaps are drawn downstream: Extended Data Fig. 5d for the 94 sQTL-derived pairs and
+Extended Data Fig. 7a for the 13 AP-MS bait pairs. Seven of the 13 bait pairs are not in the
+feature matrix, because their gene already contributes a systematically derived pair, so their
+signature is computed here with the same scaling denominators (`delta_sd`), the same
+deduplication and the same axis orientation; the two panels therefore sit on one scale.
+
+```{r export_signatures}
+# ---- the 13 AP-MS bait pairs ------------------------------------------------
+bait <- read_csv(F_APMS_BAIT_PAIRS, show_col_types = FALSE)
+names(bait) <- gsub("^﻿", "", names(bait))   # the header carries a byte-order mark
+manual <- bait %>%
+  transmute(gene_name  = .data[[grep("Gene", names(bait), value = TRUE)[1]]],
+            risk_pb    = str_extract(risk, "PB\\.[0-9]+\\.[0-9]+"),
+            nonrisk_pb = str_extract(.data[[grep("^non", names(bait),
+                                                 ignore.case = TRUE, value = TRUE)[1]]],
+                                     "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(risk_pb), !is.na(nonrisk_pb))
+cat(sprintf("AP-MS bait pairs: %d (%d already in the feature matrix)\n", nrow(manual),
+            nrow(semi_join(feat_mat, manual, by = c("gene_name", "risk_pb", "nonrisk_pb")))))
+
+# Signature for the bait pairs, scaled with the population delta_sd.
+apms_feat <- iso_wide %>%
+  semi_join(manual, by = c("gene_name", "risk_pb", "nonrisk_pb")) %>%
+  select(any_of(pair_key), all_of(intersect(feat_cols, names(iso_wide)))) %>%
+  group_by(across(any_of(pair_key))) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+apms_long <- apms_feat %>%
+  pivot_longer(all_of(intersect(feat_cols, names(apms_feat))),
+               names_to = "feature", values_to = "delta") %>%
+  mutate(stem         = str_remove(feature, "__delta$"),
+         sd_feat      = delta_sd[feature],
+         scaled_delta = delta / sd_feat,
+         abs_scaled   = abs(scaled_delta),
+         direction    = case_when(delta > 0 ~ "risk_higher",
+                                  delta < 0 ~ "risk_lower",
+                                  TRUE      ~ "no_change"),
+         dir_sign     = sign(delta)) %>%
+  left_join(feat_category, by = "feature") %>%
+  filter(is.finite(scaled_delta)) %>%
+  group_by(across(all_of(pair_key))) %>%
+  arrange(desc(abs_scaled), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  ungroup()
+
+apms_dd  <- make_dedup(apms_long)
+apms_sig <- apms_dd %>%
+  inner_join(base_axis, by = "base") %>%
+  mutate(oriented = orient * scaled_delta) %>%
+  group_by(across(all_of(pair_key)), axis) %>%
+  summarise(score = mean(oriented, na.rm = TRUE), .groups = "drop") %>%
+  mutate(axis = factor(axis, levels = AXIS_LEVELS))
+missed <- manual %>% anti_join(apms_sig, by = c("gene_name", "risk_pb", "nonrisk_pb"))
+if (nrow(missed)) warning(sprintf("%d bait pair(s) without a signature", nrow(missed)))
+write_excel_csv(apms_sig, OUT_APMS_PAIR_SIGNATURES)
+write_excel_csv(manual,   OUT_APMS_BAIT_PAIRS)
+
+# ---- the sQTL-derived pairs ---------------------------------------------------
+sqtl_sig <- sig_long %>%
+  left_join(pair_modes %>% select(all_of(pair_key), mode_family, mode_strength,
+                                  mode_axis, mode_oriented, gated),
+            by = pair_key) %>%
+  mutate(axis = factor(axis, levels = AXIS_LEVELS))
+write_excel_csv(sqtl_sig, OUT_PAIR_SIGNATURES_LONG)
+
+# ---- lookups and provenance tables -------------------------------------------
+write_excel_csv(tibble(axis = AXIS_LEVELS, family = unname(AXIS_FAMILY[AXIS_LEVELS])),
+                OUT_PROPERTY_AXIS_ORDER)
+write_excel_csv(base_axis,     file.path(RES_06, "property_base_axis_map.csv"))
+write_excel_csv(tibble(feature = names(delta_sd), sd = unname(delta_sd)),
+                file.path(RES_06, "property_feature_sd.csv"))
+write_excel_csv(feat_category, file.path(RES_06, "property_feature_category.csv"))
+
+cat(sprintf("exported %d pair x axis rows (sQTL pairs) and %d (AP-MS pairs)\n",
+            nrow(sqtl_sig), nrow(apms_sig)))
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

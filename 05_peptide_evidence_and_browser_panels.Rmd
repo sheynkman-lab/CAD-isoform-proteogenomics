@@ -1,0 +1,2853 @@
+---
+title: "Peptide-to-isoform evidence mapping and genome-browser panels"
+output: html_document
+---
+
+## Purpose
+
+CAD sQTL junctions were assigned to full-length VSMC transcript and protein isoforms in the
+preceding scripts, but the predicted proteome is derived from transcript sequence, so this script
+asks which of those isoforms are supported at the protein level. Peptides detected by discovery
+proteomics (DDA and real-time-search acquisitions) and by targeted IS-PRM are matched by
+sequence to the Cleaver in-silico digest of the predicted proteome, which gives the complete set
+of isoforms each peptide can evidence independently of where PoGo placed it on the genome.
+Each peptide is then classified against the risk-associated and nonrisk-associated isoform sets
+of a CAD cluster (and of each CAD junction) as Risk, Nonrisk, Both (shared) or Neither; only
+Risk and Nonrisk peptides count as isoform validation because shared sequence cannot
+distinguish the two products. The same script holds the genome-browser plotting machinery and
+draws every browser panel in the manuscript, because those panels show the isoforms and
+peptides chosen by the evidence tables built here.
+
+## Manuscript outputs produced
+
+- Numbers in Results: CAD sGenes with detected peptides (124 of 168), peptides at CAD sQTL
+  junctions and the shared fraction (578 / 405), probeable junctions with isoform-unique peptide
+  support (67 of 133); Methods: the 173 IS-PRM target peptides by specificity class.
+- Supplementary Table 12 (peptide evidence in CAD sGenes) and the peptide-evidence columns of
+  Supplementary Table 13 (junction master), assembled by `10_figure_and_table_generation.Rmd`.
+- Source tables for Fig. 4g, Extended Data Fig. 4a and Extended Data Fig. 5c (plotted in script 10).
+- Genome-browser panels: Fig. 1e, 2c, 2f, 3e, 3f, 4i, 6a, 6f, 6k; Extended Data Fig. 1b, 2d, 2f,
+  2h, 3g, 3h, 4b, 4d, 6a, 6c, 6e, 6g.
+
+## Inputs
+
+- `OUT_LFC_INTEGRATED` (script 01): CAD sQTL junctions with effect direction relative to the
+  CAD risk allele.
+- `OUT_PAIRS_UNIFIED_FLAGGED`, `OUT_JUNCTION_ISOFORM_MAP`, `OUT_CAD_JUNCTION_CODING`
+  (script 02): risk/nonrisk isoform pairs, junction-to-isoform map and junction coding class.
+- `F_SMC_GTF`, `F_SMC_EXON_COORDS`, `F_SQANTI_PROTEIN_CPM`, `F_SQANTI_PROTEIN_TSV`: long-read
+  transcript models, exon table and SQANTI Protein classification of the VSMC isoforms.
+- `F_GENCODE_V38_GTF`, `F_GENCODE_V38_EXONS`: GENCODE v38 models drawn alongside the long-read
+  isoforms.
+- `D_UNIPROT_BED`: UCSC UniProt track exports (hg38) for the protein-feature tracks.
+- `F_ISPRM_DETECTED`, `F_CAD173_TARGETS`, `F_POGO_*_BED`: IS-PRM detections, the IS-PRM target
+  list and PoGo genomic coordinates of all detected peptides.
+- `F_CLEAVER_DIGEST`: Cleaver tryptic digest of the hybrid VSMC/GENCODE proteome.
+- `F_CAD_SQTL_SNPS_LD`, `F_COLOC_WITH_SLOPES`, `F_RT_PCR_PRIMERS`: SNPs and RT-PCR amplicons for
+  the browser tracks.
+
+## Outputs (all in `RES_05`)
+
+- `peptide_isoform_evidence_detail.csv` — one row per evaluable peptide × cluster
+  (script 10: Fig. 4g source, Extended Data Fig. 4a, 5c).
+- `junction_validation_seqfirst.csv`, `exclusive_peptide_possibility_per_junction.csv`,
+  `junction_not_usable_reasons.csv` — junction-level validation (script 10: junction master,
+  Supplementary Table 13, Fig. 4g).
+- `evidence_chain.csv` — the junction counts quoted in the text.
+- `SuppTable_CAD_sGene_peptide_evidence.csv` — Supplementary Table 12.
+- `validated_interesting_isoform_candidates_bonafide.csv` — peptide-supported isoforms with
+  notable features (Extended Data Fig. 5c).
+- `isprm_cad173_target_summary.csv` — the 173 IS-PRM targets by specificity class.
+- `browser_panels/<panel>_<gene>.{png,svg}` (genomic view), `<panel>_<gene>_exonview.{png,svg}`
+  and `BROWSER_MANIFEST.csv`.
+
+## Run order
+
+Scripts 01 and 02 must have run. Within this file, run Part A (setup and plotting machinery),
+then Part B (peptide evidence), then Part C (browser panels); Part C reads `detail` from Part B.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 3.5, fig.height = 3.5, dpi = 300)
+options(tibble.width = Inf, scipen = 999)
+```
+
+# A. Setup and plotting machinery
+
+## 1. Libraries and paths
+
+```{r libraries_paths}
+source("config.R")
+library(tidyverse)
+library(rtracklayer)
+library(ggrepel)
+library(patchwork)
+library(ggtext)
+library(readxl)
+library(scales)
+
+# dplyr verbs are bound explicitly because rtracklayer loads S4 generics of the same name.
+slice     <- dplyr::slice
+filter    <- dplyr::filter
+select    <- dplyr::select
+rename    <- dplyr::rename
+reduce    <- purrr::reduce
+first     <- dplyr::first
+slice_max <- dplyr::slice_max
+slice_min <- dplyr::slice_min
+comma     <- scales::comma
+
+ensure_dir(RES_05, BROWSER_DIR)
+
+POGO_BEDS <- c("IS-PRM" = F_POGO_ISPRM_BED, EDJ = F_POGO_RTS_BED,
+               DDA = F_POGO_DDA_CAD_BED, LBZ = F_POGO_DDA_ALL_BED)
+UNIPROT_BEDS <- file.path(D_UNIPROT_BED, paste0(
+  c("unipLocSignal", "unipLocExtra", "unipLocTransMemb", "unipLocCytopl", "unipDomain",
+    "unipInterest", "unipStruct", "unipDisulfBond", "unipModif", "unipRepeat"), ".bed"))
+
+require_files(OUT_LFC_INTEGRATED, OUT_PAIRS_UNIFIED_FLAGGED, OUT_JUNCTION_ISOFORM_MAP,
+              OUT_CAD_JUNCTION_CODING, F_SMC_GTF, F_SMC_EXON_COORDS, F_SQANTI_PROTEIN_CPM,
+              F_SQANTI_PROTEIN_TSV, F_GENCODE_V38_GTF, F_GENCODE_V38_EXONS, POGO_BEDS,
+              F_ISPRM_DETECTED, F_CAD173_TARGETS, F_CLEAVER_DIGEST, F_CAD_SQTL_SNPS_LD,
+              F_COLOC_WITH_SLOPES, F_RT_PCR_PRIMERS, UNIPROT_BEDS)
+```
+
+## 2. Transcript models
+
+The long-read exon table carries one row per exon with `trans_id` of the form
+`GENE|PB.x.y|CPM`; CDS segments come from the GTF because the browser panels draw the coding
+portion of each transcript thicker than the UTRs.
+
+```{r load_smc_data}
+exon_data  <- read_tsv(F_SMC_EXON_COORDS, show_col_types = FALSE)
+smc_gtf_df <- as.data.frame(rtracklayer::import(F_SMC_GTF))
+cds_data   <- smc_gtf_df %>% filter(type == "CDS")
+```
+
+```{r load_cluster_data}
+# CAD sQTL junctions (script 01): one row per junction x condition; effect_direction is
+# relative to the CAD risk allele. The table serves both as the browser sQTL track
+# (cluster_data) and as the junction universe for the peptide evidence (lfc).
+cluster_data <- read_tsv(OUT_LFC_INTEGRATED, show_col_types = FALSE)
+if ("effect_direction" %in% names(cluster_data) && !"Effect_direction" %in% names(cluster_data))
+  cluster_data <- cluster_data %>% mutate(Effect_direction = effect_direction)
+lfc <- cluster_data
+# Every lead SNP must carry a single ref/alt assignment; two entries would make the
+# effect direction ambiguous.
+dup_snp <- lfc %>% distinct(SNP_ID, ref, alt) %>% count(SNP_ID) %>% filter(n > 1)
+stopifnot("a lead SNP carries two ref/alt entries in the integrated sQTL table" = nrow(dup_snp) == 0)
+cat(sprintf("cluster_data: %d junction rows | %d distinct junctions | %d genes\n",
+            nrow(cluster_data), n_distinct(cluster_data$junction_key),
+            n_distinct(cluster_data$gene_name)))
+```
+
+```{r load_pairs}
+# Risk/nonrisk isoform pairs (script 02). The plotting function branches on
+# risk_isoform / nonrisk_isoform (ENST-level pairs), so those columns are added as NA
+# and PB accessions are normalised to the bare PB.x.y form.
+risk_pairs <- read_csv(OUT_PAIRS_UNIFIED_FLAGGED, show_col_types = FALSE)
+stopifnot("expected risk_pb / nonrisk_pb" = all(c("risk_pb", "nonrisk_pb") %in% names(risk_pairs)))
+risk_pairs <- risk_pairs %>%
+  mutate(risk_pb    = coalesce(str_extract(risk_pb,    "PB\\.[0-9]+\\.[0-9]+"), risk_pb),
+         nonrisk_pb = coalesce(str_extract(nonrisk_pb, "PB\\.[0-9]+\\.[0-9]+"), nonrisk_pb),
+         risk_isoform = NA_character_, nonrisk_isoform = NA_character_)
+```
+
+```{r load_sqanti}
+# SQANTI Protein classification with CPM (pb, tx_cat, tx_subcat, pr_splice_cat, is_nmd, CPM,
+# gene, tx_transcripts).
+sqanti_protein_cpm <- read_csv(F_SQANTI_PROTEIN_CPM, show_col_types = FALSE)
+if (!"pb_acc" %in% names(sqanti_protein_cpm)) sqanti_protein_cpm$pb_acc <- sqanti_protein_cpm$pb
+```
+
+```{r load_gencode}
+gencode_exon_data <- read_tsv(F_GENCODE_V38_EXONS, show_col_types = FALSE)
+read_gencode_cds_from_gtf <- function(gtf_file) {
+  read_tsv(gtf_file, col_names = c("seqname", "source", "feature", "start", "end", "score",
+                                   "strand", "frame", "attribute"),
+           comment = "#", col_types = cols(.default = "c")) %>%
+    filter(feature == "CDS") %>%
+    transmute(transcript_id = str_extract(attribute, '(?<=transcript_id ")[^"]+'),
+              start = as.numeric(start), end = as.numeric(end))
+}
+gencode_cds_data <- read_gencode_cds_from_gtf(F_GENCODE_V38_GTF)
+```
+
+## 3. UniProt feature tracks
+
+The UCSC UniProt track BEDs are bigBed exports whose column count differs between tracks, so
+the full feature name and the UniProt accession are located by content rather than by position.
+BED coordinates are 0-based half-open and are shifted to 1-based here to match the GTF-derived
+transcript coordinates.
+
+```{r load_uniprot}
+read_uniprot_bed <- function(path) {
+  raw <- read_tsv(path, col_names = FALSE, col_types = cols(.default = "c"),
+                  show_col_types = FALSE)
+  std <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+           "thickStart", "thickEnd", "itemRgb", "blockCount", "blockSizes",
+           "chromStarts", "status1", "status2", "level", "source",
+           "review_status", "feature_type", "description", "feature_name", "uniprot_id")
+  names(raw)[seq_len(min(length(std), ncol(raw)))] <- std[seq_len(min(length(std), ncol(raw)))]
+
+  # Extra field with the full (untruncated) feature name; the `name` column may hold a
+  # placeholder such as "repeat".
+  full_name_col <- if (ncol(raw) >= 27) raw[[27]] else NA_character_
+
+  # UniProt accession pattern, searched across all columns.
+  acc_pat <- "^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})(-[0-9]+)?$"
+  acc <- apply(as.matrix(raw), 1, function(r) {
+    hit <- grep(acc_pat, trimws(r), value = TRUE)
+    if (length(hit)) hit[1] else NA_character_
+  })
+
+  raw %>%
+    mutate(
+      .full = na_if(trimws(full_name_col), ""),
+      name  = dplyr::if_else(!is.na(.full), .full, name),
+      .acc  = acc,
+      uniprot_id = dplyr::if_else(!is.na(.acc), .acc,
+                                  suppressWarnings(as.character(uniprot_id))),
+      chromStart = as.numeric(chromStart) + 1,
+      chromEnd   = as.numeric(chromEnd)   + 1) %>%
+    select(-.full, -.acc)
+}
+
+unip_signal        <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipLocSignal.bed"))
+unip_extracellular <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipLocExtra.bed"))
+unip_transmembrane <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipLocTransMemb.bed"))
+unip_cytoplasmic   <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipLocCytopl.bed"))
+unip_domain        <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipDomain.bed"))
+unip_interest      <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipInterest.bed"))
+unip_structure     <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipStruct.bed"))
+unip_disulfide     <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipDisulfBond.bed"))
+unip_modif         <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipModif.bed"))
+unip_repeat        <- read_uniprot_bed(file.path(D_UNIPROT_BED, "unipRepeat.bed"))
+```
+
+## 4. PoGo peptide coordinates
+
+PoGo places detected peptides on the genome for the browser peptide tracks. The IS-PRM BED is
+restricted to peptides present in the filtered Tomahto output because PoGo retains some
+peptides that did not pass the post-acquisition filters. `pogo_data` is used only for
+plotting; the peptide evidence in Part B is sequence-based and does not depend on PoGo
+placement.
+
+```{r read_pogo_bed}
+read_pogo_bed <- function(bed_file, skip_header = TRUE) {
+  col_names <- c("chrom", "chromStart", "chromEnd", "peptide_seq", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb", "blockCount", "blockSizes", "blockStarts")
+  read_tsv(bed_file, col_names = col_names, skip = if (skip_header) 1 else 0,
+           col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+    mutate(
+      chromStart = as.numeric(chromStart) + 1,
+      chromEnd   = as.numeric(chromEnd)   + 1,
+      blockCount = as.numeric(blockCount),
+      # PoGo colours peptides by specificity: red = isoform-specific, black = gene-specific,
+      # grey = shared between genes.
+      specificity = case_when(
+        itemRgb == "204,0,0"                         ~ "Isoform-specific",
+        itemRgb == "0,0,0"                           ~ "Gene-specific",
+        itemRgb %in% c("128,128,128", "169,169,169") ~ "Not gene-specific",
+        TRUE                                         ~ "Unknown"),
+      source_file = basename(bed_file))
+}
+pogo_tom <- read_pogo_bed(F_POGO_ISPRM_BED)
+pogo_edj <- read_pogo_bed(F_POGO_RTS_BED)
+pogo_dda <- read_pogo_bed(F_POGO_DDA_CAD_BED)
+pogo_lbz <- read_pogo_bed(F_POGO_DDA_ALL_BED)
+```
+
+```{r tom_pogo_filter}
+tom_results <- read_csv(F_ISPRM_DETECTED, show_col_types = FALSE)
+stopifnot("expected a 'Peptide' column in the IS-PRM output" = "Peptide" %in% names(tom_results))
+
+# Strip search-engine modification notation so that sequences compare on bare residues.
+bare_seq <- function(x) {
+  x %>%
+    str_remove_all("\\[[^\\]]*\\]") %>%
+    str_remove_all("\\([^\\)]*\\)") %>%
+    str_remove_all("[\\+\\-][0-9\\.]+") %>%
+    str_remove_all("[^A-Z]") %>%
+    toupper()
+}
+tom_peps  <- unique(bare_seq(tom_results$Peptide))
+tom_peps  <- tom_peps[nchar(tom_peps) > 0]
+pogo_peps <- unique(toupper(pogo_tom$peptide_seq))
+shared    <- intersect(pogo_peps, tom_peps)
+
+pogo_tom_filt <- pogo_tom %>% filter(toupper(peptide_seq) %in% shared)
+pogo_data     <- bind_rows(pogo_tom_filt, pogo_edj, pogo_dda, pogo_lbz)
+```
+
+## 5. SNPs and RT-PCR amplicons
+
+Lead sQTL variants are flagged from the colocalization table so that they are drawn bold;
+all other variants in the LD-expanded table are drawn as plain lollipops.
+
+```{r load_snps}
+coloc_slopes <- read_csv(F_COLOC_WITH_SLOPES, show_col_types = FALSE)
+stopifnot("expected an 'rsid' column in the colocalization table" = "rsid" %in% names(coloc_slopes))
+lead_rsids <- unique(na.omit(coloc_slopes$rsid))
+
+cad_snps_raw <- read_csv(F_CAD_SQTL_SNPS_LD, show_col_types = FALSE)
+shared_col   <- "Shared sQTL & CAD SNP"
+
+snp_data <- cad_snps_raw %>%
+  transmute(
+    rsid       = .data[[shared_col]],
+    chr        = if_else(str_starts(as.character(chr), "chr"),
+                         as.character(chr), paste0("chr", chr)),
+    pos        = as.integer(pos_hg38),
+    ref, alt,
+    gene_name  = GENCODE_name,
+    lead_rsid_for_this_snp = query_lead_snp_rsid,
+    lead_source            = query_lead_SNP_source) %>%
+  filter(!is.na(rsid), !is.na(pos)) %>%
+  distinct() %>%
+  mutate(is_lead = rsid %in% lead_rsids)
+
+# Lead variants absent from the LD table are appended from the colocalization table.
+if (all(c("chr", "pos_hg38") %in% names(coloc_slopes))) {
+  coloc_extra <- coloc_slopes %>%
+    transmute(
+      rsid = rsid,
+      chr  = if_else(str_starts(as.character(chr), "chr"),
+                     as.character(chr), paste0("chr", chr)),
+      pos  = as.integer(pos_hg38),
+      gene_name = if ("gene_name" %in% names(coloc_slopes)) gene_name else NA_character_,
+      is_lead = TRUE) %>%
+    filter(!is.na(rsid), !is.na(pos)) %>%
+    anti_join(snp_data, by = c("rsid", "chr", "pos"))
+  if (nrow(coloc_extra) > 0) snp_data <- bind_rows(snp_data, coloc_extra)
+}
+```
+
+```{r load_primers}
+# RT-PCR primer workbook (Supplementary Table 6): the sheet holding the primer design is
+# located by name, and the gene and hg38 amplicon-coordinate columns by pattern.
+primer_sheet <- grep("primer", excel_sheets(F_RT_PCR_PRIMERS), ignore.case = TRUE, value = TRUE)[1]
+stopifnot("no primer-design sheet in the RT-PCR workbook" = !is.na(primer_sheet))
+primer_raw <- read_excel(F_RT_PCR_PRIMERS, sheet = primer_sheet) %>% as_tibble()
+names(primer_raw) <- names(primer_raw) %>% str_replace_all("\\s+", " ") %>% trimws()
+
+gene_col  <- names(primer_raw)[str_detect(tolower(names(primer_raw)), "gene")][1]
+coord_col <- names(primer_raw)[str_detect(tolower(names(primer_raw)),
+                                          "genomic|coordinate|h38|hg38")][1]
+stopifnot("no hg38 amplicon-coordinate column in the primer sheet" = !is.na(coord_col))
+
+primer_data <- primer_raw %>%
+  transmute(gene = .data[[gene_col]], coord = .data[[coord_col]]) %>%
+  tidyr::fill(gene, .direction = "down") %>%
+  filter(!is.na(coord), str_detect(coord, "^chr")) %>%
+  mutate(
+    amplicon_chr   = str_extract(coord, "^chr[0-9XYM]+"),
+    amplicon_start = as.numeric(str_extract(coord, "(?<=:)[0-9]+")),
+    amplicon_end   = as.numeric(str_extract(coord, "(?<=-)[0-9]+")),
+    amplicon_label = "RT-PCR amplicon") %>%
+  filter(!is.na(amplicon_start), !is.na(amplicon_end)) %>%
+  select(gene, amplicon_chr, amplicon_start, amplicon_end, amplicon_label)
+```
+
+## 6. Helpers
+
+```{r helpers_ids}
+# Full exon_data trans_ids ("GENE|PB.x.y|CPM") for a gene's PB accessions. The accession is
+# matched up to the following "|" so that PB.1.1 does not match PB.1.10.
+get_transcript_ids_for_gene <- function(exon_data, gene_symbol, pb_ids) {
+  all_tx <- exon_data %>% filter(gene_id == gene_symbol) %>%
+    pull(trans_id) %>% unique()
+  out <- character(0)
+  for (pb in pb_ids) {
+    hits <- all_tx[str_detect(all_tx, paste0(fixed(pb), "\\|"))]
+    if (length(hits) == 0)
+      hits <- all_tx[str_detect(all_tx, paste0(fixed(pb), "$"))]
+    out <- c(out, hits)
+  }
+  unique(out)
+}
+
+# Status (Risk / Nonrisk / Both) for each drawn peptide. A peptide that is not itself in the
+# status map inherits the status of a mapped peptide it contains (missed-cleavage forms), or
+# "Unknown" when that is ambiguous. Used by draw_peptide_track().
+resolve_status <- function(seq, smap) {
+  smap <- setNames(as.character(smap), names(smap))
+  vapply(seq, function(s) {
+    if (s %in% names(smap)) return(unname(smap[s]))
+    hits <- names(smap)[stringr::str_detect(s, stringr::fixed(names(smap)))]
+    st <- unique(unname(smap[hits]))
+    if (length(st) == 1) st else "Unknown"
+  }, character(1), USE.NAMES = FALSE)
+}
+```
+
+## 7. Coordinate helpers and the exon-view transform
+
+Minus-strand genes are drawn reversed so that transcription runs left to right. The exon-view
+transform collapses introns to a fixed pad so that short exons and peptides remain visible in
+genes with long introns; every track is passed through the same transform.
+
+```{r helpers_coords}
+flip_coordinates <- function(coord, region_min, region_max) {
+  region_max + region_min - coord
+}
+
+intersect_features_with_exons <- function(features_df, cds_coords) {
+  if (nrow(features_df) == 0 || nrow(cds_coords) == 0) return(data.frame())
+  cds_segments <- cds_coords %>% distinct(start, end) %>% arrange(start)
+  result_list <- list()
+  for (i in seq_len(nrow(features_df))) {
+    feat <- features_df[i, ]
+    overlapping_cds <- cds_segments %>%
+      filter(end >= feat$feature_start, start <= feat$feature_end)
+    if (nrow(overlapping_cds) == 0) next
+    for (j in seq_len(nrow(overlapping_cds))) {
+      cds <- overlapping_cds[j, ]
+      seg_start <- max(feat$feature_start, cds$start)
+      seg_end   <- min(feat$feature_end,   cds$end)
+      if (seg_start < seg_end) {
+        new_feat <- feat
+        new_feat$feature_start <- seg_start
+        new_feat$feature_end   <- seg_end
+        result_list[[length(result_list) + 1]] <- new_feat
+      }
+    }
+  }
+  if (length(result_list) == 0) return(data.frame())
+  bind_rows(result_list)
+}
+```
+
+```{r exon_view_transform}
+build_exon_view_transform <- function(exon_coords, intron_pad_frac = 0.015) {
+  exons <- exon_coords %>%
+    distinct(start = blockstarts, end = blockends) %>%
+    arrange(start) %>%
+    mutate(grp = cumsum(start > lag(cummax(end), default = -Inf))) %>%
+    group_by(grp) %>%
+    summarise(start = min(start), end = max(end), .groups = "drop") %>%
+    arrange(start)
+
+  total_exon_length <- sum(exons$end - exons$start)
+  intron_pad <- total_exon_length * intron_pad_frac
+  exons <- exons %>%
+    mutate(
+      genomic_length   = end - start,
+      cum_genomic      = cumsum(genomic_length),
+      n_introns_before = pmax(0, row_number() - 1),
+      plot_start       = cum_genomic - genomic_length + n_introns_before * intron_pad,
+      plot_end         = plot_start + genomic_length)
+
+  transform_fn <- function(x) {
+    out <- numeric(length(x))
+    for (i in seq_along(x)) {
+      xi <- x[i]
+      if (is.na(xi)) { out[i] <- NA_real_; next }
+      if (xi <= exons$start[1]) {
+        out[i] <- exons$plot_start[1] - (exons$start[1] - xi); next
+      }
+      if (xi >= exons$end[nrow(exons)]) {
+        out[i] <- exons$plot_end[nrow(exons)] + (xi - exons$end[nrow(exons)]); next
+      }
+      idx <- which(exons$start <= xi & xi <= exons$end)
+      if (length(idx) > 0) {
+        k <- idx[1]
+        out[i] <- exons$plot_start[k] + (xi - exons$start[k]); next
+      }
+      k <- which(exons$start > xi)[1]
+      prev_end   <- exons$end[k - 1]
+      next_start <- exons$start[k]
+      frac <- (xi - prev_end) / (next_start - prev_end)
+      out[i] <- exons$plot_end[k - 1] + frac * intron_pad
+    }
+    out
+  }
+  list(transform = transform_fn, exons = exons, intron_pad = intron_pad)
+}
+
+apply_transform_cols <- function(df, fn, cols) {
+  for (cc in cols) if (cc %in% names(df)) df[[cc]] <- fn(df[[cc]])
+  df
+}
+```
+
+## 8. Track drawing functions
+
+Each function returns the rectangles, stems and labels for one track, positioned above or below
+the transcript models; the main plotting function assembles them. sQTL junctions increased in
+usage with the CAD risk allele are drawn red and decreased junctions blue; overlapping elements
+are packed onto sub-tracks so that nothing is hidden.
+
+```{r draw_sqtl_junctions}
+draw_sqtl_junctions <- function(cluster_data, gene_name, track_y,
+                                region_start, region_end,
+                                strand = "+",
+                                junction_height = 0.18,
+                                cap_width_factor = 0.004,
+                                bar_height = 0.06,
+                                track_spacing = 0.45,
+                                show_highlight = TRUE,
+                                highlight_alpha = 0.2) {
+  increased_color <- "#ef5350"
+  decreased_color <- "#7FA8E0"
+  effect_col <- if ("Effect_direction" %in% names(cluster_data))
+                  "Effect_direction" else "effect_direction"
+
+  sqtl_junctions <- cluster_data %>%
+    filter(gene_name == !!gene_name, !is.na(intron_start), !is.na(intron_end)) %>%
+    distinct(intron_start, intron_end, !!sym(effect_col), .keep_all = TRUE) %>%
+    mutate(
+      effect_type = case_when(
+        str_detect(.data[[effect_col]], regex("Increase", ignore_case = TRUE)) ~ "Increased",
+        str_detect(.data[[effect_col]], regex("Decrease", ignore_case = TRUE)) ~ "Decreased",
+        TRUE ~ "Other"),
+      fill_color = case_when(
+        effect_type == "Increased" ~ increased_color,
+        effect_type == "Decreased" ~ decreased_color,
+        TRUE ~ "gray50"))
+
+  if (nrow(sqtl_junctions) == 0)
+    return(list(has_junctions = FALSE, max_y = track_y))
+
+  if (strand == "-") {
+    sqtl_junctions <- sqtl_junctions %>%
+      mutate(orig_start = intron_start, orig_end = intron_end,
+             intron_start = flip_coordinates(orig_end,   region_start, region_end),
+             intron_end   = flip_coordinates(orig_start, region_start, region_end)) %>%
+      select(-orig_start, -orig_end)
+  }
+
+  sqtl_junctions <- sqtl_junctions %>%
+    arrange(intron_start) %>%
+    mutate(sub_track = {
+      tracks <- numeric(n())
+      if (n() > 0) {
+        tracks[1] <- 0
+        if (n() > 1) for (i in 2:n()) {
+          overlaps <- which(intron_end[1:(i-1)] >= intron_start[i])
+          if (length(overlaps) > 0) {
+            used <- tracks[overlaps]; av <- 0
+            while (av %in% used) av <- av + 1
+            tracks[i] <- av
+          } else tracks[i] <- 0
+        }
+      }
+      tracks
+    }) %>%
+    mutate(junction_y = track_y + (sub_track * track_spacing),
+           cap_width  = (region_end - region_start) * cap_width_factor)
+
+  left_caps <- sqtl_junctions %>%
+    transmute(xmin = intron_start, xmax = intron_start + (cap_width * 2),
+              ymin = junction_y - junction_height, ymax = junction_y + junction_height,
+              fill_color, effect_type)
+  right_caps <- sqtl_junctions %>%
+    transmute(xmin = intron_end - (cap_width * 2), xmax = intron_end,
+              ymin = junction_y - junction_height, ymax = junction_y + junction_height,
+              fill_color, effect_type)
+  middle_bars <- sqtl_junctions %>%
+    transmute(xmin = intron_start + (cap_width * 2), xmax = intron_end - (cap_width * 2),
+              ymin = junction_y - bar_height, ymax = junction_y + bar_height,
+              fill_color, effect_type)
+  highlight_boxes <- sqtl_junctions %>%
+    transmute(xmin = intron_start, xmax = intron_end,
+              fill_color, effect_type, alpha = highlight_alpha)
+
+  list(has_junctions = TRUE,
+       max_y = max(sqtl_junctions$junction_y) + junction_height,
+       left_caps = left_caps, right_caps = right_caps, middle_bars = middle_bars,
+       highlight_boxes = if (show_highlight) highlight_boxes else NULL,
+       junction_data = sqtl_junctions)
+}
+```
+
+```{r draw_peptide_track}
+draw_peptide_track <- function(pogo_data, gene_chr, region_start, region_end,
+                               track_y, strand = "+",
+                               selected_peptides = NULL,
+                               exact_peptides     = FALSE,
+                               peptide_status_map = NULL,
+                               overlap_sqtl_coords = NULL,
+                               cap_height = 0.18, cap_width_factor = 0.004,
+                               bar_height = 0.06, track_spacing = 0.45,
+                               should_flip = FALSE, exon_coords = NULL,
+                               risk_color = "#D66B6B", non_risk_color = "#6494C5",
+                               both_color = "#6B3074", unknown_color = "#808080") {
+
+  peptides <- pogo_data %>%
+    filter(chrom == gene_chr, chromEnd >= region_start, chromStart <= region_end)
+  if (nrow(peptides) == 0) return(list(has_peptides = FALSE, max_y = track_y))
+  if (!is.null(selected_peptides)) {
+    keep <- if (isTRUE(exact_peptides)) {
+      peptides$peptide_seq %in% selected_peptides
+    } else {
+      peptides$peptide_seq %in% selected_peptides |
+        vapply(peptides$peptide_seq,
+               function(s) any(stringr::str_detect(s, stringr::fixed(selected_peptides))),
+               logical(1))
+    }
+    peptides <- peptides[keep, , drop = FALSE]
+  }
+  peptides <- peptides %>% distinct(peptide_seq, chromStart, chromEnd, .keep_all = TRUE)
+  if (!is.null(overlap_sqtl_coords)) {
+    peptides <- peptides %>% rowwise() %>%
+      filter(any(chromEnd >= overlap_sqtl_coords$intron_start &
+                 chromStart <= overlap_sqtl_coords$intron_end)) %>% ungroup()
+  }
+  if (nrow(peptides) == 0) return(list(has_peptides = FALSE, max_y = track_y))
+
+  if (!is.null(peptide_status_map)) {
+    peptides <- peptides %>%
+      mutate(
+        peptide_risk_status = resolve_status(peptide_seq, peptide_status_map),
+        risk_fill_color = case_when(
+          peptide_risk_status == "Risk"     ~ risk_color,
+          peptide_risk_status == "Nonrisk" ~ non_risk_color,
+          peptide_risk_status == "Both"     ~ both_color,
+          TRUE ~ unknown_color))
+  } else if (!is.null(exon_coords) && "risk_status" %in% names(exon_coords)) {
+    risk_exons    <- exon_coords %>% filter(risk_status == "Risk")
+    nonrisk_exons <- exon_coords %>% filter(risk_status == "Nonrisk")
+    peptides <- peptides %>% rowwise() %>%
+      mutate(
+        overlaps_risk    = if (nrow(risk_exons) > 0)
+          any(chromEnd >= risk_exons$blockstarts & chromStart <= risk_exons$blockends) else FALSE,
+        overlaps_nonrisk = if (nrow(nonrisk_exons) > 0)
+          any(chromEnd >= nonrisk_exons$blockstarts & chromStart <= nonrisk_exons$blockends) else FALSE,
+        peptide_risk_status = case_when(
+          overlaps_risk & overlaps_nonrisk ~ "Both",
+          overlaps_risk    ~ "Risk",
+          overlaps_nonrisk ~ "Nonrisk",
+          TRUE ~ "Unknown"),
+        risk_fill_color = case_when(
+          peptide_risk_status == "Risk"     ~ risk_color,
+          peptide_risk_status == "Nonrisk" ~ non_risk_color,
+          peptide_risk_status == "Both"     ~ both_color,
+          TRUE ~ unknown_color)) %>% ungroup()
+  } else {
+    peptides <- peptides %>%
+      mutate(peptide_risk_status = "Unknown", risk_fill_color = unknown_color)
+  }
+
+  cap_width <- (region_end - region_start) * cap_width_factor
+  peptide_coords <- peptides %>%
+    mutate(peptide_id = row_number(),
+           pep_start = chromStart, pep_end = chromEnd) %>%
+    select(peptide_id, peptide_seq, pep_start, pep_end,
+           peptide_risk_status, risk_fill_color)
+
+  # Exonic block segments from the BED (so junction-spanning peptides draw as
+  # their pieces, not one bar across the intron)
+  pep_blocks <- peptides %>%
+    mutate(peptide_id = row_number()) %>%
+    rowwise() %>%
+    mutate(.seg = list({
+      bt <- suppressWarnings(as.numeric(str_split(blockStarts, ",", simplify = TRUE)))
+      bs <- suppressWarnings(as.numeric(str_split(blockSizes,  ",", simplify = TRUE)))
+      ok <- !is.na(bt) & !is.na(bs); bt <- bt[ok]; bs <- bs[ok]
+      if (length(bt) == 0) { bt <- 0; bs <- chromEnd - chromStart }
+      tibble(seg_start = chromStart + bt, seg_end = chromStart + bt + bs)
+    })) %>%
+    ungroup() %>%
+    select(peptide_id, .seg) %>%
+    tidyr::unnest(.seg)
+
+  if (should_flip) {
+    peptide_coords <- peptide_coords %>%
+      mutate(ps_new = flip_coordinates(pep_end,   region_start, region_end),
+             pe_new = flip_coordinates(pep_start, region_start, region_end),
+             pep_start = ps_new, pep_end = pe_new) %>%
+      select(-ps_new, -pe_new)
+    pep_blocks <- pep_blocks %>%
+      mutate(s_new = flip_coordinates(seg_end,   region_start, region_end),
+             e_new = flip_coordinates(seg_start, region_start, region_end),
+             seg_start = s_new, seg_end = e_new) %>%
+      select(-s_new, -e_new)
+  }
+
+  peptide_coords <- peptide_coords %>%
+    arrange(pep_start) %>%
+    mutate(sub_track = {
+      tracks <- numeric(n())
+      if (n() > 0) {
+        tracks[1] <- 0
+        if (n() > 1) for (i in 2:n()) {
+          overlaps <- which(pep_end[1:(i-1)] >= pep_start[i])
+          if (length(overlaps) > 0) {
+            used <- tracks[overlaps]; av <- 0
+            while (av %in% used) av <- av + 1
+            tracks[i] <- av
+          } else tracks[i] <- 0
+        }
+      }
+      tracks
+    }) %>%
+    mutate(peptide_y = track_y + (sub_track * track_spacing))
+
+  left_caps  <- peptide_coords[0, ] %>%
+    transmute(xmin = numeric(), xmax = numeric(), ymin = numeric(), ymax = numeric(),
+              fill_color = character(), peptide_risk_status = character())
+  right_caps <- left_caps
+  pep_introns <- pep_blocks %>%
+    dplyr::group_by(peptide_id) %>%
+    dplyr::summarise(xmin = min(seg_start), xmax = max(seg_end), .groups = "drop") %>%
+    dplyr::left_join(
+      peptide_coords %>% dplyr::select(peptide_id, peptide_y, risk_fill_color),
+      by = "peptide_id") %>%
+    transmute(xmin, xmax,
+              ymin = peptide_y - bar_height, ymax = peptide_y + bar_height,
+              fill_color = risk_fill_color)
+  middle_bars <- pep_blocks %>%
+    dplyr::left_join(
+      peptide_coords %>% dplyr::select(peptide_id, peptide_y,
+                                       risk_fill_color, peptide_risk_status),
+      by = "peptide_id") %>%
+    transmute(xmin = seg_start, xmax = seg_end,
+              ymin = peptide_y - cap_height, ymax = peptide_y + cap_height,
+              fill_color = risk_fill_color, peptide_risk_status)
+  peptide_labels <- peptide_coords %>%
+    mutate(mid_x = (pep_start + pep_end) / 2, label = peptide_seq)
+
+  list(has_peptides = TRUE,
+       max_y = max(peptide_coords$peptide_y) + cap_height,
+       left_caps = left_caps, right_caps = right_caps,
+       middle_bars = middle_bars, pep_introns = pep_introns,
+       peptide_labels = peptide_labels, peptide_data = peptide_coords)
+}
+```
+
+```{r draw_snp_track}
+draw_snp_track <- function(snp_data, gene_chr, region_start, region_end,
+                           track_y,
+                           gene_symbol = NULL,
+                           snps_to_show = NULL,
+                           should_flip = FALSE,
+                           lead_color  = "#000000",
+                           other_color = "#666666",
+                           lollipop_height = 0.25) {
+
+  if (is.null(snp_data) || nrow(snp_data) == 0)
+    return(list(has_snps = FALSE, max_y = track_y))
+
+  snps <- snp_data %>%
+    filter(chr == gene_chr, pos >= region_start, pos <= region_end)
+  if (!is.null(gene_symbol) && "gene_name" %in% names(snp_data)) {
+    by_gene <- snps %>% filter(gene_name == gene_symbol)
+    if (nrow(by_gene) > 0) snps <- by_gene
+  }
+  if (!is.null(snps_to_show))
+    snps <- snps %>% filter(rsid %in% snps_to_show)
+  snps <- snps %>% arrange(desc(is_lead)) %>% distinct(rsid, .keep_all = TRUE)
+  if (nrow(snps) == 0) return(list(has_snps = FALSE, max_y = track_y))
+
+  snps <- snps %>%
+    mutate(
+      x_pos      = pos,
+      stem_color = if_else(is_lead, lead_color, other_color),
+      stem_size  = if_else(is_lead, 0.7, 0.35),
+      label_face = if_else(is_lead, "bold", "plain"),
+      point_size = if_else(is_lead, 1.8, 1.0))
+
+  if (should_flip)
+    snps <- snps %>% mutate(x_pos = flip_coordinates(x_pos, region_start, region_end))
+
+  stems <- snps %>%
+    transmute(x = x_pos, y_lo = track_y, y_hi = track_y + lollipop_height,
+              color = stem_color, size = stem_size)
+  heads <- snps %>%
+    transmute(x = x_pos, y = track_y + lollipop_height,
+              color = stem_color, is_lead, rsid, label_face, point_size)
+
+  list(has_snps = TRUE,
+       max_y = track_y + lollipop_height + 0.15,
+       stems = stems, heads = heads, snp_data = snps)
+}
+```
+
+```{r draw_primer_track}
+draw_primer_track <- function(primer_data, gene_chr, region_start, region_end,
+                              track_y, gene_symbol = NULL, should_flip = FALSE,
+                              primer_color = "#7F7F7F", cap_height = 0.16) {
+  if (is.null(primer_data) || nrow(primer_data) == 0)
+    return(list(has_primers = FALSE, max_y = track_y))
+
+  pr <- primer_data %>%
+    filter(amplicon_chr == gene_chr,
+           amplicon_end >= region_start, amplicon_start <= region_end)
+  if (!is.null(gene_symbol) && "gene" %in% names(primer_data)) {
+    bg <- pr %>% filter(gene == gene_symbol)
+    if (nrow(bg) > 0) pr <- bg
+  }
+  if (nrow(pr) == 0) return(list(has_primers = FALSE, max_y = track_y))
+
+  pr <- pr %>% mutate(xstart = amplicon_start, xend = amplicon_end)
+  if (should_flip)
+    pr <- pr %>%
+      mutate(xs = flip_coordinates(xend,   region_start, region_end),
+             xe = flip_coordinates(xstart, region_start, region_end),
+             xstart = xs, xend = xe) %>% select(-xs, -xe)
+
+  amp <- pr %>%
+    mutate(y = track_y, cap_height = cap_height,
+           y_lo = y - cap_height, y_hi = y + cap_height,
+           mid = (xstart + xend) / 2, lab_y = y + cap_height + 0.18,
+           amplicon_label = if ("amplicon_label" %in% names(pr))
+                              amplicon_label else "RT-PCR amplicon")
+  list(has_primers = TRUE, max_y = track_y + cap_height, amplicon = amp)
+}
+```
+
+## 9. Main plotting function
+
+`plot_transcripts_peptides_sqtl_v2()` draws a set of long-read and/or GENCODE transcripts for
+one gene with optional sQTL-junction, peptide, SNP, amplicon and UniProt-feature tracks, coloured
+either by risk/nonrisk status or by transcript novelty. GENCODE transcripts can be drawn faded
+(`shadow_gencode`) as a reference for the annotation that preceded long-read sequencing. The
+legend is built as a separate panel and stacked under the plot with patchwork.
+
+```{r plot_function}
+# lighten a hex colour toward white; used for GENCODE shadow transcripts
+  fade_hex <- function(hex, amount = 0.55) {
+    m <- grDevices::col2rgb(hex) / 255
+    grDevices::rgb(t(m + (1 - m) * amount))
+  }
+
+  plot_transcripts_peptides_sqtl_v2 <- function(
+  exon_data, cds_data,
+  cluster_data       = NULL,
+  risk_nonrisk_pairs = NULL,
+  pogo_data          = NULL,
+  sqanti_data        = NULL,
+  gencode_exon_data  = NULL,
+  gencode_cds_data   = NULL,
+  snp_data           = NULL,
+  unip_signal = NULL, unip_extracellular = NULL, unip_transmembrane = NULL,
+  unip_cytoplasmic = NULL, unip_domain = NULL, unip_interest = NULL,
+  unip_structure = NULL, unip_disulfide = NULL, unip_modif = NULL,
+  unip_repeat = NULL,
+  transcript_ids        = NULL,
+  gene_name_for_cluster = NULL,
+  selected_peptides     = NULL,
+  peptide_status_map = NULL,
+  peptides_overlap_sqtl = TRUE,
+
+  color_by = c("risk", "novelty"),
+
+  manual_risk_pbs    = NULL,
+  manual_nonrisk_pbs = NULL,
+  exact_peptides = FALSE,
+
+  show_peptides  = TRUE,
+  show_snps      = TRUE,
+  show_sqtl      = TRUE,
+  show_highlight = TRUE,
+  show_peptide_labels = TRUE,
+  show_snp_labels     = TRUE,
+  show_feature_labels = TRUE,
+  shadow_gencode = FALSE,
+
+  snps_to_show     = NULL,
+  lead_color       = "#000000",
+  other_snp_color  = "#666666",
+
+  collapse_introns = FALSE,
+  intron_pad_frac  = 0.015,
+
+  risk_color = "#D66B6B", non_risk_color = "#6494C5",
+  novel_color = "#E8700A", annotated_color = "#4a4a4a",
+  gencode_color = "#4a4a4a", unknown_color = "gray60",
+  signal_color = "#E74C3C", extracellular_color = "#3498DB",
+  transmembrane_color = "#7B2D8E", cytoplasmic_color = "#F39C12",
+  domain_color = "#7B2D8E", region_of_interest_color = "#7B2D8E",
+  structure_color = "#95A5A6", disulfide_color = "#E67E22",
+  modification_color = "#D35400", disordered_color = "#7B2D8E",
+  repeat_color = "#7B2D8E",
+  highlight_alpha = 0.2,
+
+  thickness_scale = 1.5,
+  sqtl_cap_pt     = 1.2,
+  plot_width_in   = 3.5,
+  track_spacing   = 1.6,
+  feature_track_spacing = 0.55,
+
+  base_pt = 7,
+
+  dedup_feature_labels = TRUE,
+  collapse_repeat_numbers = FALSE,
+  primer_data   = NULL,
+  show_primers  = TRUE,
+  primer_color  = "#7F7F7F",
+  primer_label  = TRUE,
+  transcript_label_wrap = TRUE,
+
+  show_risk_legend             = TRUE,
+  transcript_label_legend      = FALSE,
+  transcript_label_legend_text = c("Novel: gene|PacBio ID|CPM", "Annotated: ENST ID|CPM"),
+
+  show_tracks   = c("topology","domains","structure","modifications"),
+  show_features = c("signal","extracellular","transmembrane","cytoplasmic",
+                    "domain","interest","structure","disulfide","modification", "repeat"),
+
+  transcript_label_position = c("left","right"),
+  flip_negative_strand = TRUE,
+  title = NULL,
+
+  legend_heights = c(1, 0.22)   # patchwork ratio: plot panel vs legend strip
+  ){
+  color_by                  <- match.arg(color_by)
+  transcript_label_position <- match.arg(transcript_label_position)
+
+  pt2gg     <- function(pt) pt / ggplot2::.pt
+  text_size <- pt2gg(base_pt)
+
+  feature_colors <- c(
+    "Signal peptide" = signal_color, "Extracellular" = extracellular_color,
+    "Transmembrane" = transmembrane_color, "Cytoplasmic" = cytoplasmic_color,
+    "Domain" = domain_color, "Region of interest" = region_of_interest_color,
+    "Disordered" = disordered_color, "Structure" = structure_color,
+    "Disulfide bond" = disulfide_color, "Modification" = modification_color, "Repeat" = repeat_color)
+
+  # Resolve risk/non-risk
+  rp <- risk_nonrisk_pairs
+  if (is.null(rp)) {
+    risk_isoforms <- nonrisk_isoforms <- risk_pbs <- nonrisk_pbs <- character(0)
+  } else if ("risk_isoform" %in% names(rp)) {
+    risk_isoforms    <- unique(na.omit(rp$risk_isoform))
+    nonrisk_isoforms <- unique(na.omit(rp$nonrisk_isoform))
+    risk_pbs    <- unique(na.omit(rp$risk_pb))
+    nonrisk_pbs <- unique(na.omit(rp$nonrisk_pb))
+  } else if ("role" %in% names(rp)) {
+    risk_isoforms    <- rp %>% filter(role == "risk")     %>% pull(isoform) %>% unique()
+    nonrisk_isoforms <- rp %>% filter(role == "nonrisk") %>% pull(isoform) %>% unique()
+    risk_pbs    <- rp %>% filter(role == "risk")     %>% pull(pb_acc) %>% unique()
+    nonrisk_pbs <- rp %>% filter(role == "nonrisk") %>% pull(pb_acc) %>% unique()
+  } else {
+    risk_isoforms <- nonrisk_isoforms <- character(0)
+    risk_pbs    <- if ("risk"     %in% names(rp)) unique(na.omit(rp$risk))     else character(0)
+    nonrisk_pbs <- if ("non_risk" %in% names(rp)) unique(na.omit(rp$non_risk)) else character(0)
+  }
+  if (!is.null(manual_risk_pbs))    risk_pbs    <- unique(c(risk_pbs,    manual_risk_pbs))
+  if (!is.null(manual_nonrisk_pbs)) nonrisk_pbs <- unique(c(nonrisk_pbs, manual_nonrisk_pbs))
+
+  # Subset SMC + GENCODE exon data
+  if (!is.null(transcript_ids)) {
+    enst_ids <- transcript_ids[str_detect(transcript_ids, "^ENST")]
+    pb_ids   <- transcript_ids[!str_detect(transcript_ids, "^ENST")]
+    exon_data <- exon_data %>% filter(trans_id %in% pb_ids)
+
+    if (length(enst_ids) > 0 && !is.null(gencode_exon_data)) {
+      gencode_subset <- gencode_exon_data %>% filter(trans_id %in% enst_ids)
+      if (!"blocksizes" %in% names(gencode_subset) &&
+          all(c("blockstarts","blockends") %in% names(gencode_subset))) {
+        gencode_subset <- gencode_subset %>% mutate(blocksizes = blockends - blockstarts)
+      }
+      common_cols <- intersect(names(exon_data), names(gencode_subset))
+      exon_data <- bind_rows(exon_data %>% select(all_of(common_cols)),
+                             gencode_subset %>% select(all_of(common_cols)))
+    }
+  }
+  if (nrow(exon_data) == 0) stop("No transcripts found.")
+
+  gene_name_for_sqtl <- if (!is.null(gene_name_for_cluster))
+                         gene_name_for_cluster else unique(exon_data$gene_id)[1]
+  gene_strand <- unique(exon_data$strand)[1]
+  gene_chr    <- unique(exon_data$chr)[1]
+  should_flip <- flip_negative_strand && gene_strand == "-"
+
+  # Per-transcript category
+  transcript_order <- exon_data %>% distinct(trans_id, gene_id) %>%
+    mutate(pb_id      = str_extract(trans_id, "PB\\.[0-9]+\\.[0-9]+"),
+           is_gencode = str_detect(trans_id, "^ENST"),
+           # GENCODE transcripts plotted alongside long-read isoforms are drawn
+           # faded, as a visual reference for what was annotated before long-read
+           # sequencing.
+           is_shadow  = is_gencode & shadow_gencode)
+
+  if (color_by == "risk") {
+    transcript_order <- transcript_order %>%
+      mutate(risk_status = case_when(
+        trans_id %in% risk_isoforms    | pb_id %in% risk_pbs    ~ "Risk",
+        trans_id %in% nonrisk_isoforms | pb_id %in% nonrisk_pbs ~ "Nonrisk",
+        is_gencode ~ "GENCODE",
+        TRUE ~ "Unknown"))
+
+    non_gencode <- transcript_order %>% filter(!is_gencode)
+    if (nrow(non_gencode) > 0 && all(non_gencode$risk_status == "Unknown")) {
+      warning(sprintf("color_by='risk' but no transcripts found in risk_nonrisk_pairs for '%s'. ",
+                      gene_name_for_sqtl),
+              "Pass manual_risk_pbs / manual_nonrisk_pbs to override.")
+    }
+    cat_colors   <- c("Risk" = risk_color, "Nonrisk" = non_risk_color,
+                      "GENCODE" = gencode_color, "Unknown" = unknown_color)
+    legend_title <- "CAD Risk Status"
+    if (!any(transcript_order$risk_status %in% c("Risk", "Nonrisk")))
+      legend_title <- NA_character_
+  } else {
+    if (is.null(sqanti_data))
+      stop("sqanti_data is required when color_by = 'novelty'.")
+    pb_col <- if ("pb" %in% names(sqanti_data)) "pb" else "pb_acc"
+    tx_cat_lookup <- sqanti_data %>%
+      select(all_of(pb_col), tx_cat) %>% distinct() %>%
+      dplyr::rename(pb_id = !!pb_col)
+    transcript_order <- transcript_order %>%
+      left_join(tx_cat_lookup, by = "pb_id") %>%
+      mutate(risk_status = case_when(
+        is_gencode ~ "Annotated",
+        tx_cat %in% c("novel_in_catalog","novel_not_in_catalog") ~ "Novel",
+        tx_cat %in% c("full_splice_match","incomplete_splice_match") ~ "Annotated",
+        TRUE ~ "Annotated"))
+    cat_colors   <- c("Novel" = novel_color, "Annotated" = annotated_color,
+                      "NA" = gencode_color, "Unknown" = unknown_color)
+    legend_title <- "RNA Isoform Novelty"
+  }
+
+  if (!is.null(transcript_ids)) {
+    transcript_order <- transcript_order %>%
+      mutate(input_order = match(trans_id, transcript_ids)) %>%
+      arrange(input_order) %>%
+      mutate(y_position = row_number() * track_spacing) %>%
+      select(-input_order)
+  } else {
+    transcript_order <- transcript_order %>%
+      arrange(gene_id, trans_id) %>%
+      mutate(y_position = row_number() * track_spacing)
+  }
+  exon_coords <- exon_data %>%
+    left_join(transcript_order %>% select(trans_id, y_position, risk_status),
+              by = "trans_id")
+
+  cds_coords <- cds_data %>%
+    filter(transcript_id %in% exon_coords$trans_id) %>%
+    dplyr::rename(trans_id = transcript_id) %>%
+    left_join(transcript_order %>% select(trans_id, y_position, risk_status),
+              by = "trans_id")
+
+  if (!is.null(gencode_cds_data)) {
+    enst_in_plot <- exon_coords %>% filter(str_detect(trans_id, "^ENST")) %>%
+      pull(trans_id) %>% unique()
+    if (length(enst_in_plot) > 0) {
+      gcds <- gencode_cds_data %>% filter(transcript_id %in% enst_in_plot)
+      if (nrow(gcds) > 0) {
+        gcds <- gcds %>% dplyr::rename(trans_id = transcript_id) %>%
+          left_join(transcript_order %>% select(trans_id, y_position, risk_status),
+                    by = "trans_id")
+        cc <- intersect(names(cds_coords), names(gcds))
+        cds_coords <- bind_rows(cds_coords %>% select(all_of(cc)),
+                                gcds %>% select(all_of(cc)))
+      }
+    }
+  }
+
+  for_plotting <- exon_coords %>%
+    group_by(trans_id, y_position, risk_status) %>%
+    summarise(start = min(start, na.rm = TRUE),
+              end   = max(end,   na.rm = TRUE),
+              gene_id = dplyr::first(gene_id),
+              strand  = dplyr::first(strand),
+              chr     = dplyr::first(chr), .groups = "drop")
+
+  sqtl_raw <- if (!is.null(cluster_data))
+    cluster_data %>% filter(gene_name == gene_name_for_sqtl,
+                            !is.na(intron_start), !is.na(intron_end))
+    else tibble()
+
+  all_starts <- c(for_plotting$start, exon_coords$blockstarts)
+  all_ends   <- c(for_plotting$end,   exon_coords$blockends)
+  if (nrow(sqtl_raw) > 0) {
+    all_starts <- c(all_starts, sqtl_raw$intron_start)
+    all_ends   <- c(all_ends,   sqtl_raw$intron_end)
+  }
+  region_start <- min(all_starts, na.rm = TRUE)
+  region_end   <- max(all_ends,   na.rm = TRUE)
+
+  if (should_flip) {
+    exon_coords <- exon_coords %>%
+      mutate(bs_new = flip_coordinates(blockends,   region_start, region_end),
+             be_new = flip_coordinates(blockstarts, region_start, region_end),
+             blockstarts = bs_new, blockends = be_new) %>% select(-bs_new, -be_new)
+    cds_coords <- cds_coords %>%
+      mutate(s_new = flip_coordinates(end,   region_start, region_end),
+             e_new = flip_coordinates(start, region_start, region_end),
+             start = s_new, end = e_new) %>% select(-s_new, -e_new)
+    for_plotting <- for_plotting %>%
+      mutate(s_new = flip_coordinates(end,   region_start, region_end),
+             e_new = flip_coordinates(start, region_start, region_end),
+             start = s_new, end = e_new) %>% select(-s_new, -e_new)
+  }
+
+  sqtl_base_y <- max(for_plotting$y_position) + track_spacing
+  sqtl_result <- if (show_sqtl && nrow(sqtl_raw) > 0)
+    draw_sqtl_junctions(cluster_data, gene_name_for_sqtl, sqtl_base_y,
+                        region_start, region_end,
+                        strand = if (should_flip) "-" else "+",
+                        show_highlight = show_highlight,
+                        highlight_alpha = highlight_alpha,
+                        junction_height = 0.12 * thickness_scale,
+                        cap_width_factor = 0,
+                        bar_height = 0.04 * thickness_scale)
+    else list(has_junctions = FALSE, max_y = sqtl_base_y)
+
+  peptide_base_y <- if (sqtl_result$has_junctions) sqtl_result$max_y + track_spacing
+                    else sqtl_base_y
+  sqtl_coords_for_filter <- if (peptides_overlap_sqtl && nrow(sqtl_raw) > 0)
+                              sqtl_raw else NULL
+  peptide_result <- if (show_peptides && !is.null(pogo_data))
+    draw_peptide_track(pogo_data, gene_chr, region_start, region_end,
+                       peptide_base_y, strand = gene_strand,
+                                              selected_peptides = selected_peptides,
+                       exact_peptides = exact_peptides,
+                       peptide_status_map = peptide_status_map,
+                       overlap_sqtl_coords = sqtl_coords_for_filter,
+                       should_flip = should_flip, exon_coords = exon_coords,
+                       risk_color = risk_color, non_risk_color = non_risk_color,
+                       cap_height = 0.12 * thickness_scale,
+                       bar_height = 0.04 * thickness_scale)
+    else list(has_peptides = FALSE, max_y = peptide_base_y)
+
+  snp_base_y <- if (peptide_result$has_peptides) peptide_result$max_y + track_spacing * 0.15
+                else peptide_base_y + track_spacing * 0.15
+  snp_result <- if (show_snps && !is.null(snp_data))
+    draw_snp_track(snp_data, gene_chr, region_start, region_end,
+                   snp_base_y, gene_symbol = gene_name_for_sqtl,
+                   snps_to_show = snps_to_show,
+                   should_flip = should_flip,
+                   lead_color = lead_color, other_color = other_snp_color,
+                   lollipop_height = 0.25 * thickness_scale)
+    else list(has_snps = FALSE, max_y = peptide_result$max_y)
+
+  # Primer / amplicon track (sits just above the transcripts, below the SNP/peptide stack)
+  primer_base_y <- max(for_plotting$y_position) + track_spacing * 0.5
+  primer_result <- if (show_primers && !is.null(primer_data))
+    draw_primer_track(primer_data, gene_chr, region_start, region_end,
+                      primer_base_y, gene_symbol = gene_name_for_sqtl,
+                      should_flip = should_flip, primer_color = primer_color)
+    else list(has_primers = FALSE, max_y = primer_base_y)
+
+  # UniProt features
+  is_valid_df <- function(df) !is.null(df) && is.data.frame(df) && nrow(df) > 0
+  prepare_uniprot_features <- function(unip_df, cat_str, g_chr, g_strand, r_start, r_end) {
+    if (!is_valid_df(unip_df)) return(data.frame())
+    filt <- unip_df %>%
+      filter(chrom == g_chr, strand == g_strand,
+             chromEnd >= r_start, chromStart <= r_end)
+    if (nrow(filt) == 0) return(data.frame())
+    out <- data.frame(
+      chrom = filt$chrom, strand = filt$strand,
+      feature_start = as.numeric(filt$chromStart),
+      feature_end   = as.numeric(filt$chromEnd),
+      feature_label = trimws(as.character(filt$name)),
+      feature_category = rep(cat_str, nrow(filt))) %>%
+      mutate(feature_category = ifelse(str_detect(tolower(feature_label), "disordered"),
+                                       "Disordered", feature_category))
+                                       if (isTRUE(collapse_repeat_numbers))
+      out <- out %>%
+        mutate(feature_label = str_remove(feature_label, "\\s+\\d+$") %>% trimws())
+    if (should_flip) {
+      out <- out %>%
+        mutate(fs_new = flip_coordinates(feature_end,   r_start, r_end),
+               fe_new = flip_coordinates(feature_start, r_start, r_end),
+               feature_start = fs_new, feature_end = fe_new) %>%
+        select(-fs_new, -fe_new)
+    }
+    out
+  }
+
+  raw_features_list <- list()
+  if ("topology" %in% show_tracks) {
+    tp <- list()
+    if ("signal"        %in% show_features && is_valid_df(unip_signal))        tp$s <- prepare_uniprot_features(unip_signal,        "Signal peptide", gene_chr, gene_strand, region_start, region_end)
+    if ("extracellular" %in% show_features && is_valid_df(unip_extracellular)) tp$e <- prepare_uniprot_features(unip_extracellular, "Extracellular",  gene_chr, gene_strand, region_start, region_end)
+    if ("transmembrane" %in% show_features && is_valid_df(unip_transmembrane)) tp$t <- prepare_uniprot_features(unip_transmembrane, "Transmembrane",  gene_chr, gene_strand, region_start, region_end)
+    if ("cytoplasmic"   %in% show_features && is_valid_df(unip_cytoplasmic))   tp$c <- prepare_uniprot_features(unip_cytoplasmic,   "Cytoplasmic",    gene_chr, gene_strand, region_start, region_end)
+    if (length(tp) > 0) { td <- bind_rows(tp)
+      if (nrow(td) > 0) { td$track_name <- "Topology"; raw_features_list$topology <- td } }
+  }
+  if ("domains" %in% show_tracks) {
+    dp <- list()
+    if ("domain"   %in% show_features && is_valid_df(unip_domain))   dp$d <- prepare_uniprot_features(unip_domain,   "Domain",             gene_chr, gene_strand, region_start, region_end)
+    if ("interest" %in% show_features && is_valid_df(unip_interest)) dp$i <- prepare_uniprot_features(unip_interest, "Region of interest", gene_chr, gene_strand, region_start, region_end)
+    if ("repeat" %in% show_features && is_valid_df(unip_repeat))
+      dp$r <- prepare_uniprot_features(unip_repeat, "Repeat",
+                                       gene_chr, gene_strand, region_start, region_end)
+    if (length(dp) > 0) { dd <- bind_rows(dp)
+      if (nrow(dd) > 0) { dd$track_name <- "Domains & Regions"; raw_features_list$domains <- dd } }
+  }
+  if ("structure" %in% show_tracks && "structure" %in% show_features && is_valid_df(unip_structure)) {
+    sd <- prepare_uniprot_features(unip_structure, "Structure", gene_chr, gene_strand, region_start, region_end)
+    if (nrow(sd) > 0) { sd$track_name <- "Protein Structure"; raw_features_list$structure <- sd }
+  }
+  if ("modifications" %in% show_tracks) {
+    mp <- list()
+    if ("disulfide"    %in% show_features && is_valid_df(unip_disulfide)) mp$d <- prepare_uniprot_features(unip_disulfide, "Disulfide bond", gene_chr, gene_strand, region_start, region_end)
+    if ("modification" %in% show_features && is_valid_df(unip_modif))     mp$m <- prepare_uniprot_features(unip_modif,     "Modification",   gene_chr, gene_strand, region_start, region_end)
+    if (length(mp) > 0) { md <- bind_rows(mp)
+      if (nrow(md) > 0) { md$track_name <- "Modifications"; raw_features_list$modifications <- md } }
+  }
+
+  all_features_df <- NULL; feature_labels_df <- NULL
+  if (length(raw_features_list) > 0) {
+    raw_features_df <- bind_rows(raw_features_list)
+    if (nrow(raw_features_df) > 0) {
+      all_features_df <- intersect_features_with_exons(raw_features_df, cds_coords)
+      if (!is.null(all_features_df) && nrow(all_features_df) > 0) {
+      cur_y <- min(for_plotting$y_position) - track_spacing
+        ty_map <- data.frame(track_name = c("Topology","Domains & Regions",
+                                            "Protein Structure","Modifications")) %>%
+          filter(track_name %in% unique(all_features_df$track_name)) %>%
+          mutate(track_y_base = cur_y - (row_number() - 1) * track_spacing)
+          all_features_df <- all_features_df %>%
+          left_join(ty_map, by = "track_name") %>%
+          mutate(feature_category = factor(feature_category, levels = names(feature_colors)))
+
+        pack_envelopes <- function(starts, ends) {
+          n <- length(starts); tracks <- numeric(n)
+          if (n > 0) {
+            tracks[1] <- 0
+            if (n > 1) for (i in 2:n) {
+              overlaps <- which(ends[1:(i-1)] >= starts[i])
+              if (length(overlaps) > 0) {
+                used <- tracks[overlaps]; av <- 0
+                while (av %in% used) av <- av + 1
+                tracks[i] <- av
+              } else tracks[i] <- 0
+            }
+          }
+          tracks
+        }
+
+        if (isTRUE(dedup_feature_labels)) {
+          # Collapse every same-named feature (e.g. repeated WD/FG-GAP repeats)
+          # onto ONE row. Each unique name = one envelope [min..max]; non-overlapping
+          # names share a row. All boxes still drawn; backbone line + single label
+          # tie the disjoint instances together.
+          label_env <- all_features_df %>%
+            group_by(track_name, feature_label) %>%
+            summarise(env_start = min(feature_start),
+                      env_end   = max(feature_end), .groups = "drop") %>%
+            group_by(track_name) %>% arrange(env_start, .by_group = TRUE) %>%
+            mutate(sub_track = pack_envelopes(env_start, env_end)) %>%
+            ungroup() %>% select(track_name, feature_label, sub_track)
+          all_features_df <- all_features_df %>%
+            left_join(label_env, by = c("track_name", "feature_label"))
+        } else {
+          all_features_df <- all_features_df %>%
+            group_by(track_name) %>% arrange(feature_start) %>%
+            mutate(sub_track = pack_envelopes(feature_start, feature_end)) %>%
+            ungroup()
+        }
+
+        all_features_df <- all_features_df %>%
+          mutate(feature_y     = track_y_base - (sub_track * feature_track_spacing),
+                 feature_y_min = feature_y - 0.15 * thickness_scale,
+                 feature_y_max = feature_y + 0.15 * thickness_scale)
+
+        feature_labels_df <- all_features_df %>%
+          group_by(track_name, feature_category, feature_label, feature_y) %>%
+          mutate(segment_width = feature_end - feature_start) %>%
+          slice_max(segment_width, n = 1, with_ties = FALSE) %>% ungroup() %>%
+          mutate(mid = (feature_start + feature_end) / 2) %>%
+          select(track_name, feature_category, feature_label, mid, feature_y)
+      }
+    }
+  }
+
+  # Capture genomic boundaries before exon-view transform overwrites them
+  genomic_left  <- min(exon_coords$blockstarts, na.rm = TRUE)
+  genomic_right <- max(exon_coords$blockends,   na.rm = TRUE)
+
+  if (collapse_introns) {
+    ev <- build_exon_view_transform(exon_coords, intron_pad_frac = intron_pad_frac)
+    fn <- ev$transform
+
+    exon_coords  <- apply_transform_cols(exon_coords,  fn, c("blockstarts","blockends"))
+    cds_coords   <- apply_transform_cols(cds_coords,   fn, c("start","end"))
+    for_plotting <- apply_transform_cols(for_plotting, fn, c("start","end"))
+
+    transform_track <- function(lst) {
+      for (nm in c("left_caps","right_caps","middle_bars","pep_introns","highlight_boxes")) {
+        if (!is.null(lst[[nm]])) {
+          lst[[nm]]$xmin <- fn(lst[[nm]]$xmin)
+          lst[[nm]]$xmax <- fn(lst[[nm]]$xmax)
+        }
+      }
+      lst
+    }
+    if (isTRUE(sqtl_result$has_junctions)) sqtl_result <- transform_track(sqtl_result)
+    if (isTRUE(peptide_result$has_peptides)) {
+      peptide_result <- transform_track(peptide_result)
+      peptide_result$peptide_labels$mid_x <- fn(peptide_result$peptide_labels$mid_x)
+    }
+    if (isTRUE(snp_result$has_snps)) {
+      snp_result$stems$x <- fn(snp_result$stems$x)
+      snp_result$heads$x <- fn(snp_result$heads$x)
+    }
+    if (isTRUE(primer_result$has_primers)) {
+      primer_result$amplicon$xstart <- fn(primer_result$amplicon$xstart)
+      primer_result$amplicon$xend   <- fn(primer_result$amplicon$xend)
+      primer_result$amplicon$mid    <- fn(primer_result$amplicon$mid)
+    }
+    if (!is.null(all_features_df) && nrow(all_features_df) > 0) {
+      all_features_df$feature_start <- fn(all_features_df$feature_start)
+      all_features_df$feature_end   <- fn(all_features_df$feature_end)
+      feature_labels_df$mid         <- fn(feature_labels_df$mid)
+    }
+    region_start <- min(exon_coords$blockstarts, na.rm = TRUE)
+    region_end   <- max(exon_coords$blockends,   na.rm = TRUE)
+  }
+
+  raw_limits    <- c(region_start, region_end)
+  span          <- diff(raw_limits)
+  pad_right     <- span * 0.02
+  pad_left      <- span * (if (transcript_label_position == "left") 0.42 else 0.05)
+  padded_lim    <- c(raw_limits[1] - pad_left, raw_limits[2] + pad_right)
+
+  # Recompute sQTL cap widths in DATA units from a physical pt target
+  if (isTRUE(sqtl_result$has_junctions)) {
+    pt_per_in   <- 72
+    panel_data_span <- diff(padded_lim)
+    cap_w_data  <- (sqtl_cap_pt / pt_per_in) / plot_width_in * panel_data_span
+    mb <- sqtl_result$middle_bars
+    sqtl_result$left_caps <- mb %>%
+      mutate(xmax = xmin + cap_w_data,
+             ymin = ymin - (0.12 * thickness_scale - 0.04 * thickness_scale),
+             ymax = ymax + (0.12 * thickness_scale - 0.04 * thickness_scale))
+    sqtl_result$right_caps <- mb %>%
+      mutate(xmin = xmax - cap_w_data,
+             ymin = ymin - (0.12 * thickness_scale - 0.04 * thickness_scale),
+             ymax = ymax + (0.12 * thickness_scale - 0.04 * thickness_scale))
+  }
+  label_x_left  <- raw_limits[1] - span * 0.02
+  label_x_right <- raw_limits[2] + span * 0.04
+
+  # ========================== BUILD MAIN PLOT ==========================
+  p1 <- ggplot()
+
+  # sQTL highlight (background)
+  if (isTRUE(sqtl_result$has_junctions) && !is.null(sqtl_result$highlight_boxes)) {
+    y_min_hl <- if (!is.null(all_features_df) && nrow(all_features_df) > 0)
+      min(all_features_df$feature_y_min) - 0.5 else min(for_plotting$y_position) - 1
+    y_max_hl <- if (isTRUE(snp_result$has_snps))                snp_result$max_y + 0.5
+                else if (isTRUE(peptide_result$has_peptides))   peptide_result$max_y + 0.5
+                else                                            sqtl_result$max_y + 0.5
+    hd <- sqtl_result$highlight_boxes %>% mutate(ymin = y_min_hl, ymax = y_max_hl)
+    p1 <- p1 + geom_rect(data = hd,
+                         aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                         fill = hd$fill_color, alpha = hd$alpha, color = NA)
+  }
+
+  # Transcripts (thicker bars); fill is assigned per row rather than mapped as an aesthetic
+  intron_h <- 0.04 * thickness_scale
+  exon_h   <- 0.15 * thickness_scale
+  cds_h    <- 0.30 * thickness_scale
+
+  shadow_lookup <- transcript_order %>% select(trans_id, is_shadow)
+
+  add_fill <- function(df) {
+    df %>%
+      left_join(shadow_lookup, by = "trans_id") %>%
+      mutate(is_shadow = tidyr::replace_na(is_shadow, FALSE),
+             .fill = ifelse(is_shadow,
+                            fade_hex(unname(cat_colors[risk_status])),
+                            unname(cat_colors[risk_status])))
+  }
+
+  exon_coords  <- add_fill(exon_coords)
+  cds_coords   <- add_fill(cds_coords)
+  for_plotting <- add_fill(for_plotting)
+
+  p1 <- p1 +
+    geom_rect(data = for_plotting,
+              aes(xmin = start, xmax = end,
+                  ymin = y_position - intron_h, ymax = y_position + intron_h,
+                  fill = .fill), color = NA) +
+                  geom_rect(data = exon_coords,
+              aes(xmin = blockstarts, xmax = blockends,
+                  ymin = y_position - exon_h, ymax = y_position + exon_h,
+                  fill = .fill, color = .fill), linewidth = 0.2) +
+    geom_rect(data = cds_coords,
+              aes(xmin = start, xmax = end,
+                  ymin = y_position - cds_h, ymax = y_position + cds_h,
+                  fill = .fill, color = .fill), linewidth = 0.25) +
+    scale_fill_identity() +
+    scale_color_identity()
+
+  # sQTL track
+  if (isTRUE(sqtl_result$has_junctions)) {
+    p1 <- p1 +
+      geom_rect(data = sqtl_result$middle_bars,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = sqtl_result$middle_bars$fill_color, color = NA) +
+      geom_rect(data = sqtl_result$left_caps,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = sqtl_result$left_caps$fill_color, color = NA) +
+      geom_rect(data = sqtl_result$right_caps,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = sqtl_result$right_caps$fill_color, color = NA)
+  }
+
+  # Peptide track
+  if (isTRUE(peptide_result$has_peptides)) {
+    .pspan <- diff(padded_lim); .minw <- .pspan * 0.006
+    .mb <- peptide_result$middle_bars
+    .thin <- (.mb$xmax - .mb$xmin) < .minw
+    .ctr <- (.mb$xmin + .mb$xmax) / 2
+    .mb$xmin[.thin] <- .ctr[.thin] - .minw/2
+    .mb$xmax[.thin] <- .ctr[.thin] + .minw/2
+    peptide_result$middle_bars <- .mb
+    p1 <- p1 +
+      geom_rect(data = peptide_result$pep_introns,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = peptide_result$pep_introns$fill_color, color = NA) +
+      geom_rect(data = peptide_result$middle_bars,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = peptide_result$middle_bars$fill_color, color = NA) +
+      geom_rect(data = peptide_result$left_caps,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = peptide_result$left_caps$fill_color, color = NA) +
+      geom_rect(data = peptide_result$right_caps,
+                aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                fill = peptide_result$right_caps$fill_color, color = NA)
+    if (show_peptide_labels) {
+    p1 <- p1 + ggrepel::geom_text_repel(
+        data = peptide_result$peptide_labels,
+        aes(x = mid_x, y = peptide_y, label = label),
+        size = text_size,
+        min.segment.length = 0, segment.size = 0.2,
+        direction = "both", nudge_y = 0.6,
+        box.padding = 0.4, point.padding = 0.2,
+        force = 3, max.overlaps = Inf)
+    }
+}
+    # track label for the peptide row, aligned with the transcript labels
+  if (isTRUE(peptide_result$has_peptides)) {
+    pep_lab <- tibble::tibble(
+      y     = mean(c(peptide_base_y, peptide_result$max_y)),
+      x     = if (transcript_label_position == "left") label_x_left else label_x_right,
+      hjust = if (transcript_label_position == "left") 1 else 0,
+      label = "Detected peptides")
+    p1 <- p1 + geom_text(data = pep_lab,
+                         aes(x = x, y = y, label = label, hjust = hjust),
+                         size = text_size, lineheight = 0.9)
+  }
+
+  # SNP track
+  if (isTRUE(snp_result$has_snps)) {
+    snp_drop_y_bottom <- if (!is.null(all_features_df) && nrow(all_features_df) > 0)
+      min(all_features_df$feature_y_min) - 0.2 else min(for_plotting$y_position) - 0.5
+
+    p1 <- p1 +
+      geom_segment(data = snp_result$heads,
+                   aes(x = x, xend = x, y = y, yend = snp_drop_y_bottom),
+                   color = snp_result$heads$color,
+                   linewidth = 0.25, linetype = "dotted") +
+      geom_segment(data = snp_result$stems,
+                   aes(x = x, xend = x, y = y_lo, yend = y_hi),
+                   color = snp_result$stems$color,
+                   linewidth = snp_result$stems$size) +
+      geom_point(data = snp_result$heads,
+                 aes(x = x, y = y),
+                 color = snp_result$heads$color,
+                 size  = snp_result$heads$point_size)
+
+                 if (show_snp_labels) {
+      p1 <- p1 + ggrepel::geom_text_repel(
+        data = snp_result$heads,
+        aes(x = x, y = y, label = rsid, fontface = label_face),
+        size = text_size, color = snp_result$heads$color,
+        nudge_y = 0.5, segment.size = 0.2, segment.alpha = 0.5,
+        direction = "both",
+        force = 2, force_pull = 0.5,
+        box.padding = 0.15, point.padding = 0.1,
+        max.overlaps = Inf, show.legend = FALSE)
+    }
+  }
+
+  # Primer / amplicon track
+  if (isTRUE(primer_result$has_primers)) {
+    amp <- primer_result$amplicon
+    p1 <- p1 +
+      geom_segment(data = amp, aes(x = xstart, xend = xend, y = y, yend = y),
+                   color = primer_color, linewidth = 0.5) +
+      geom_segment(data = amp, aes(x = xstart, xend = xstart, y = y_lo, yend = y_hi),
+                   color = primer_color, linewidth = 0.5) +
+      geom_segment(data = amp, aes(x = xend, xend = xend, y = y_lo, yend = y_hi),
+                   color = primer_color, linewidth = 0.5)
+    if (isTRUE(primer_label))
+      p1 <- p1 + geom_text(data = amp,
+                           aes(x = mid, y = lab_y, label = amplicon_label),
+                           size = text_size, color = primer_color)
+  }
+
+  # UniProt features — hardcoded per-row fill
+  if (!is.null(all_features_df) && nrow(all_features_df) > 0) {
+    feature_spans <- all_features_df %>%
+      group_by(track_name, feature_category, feature_label, feature_y) %>%
+      summarise(span_start = min(feature_start), span_end = max(feature_end),
+                .groups = "drop")
+    all_features_df <- all_features_df %>%
+      mutate(.fill = unname(feature_colors[as.character(feature_category)]))
+    p1 <- p1 +
+      geom_segment(data = feature_spans,
+                   aes(x = span_start, xend = span_end, y = feature_y, yend = feature_y),
+                   linewidth = 0.3, color = "gray40") +
+      geom_rect(data = all_features_df,
+                aes(xmin = feature_start, xmax = feature_end,
+                    ymin = feature_y_min, ymax = feature_y_max,
+                    fill = .fill), color = NA)
+    if (show_feature_labels && nrow(feature_labels_df) > 0) {
+    p1 <- p1 + ggrepel::geom_text_repel(
+        data = feature_labels_df,
+        aes(x = mid, y = feature_y, label = feature_label),
+        size = text_size, min.segment.length = 0,
+        segment.size = 0.2, segment.alpha = 0.3,
+        direction = "both", nudge_y = -0.5,
+        box.padding = 0.4, point.padding = 0.2,
+        force = 3, force_pull = 0.5,
+        max.overlaps = Inf, xlim = c(NA, raw_limits[2]))
+    }
+  }
+
+  # Transcript labels
+  # Display label: ENST accession for full-splice-match isoforms, PB accession otherwise.
+  # The trailing |N of the PB trans_id is retained either way.
+  tx_label_lookup <- if (!is.null(sqanti_data) &&
+                         all(c("pb", "tx_transcripts") %in% names(sqanti_data))) {
+    # An ENST label is used only for full-splice matches: an ISM is a fragment of the
+    # reference, not the same transcript, and two ISMs against one reference would
+    # otherwise receive identical labels.
+    sqanti_data %>%
+      dplyr::distinct(pb, tx_transcripts, tx_cat) %>%
+      dplyr::transmute(pb_id = pb,
+                       display = dplyr::if_else(
+                         tx_transcripts != "novel" & tx_cat == "full-splice_match",
+                         tx_transcripts, NA_character_))
+  } else tibble::tibble(pb_id = character(), display = character())
+
+  tx_label_data <- for_plotting %>%
+    distinct(trans_id, y_position, is_shadow) %>%
+    mutate(pb_id   = str_extract(trans_id, "PB\\.[0-9]+\\.[0-9]+"),
+           cpm_tag = str_extract(trans_id, "(?<=\\|)[0-9]+$")) %>%
+    left_join(tx_label_lookup, by = "pb_id") %>%
+    transmute(trans_id, y_position,
+              label_raw = if_else(!is.na(display) & !is.na(cpm_tag),
+                                  paste0(display, "|", cpm_tag),
+                                  trans_id),
+              label_wrapped = if (transcript_label_wrap)
+                                str_replace(label_raw, "\\|", "\n")
+                              else label_raw,
+              colour = if_else(is_shadow, "grey65", "grey20"),
+              x = if (transcript_label_position == "left") label_x_left else label_x_right,
+              hjust = if (transcript_label_position == "left") 1 else 0)
+  p1 <- p1 + geom_text(data = tx_label_data,
+                       aes(x = x, y = y_position, label = label_wrapped,
+                           hjust = hjust, colour = colour),
+                       size = text_size, lineheight = 0.9)
+                       # track label for the sQTL junction row, aligned with the transcript labels
+  if (isTRUE(sqtl_result$has_junctions)) {
+    sqtl_lab <- tibble::tibble(
+      y     = mean(c(sqtl_base_y, sqtl_result$max_y)),
+      x     = if (transcript_label_position == "left") label_x_left else label_x_right,
+      hjust = if (transcript_label_position == "left") 1 else 0,
+      label = "sQTL splice junction(s)")
+    p1 <- p1 + geom_text(data = sqtl_lab,
+                         aes(x = x, y = y, label = label, hjust = hjust),
+                         size = text_size, lineheight = 0.9)
+  }
+  # Tight y-limits
+  # More headroom for SNP labels when there are many (they may stack vertically)
+  n_snps_visible <- if (isTRUE(snp_result$has_snps)) nrow(snp_result$heads) else 0
+  snp_label_pad  <- if (n_snps_visible >= 4) 1.0
+                    else if (n_snps_visible >= 2) 0.5
+                    else 0.2
+  y_top <- if (isTRUE(snp_result$has_snps)) snp_result$max_y + snp_label_pad
+           else if (isTRUE(peptide_result$has_peptides)) peptide_result$max_y + 0.5
+           else if (isTRUE(sqtl_result$has_junctions)) sqtl_result$max_y + 0.5
+           else max(for_plotting$y_position) + 0.5
+
+           y_bottom <- if (!is.null(all_features_df) && nrow(all_features_df) > 0) {
+    min(all_features_df$feature_y_min) - 0.3
+  } else {
+    min(for_plotting$y_position) - 0.6
+  }
+  if (isTRUE(primer_result$has_primers))
+    y_bottom <- min(y_bottom, primer_result$amplicon$y[1] - 0.4)
+
+    # Title
+  strand_str <- if (gene_strand == "-") "− strand" else "+ strand"
+  flip_str   <- if (should_flip)        ", reversed" else ""
+  view_str   <- if (collapse_introns)   ", exon view" else ""
+
+  # Position range (always shown - useful in both genomic and exon view)
+  pos_lo_str <- format(genomic_left,  big.mark = ",", scientific = FALSE)
+  pos_hi_str <- format(genomic_right, big.mark = ",", scientific = FALSE)
+  pos_str    <- sprintf("%s:%s–%s", gene_chr, pos_lo_str, pos_hi_str)
+
+  meta_str <- sprintf("%s, %s%s%s", pos_str, strand_str, flip_str, view_str)
+  plot_title <- if (!is.null(title))
+    sprintf("*%s*<br>%s", title, meta_str)
+    else sprintf("*%s*<br>%s", gene_name_for_sqtl, meta_str)
+
+  x_label <- if (collapse_introns) NULL else "Genomic position (bp)"
+
+  p1 <- p1 +
+  scale_x_continuous(
+      expand = expansion(0, 0),
+      labels = if (should_flip)
+        function(v) format(round(genomic_left + genomic_right - v), big.mark = ",", scientific = FALSE)
+        else function(v) format(round(v), big.mark = ",", scientific = FALSE)) +
+    coord_cartesian(clip = "off",
+                    xlim = padded_lim,
+                    ylim = c(y_bottom, y_top)) +
+    theme_bw(base_size = base_pt) +
+    labs(title = plot_title, x = x_label, y = NULL) +
+    theme(
+      text             = element_text(size = base_pt),
+      plot.title       = ggtext::element_markdown(size = base_pt, hjust = 0.5,
+                                      lineheight = 0.95, margin = margin(b = 2)),
+      axis.title       = element_text(size = base_pt),
+      axis.text.x      = if (collapse_introns) element_blank() else element_text(size = base_pt),
+      axis.ticks.x     = if (collapse_introns) element_blank() else element_line(),
+      axis.text.y      = element_blank(),
+      axis.ticks.y     = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position  = "none",
+      plot.margin      = margin(2, 4, 2, 2, "pt"))
+
+  # ========================== BUILD LEGEND PANEL ==========================
+  present_cats   <- intersect(names(cat_colors), unique(transcript_order$risk_status))
+  sqtl_effects   <- if (isTRUE(sqtl_result$has_junctions))
+                     unique(sqtl_result$junction_data$effect_type) else character(0)
+  feat_cats      <- if (!is.null(all_features_df) && nrow(all_features_df) > 0)
+                     as.character(unique(all_features_df$feature_category)) else character(0)
+
+                     legend_rows <- list()
+  if (length(present_cats) > 0 && !is.na(legend_title) && isTRUE(show_risk_legend)) {
+    legend_rows[[length(legend_rows) + 1]] <- tibble(
+      group = legend_title,
+      level = present_cats,
+      color = unname(cat_colors[present_cats]))
+  }
+  if (length(sqtl_effects) > 0) {
+    effect_colors <- c("Increased" = "#ef5350", "Decreased" = "#7ba9ff", "Other" = "gray50")
+    legend_rows[[length(legend_rows) + 1]] <- tibble(
+      group = "CAD sQTL junction usage",
+      level = sqtl_effects,
+      color = unname(effect_colors[sqtl_effects]))
+  }
+  if (length(feat_cats) > 0) {
+    legend_rows[[length(legend_rows) + 1]] <- tibble(
+      group = "UniProt Features",
+      level = feat_cats,
+      color = unname(feature_colors[feat_cats]))
+  }
+
+  if (isTRUE(transcript_label_legend)) {
+    legend_rows[[length(legend_rows) + 1]] <- tibble(
+      group = "Transcript labels",
+      level = transcript_label_legend_text,
+      color = NA_character_)                     # NA colour = text only, no swatch
+  }
+
+  if (length(legend_rows) > 0) {
+    legend_df <- bind_rows(legend_rows)
+    # Align columns across groups so Risk/Increased stack, Non-Risk/Decreased stack
+    lvl_order <- c("Risk", "Increased", "Nonrisk", "Decreased", "Other")
+    legend_df <- legend_df %>%
+      dplyr::mutate(.ord = match(level, lvl_order),
+                    .ord = ifelse(is.na(.ord), 99L, .ord)) %>%
+      dplyr::arrange(group, .ord) %>%
+      dplyr::select(-.ord)
+      group_order <- intersect(c(legend_title, "CAD sQTL junction usage",
+                               "UniProt Features", "Transcript labels"),
+                             unique(legend_df$group))
+    legend_df <- legend_df %>%
+      mutate(group = factor(group, levels = group_order)) %>%
+      arrange(group) %>%
+      group_by(group) %>%
+      mutate(x = row_number()) %>%
+      ungroup()
+
+    # y: groups stacked top-to-bottom (top = first listed)
+    n_groups <- length(group_order)
+    legend_df <- legend_df %>%
+      mutate(y = n_groups - as.integer(group) + 1)
+
+    n_cols   <- max(legend_df$x)
+    x_label_col <- -0.2
+    x_swatch_start <- 0.5
+
+    legend_df <- legend_df %>%
+      mutate(has_swatch = !is.na(color),
+             swatch_x = ifelse(has_swatch, x_swatch_start + (x - 1) * 1.2,
+                                           x_swatch_start - 0.13 + (x - 1) * 2.6),
+             text_x   = ifelse(has_swatch, swatch_x + 0.13, swatch_x))
+
+    group_label_df <- legend_df %>% distinct(group, y) %>%
+      mutate(x = x_label_col,
+             # tighter row spacing: multiply y to compress
+             y = y * 0.55)
+
+    legend_df <- legend_df %>% mutate(y = y * 0.55)
+
+    p_legend <- ggplot() +
+      geom_point(data = dplyr::filter(legend_df, has_swatch),
+                 aes(x = swatch_x, y = y),
+                 fill = dplyr::filter(legend_df, has_swatch)$color, color = "black",
+                 shape = 22, size = 2.0, stroke = 0.15) +
+      geom_text(data = legend_df,
+                aes(x = text_x, y = y, label = level),
+                hjust = 0, size = text_size, color = "black") +
+      geom_text(data = group_label_df,
+                aes(x = x, y = y, label = group),
+                hjust = 1, size = text_size) +
+      coord_cartesian(clip = "off",
+                      xlim = c(-2.0, max(legend_df$text_x) + 1.2),
+                      ylim = c(0.2, max(legend_df$y) + 0.35)) +
+      theme_void() +
+      theme(plot.margin = margin(0, 4, 2, 4, "pt"))
+
+    out <- (p1 / p_legend) + patchwork::plot_layout(heights = legend_heights)
+  } else {
+    out <- p1
+  }
+
+  out
+}
+```
+
+# B. Peptide evidence
+
+Peptide classification is sequence-first: detections are joined to the Cleaver in-silico
+digest by sequence, and the junction-membership call (Risk / Nonrisk / Both (shared) / Neither)
+is made against the risk and nonrisk isoform sets built in section 12. PoGo coordinates play no
+part in the classification, so peptides that PoGo could not place on the genome are still
+evaluated.
+
+## 10. Detected peptides
+
+IS-PRM sequences come from the Tomahto output; discovery sequences (RTS and DDA acquisitions)
+from the sequence column of the PoGo exports. A peptide is recorded once per platform, so that
+the detection method can be reported per peptide.
+
+```{r detections}
+tom_raw <- read_csv(F_ISPRM_DETECTED, show_col_types = FALSE)
+.tom_seq <- intersect(c("Peptide", "peptide", "Sequence", "Annotated.Sequence"), names(tom_raw))[1]
+stopifnot("no peptide sequence column in the IS-PRM output" = !is.na(.tom_seq))
+
+det_isprm <- tom_raw %>%
+  transmute(pep = bare_seq(.data[[.tom_seq]]), platform = "IS-PRM") %>%
+  filter(nchar(pep) >= 6)
+
+read_pogo <- function(bed_file, platform) {
+  read_tsv(bed_file,
+           col_names = c("chrom", "chromStart", "chromEnd", "peptide_seq", "score",
+                         "strand", "thickStart", "thickEnd", "itemRgb", "blockCount",
+                         "blockSizes", "blockStarts"),
+           skip = 1, col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+    transmute(pep = bare_seq(peptide_seq), platform = platform,
+              chrom, strand,
+              chromStart = as.numeric(chromStart) + 1,
+              chromEnd   = as.numeric(chromEnd)   + 1,
+              blockCount = as.numeric(blockCount),
+              blockSizes, blockStarts, pogo_itemRgb = itemRgb)
+}
+pogo_all <- imap_dfr(POGO_BEDS, ~ read_pogo(.x, .y))
+
+detections <- bind_rows(
+  det_isprm,
+  pogo_all %>% filter(platform != "IS-PRM") %>% transmute(pep, platform)) %>%
+  filter(!is.na(pep), nchar(pep) > 0) %>%
+  distinct(pep, platform)
+
+peptides <- detections %>%
+  group_by(pep) %>%
+  summarise(platforms     = paste(sort(unique(platform)), collapse = "+"),
+            via_isprm     = any(platform == "IS-PRM"),
+            via_discovery = any(platform != "IS-PRM"),
+            .groups = "drop")
+
+# IS-PRM sequence set, used for the detected_by column of the evidence table.
+isprm_peptide_seqs <- unique(det_isprm$pep)
+
+cat(sprintf("distinct detected peptides: %s (IS-PRM %s | discovery %s | both %s)\n",
+            comma(nrow(peptides)), comma(sum(peptides$via_isprm)),
+            comma(sum(peptides$via_discovery)),
+            comma(sum(peptides$via_isprm & peptides$via_discovery))))
+```
+
+## 11. Cleaver digest
+
+The in-silico tryptic digest of the hybrid VSMC/GENCODE proteome lists, for every peptide, the
+isoforms whose predicted protein contains it. This is the protein-membership truth against
+which detections are interpreted; column names are resolved by pattern because the digest
+export uses dotted names.
+
+```{r cleaver_lookup}
+cleaver_raw <- read_csv(F_CLEAVER_DIGEST, show_col_types = FALSE)
+
+.pick <- function(df, patterns, what) {
+  for (p in patterns) {
+    hit <- grep(p, names(df), ignore.case = TRUE, value = TRUE)
+    if (length(hit)) return(hit[1])
+  }
+  stop(sprintf("cleaver_lookup: no column for '%s'. Available: %s",
+               what, paste(names(df), collapse = ", ")))
+}
+.c_gene  <- .pick(cleaver_raw, c("^gene\\.?name$", "^gene_name$", "^gene$"),     "gene_symbol")
+.c_seq   <- .pick(cleaver_raw, c("^AAseq$", "pep.*seq", "^sequence$"),           "peptide_seq_aa")
+.c_ids   <- .pick(cleaver_raw, c("^IDs$", "pb.?ids", "iso.*ids", "accession"),   "pb_ids_list")
+.c_ntot  <- .pick(cleaver_raw, c("iso\\.?total", "n_isoforms_total", "^total$"), "n_isoforms_total")
+.c_nwith <- .pick(cleaver_raw, c("^count$", "n_isoforms_with", "with.?seq"),     "n_isoforms_with_seq")
+.c_cat   <- .pick(cleaver_raw, c("^category$", "cleaver.?cat", "iso.*specific"), "cleaver_category")
+.c_gspec <- .pick(cleaver_raw, c("gene\\.?specificity", "gene_specificity"),     "gene_specificity")
+
+cleaver_lookup <- cleaver_raw %>%
+  transmute(
+    gene_symbol         = .data[[.c_gene]],
+    peptide_seq_aa      = toupper(.data[[.c_seq]]),
+    cleaver_category    = .data[[.c_cat]],
+    gene_specificity    = .data[[.c_gspec]],
+    n_isoforms_with_seq = suppressWarnings(as.integer(.data[[.c_nwith]])),
+    n_isoforms_total    = suppressWarnings(as.integer(.data[[.c_ntot]])),
+    pb_ids_list         = str_extract_all(.data[[.c_ids]], "PB\\.[0-9]+\\.[0-9]+"))
+```
+
+## 12. Junction-to-isoform map and the junction funnel
+
+The junction map (script 02) shares the `junction_key` format of the sQTL table, so joins are
+exact. `funnel` records, for each of the 355 distinct CAD junctions, whether it is carried by
+at least one long-read isoform (`lr_captured`) and whether it lies within a predicted CDS
+(`probeable`, coding class "CDS (at least partial)", which already implies long-read capture).
+Only probeable junctions can in principle be distinguished by a peptide.
+
+```{r junction_map}
+jm   <- read_csv(OUT_JUNCTION_ISOFORM_MAP, show_col_types = FALSE)
+jcol <- intersect(c("junction_key", "cad_sqtl_junction"), names(jm))[1]
+pcol <- intersect(c("pb_id", "pb_acc", "pb", "isoform", "trans_id"), names(jm))[1]
+stopifnot(!is.na(jcol), !is.na(pcol))
+jmap <- jm %>%
+  transmute(junction_key = .data[[jcol]],
+            pb_acc = str_extract(as.character(.data[[pcol]]), "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc)) %>% distinct()
+isoforms_with <- function(jk) jmap %>% filter(junction_key %in% jk) %>% pull(pb_acc) %>% unique()
+
+# Gene x cluster: junctions whose usage increases with the risk allele (risk) or decreases
+# (nonrisk).
+gj <- lfc %>%
+  transmute(gene = gene_name, cluster, junction_key, dir = effect_direction) %>%
+  mutate(role = case_when(str_detect(dir, regex("increas", ignore_case = TRUE)) ~ "risk",
+                          str_detect(dir, regex("decreas", ignore_case = TRUE)) ~ "nonrisk",
+                          TRUE ~ NA_character_)) %>%
+  filter(!is.na(role), !is.na(junction_key), !is.na(cluster)) %>%
+  group_by(gene, cluster) %>%
+  summarise(risk_juncs    = list(unique(junction_key[role == "risk"])),
+            nonrisk_juncs = list(unique(junction_key[role == "nonrisk"])), .groups = "drop")
+
+# Gene -> all long-read isoforms (for the complement rule in section 13).
+sqp <- sqanti_protein_cpm
+pbc <- intersect(c("pb", "pb_acc", "isoform"), names(sqp))[1]
+gnc <- intersect(c("gene", "gene_name", "associated_gene"), names(sqp))[1]
+gene_iso <- sqp %>%
+  transmute(gene = .data[[gnc]],
+            pb_acc = str_extract(as.character(.data[[pbc]]), "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc)) %>% distinct()
+all_iso_of <- function(g) gene_iso %>% filter(gene == g) %>% pull(pb_acc) %>% unique()
+
+cds_class <- read_csv(OUT_CAD_JUNCTION_CODING, show_col_types = FALSE)
+funnel <- lfc %>% distinct(junction_key) %>%
+  mutate(lr_captured = junction_key %in% jmap$junction_key,
+         probeable   = junction_key %in%
+           cds_class$junction_key[cds_class$coding_class == "CDS (at least partial)"],
+         cds         = probeable)
+probeable_keys <- funnel$junction_key[funnel$probeable]
+cat(sprintf("funnel: %d distinct junctions | %d long-read captured | %d probeable (CDS)\n",
+            nrow(funnel), sum(funnel$lr_captured), sum(funnel$probeable)))
+```
+
+## 13. Risk and nonrisk isoform sets per cluster
+
+Three rules define the stringency of "validating". Complement rule: when only one of the two
+competing junctions was captured in long-read data, the other side is the complement of that
+junction's isoforms within the gene. Ambiguity removal: an isoform carrying both junctions
+cannot discriminate and is dropped from both sets. Usability gate: a cluster is classified only
+when both sets are non-empty after ambiguity removal; one-sided clusters are excluded rather
+than classified by default.
+
+```{r isoform_sets}
+gs3 <- gj %>% rowwise() %>%
+  mutate(R0 = list(isoforms_with(unlist(risk_juncs))),
+         N0 = list(isoforms_with(unlist(nonrisk_juncs))),
+         all_iso = list(all_iso_of(gene)),
+         R = list(if (length(R0) == 0 && length(N0) > 0) setdiff(all_iso, N0) else R0),
+         N = list(if (length(N0) == 0 && length(R0) > 0) setdiff(all_iso, R0) else N0),
+         amb = list(intersect(R, N)),
+         R = list(setdiff(R, amb)), N = list(setdiff(N, amb))) %>%
+  ungroup() %>%
+  mutate(nR0 = lengths(R0), nN0 = lengths(N0), nR = lengths(R), nN = lengths(N),
+         rule = case_when(nR0 > 0 & nN0 > 0 ~ "both junctions captured",
+                          nR0 > 0 | nN0 > 0 ~ "complement (one junction captured)",
+                          TRUE              ~ "no junction captured"),
+         usable = nR > 0 & nN > 0)
+```
+
+## 14. Peptide classification
+
+Detections are joined to the digest by sequence, so the gene assignment comes from the digest.
+A peptide whose isoforms fall only in the risk set is a Risk peptide, only in the nonrisk set a
+Nonrisk peptide, in both sets Both (shared), and in neither set Neither. Peptides evaluated in
+more than one cluster of a gene keep the most informative call.
+
+```{r classify_peptides}
+pep_iso <- cleaver_lookup %>%
+  transmute(gene_symbol, pep = toupper(peptide_seq_aa), seq_pbs = pb_ids_list) %>%
+  distinct(gene_symbol, pep, .keep_all = TRUE)
+
+detected_pep <- pep_iso %>%
+  select(gene_symbol, pep) %>%
+  inner_join(peptides %>% select(pep), by = "pep") %>%
+  distinct()
+
+cov <- detected_pep %>% left_join(pep_iso, by = c("gene_symbol", "pep"))
+
+pc <- cov %>% filter(!is.na(seq_pbs)) %>%
+  inner_join(gs3 %>% filter(usable) %>% select(gene, cluster, R, N),
+             by = c("gene_symbol" = "gene"), relationship = "many-to-many") %>%
+  mutate(hR = map2_lgl(seq_pbs, R, ~ any(.x %in% .y)),
+         hN = map2_lgl(seq_pbs, N, ~ any(.x %in% .y)),
+         cls = case_when(hR & !hN ~ "Risk", !hR & hN ~ "Nonrisk",
+                         hR &  hN ~ "Both (shared)", TRUE ~ "Neither"))
+PRIO <- c("Risk" = 1, "Nonrisk" = 1, "Both (shared)" = 2, "Neither" = 3)
+pep_call <- pc %>% mutate(p = PRIO[cls]) %>%
+  group_by(gene_symbol, pep) %>% slice_min(p, n = 1, with_ties = FALSE) %>% ungroup() %>%
+  select(gene_symbol, pep, junction_class = cls, cluster)
+
+pep_class <- detected_pep %>%
+  left_join(pep_call, by = c("gene_symbol", "pep")) %>%
+  left_join(gs3 %>% group_by(gene) %>% summarise(any_usable = any(usable), .groups = "drop"),
+            by = c("gene_symbol" = "gene")) %>%
+  mutate(junction_class = case_when(
+           !is.na(junction_class) ~ junction_class,
+           is.na(any_usable)      ~ "no sQTL junctions for gene",
+           !any_usable            ~ "not evaluable (no junction captured)",
+           TRUE                   ~ "not in digest"),
+         junction_validating = junction_class %in% c("Risk", "Nonrisk"))
+
+ev <- pep_class %>% filter(junction_class %in% c("Risk", "Nonrisk", "Both (shared)", "Neither"))
+```
+
+## 15. Evidence tables
+
+`peptide_isoform_evidence_detail.csv` holds one row per evaluable peptide with the isoforms its
+classification rests on; it is read by script 10 (Fig. 4g, Extended Data Fig. 4a and 5c) and by
+Part C to choose the isoforms and peptides drawn in each browser panel. `detected_by` is IS-PRM
+when the sequence is in the Tomahto output.
+
+```{r evidence_tables}
+isprm_set <- toupper(isprm_peptide_seqs)
+EVAL_LV <- c("Risk", "Nonrisk", "Both (shared)", "Neither")
+
+detail <- pep_class %>% filter(junction_class %in% EVAL_LV) %>%
+  left_join(pep_iso, by = c("gene_symbol", "pep")) %>%
+  left_join(gs3 %>% filter(usable) %>% select(gene_symbol = gene, cluster, R, N),
+            by = c("gene_symbol", "cluster")) %>%
+  rowwise() %>%
+  mutate(target = list(switch(junction_class,
+                              "Risk"          = intersect(seq_pbs, R),
+                              "Nonrisk"       = intersect(seq_pbs, N),
+                              "Both (shared)" = intersect(seq_pbs, union(R, N)),
+                              seq_pbs)),
+         isoforms_evidenced   = paste(sort(unlist(target)), collapse = "; "),
+         n_isoforms_evidenced = length(unlist(target)),
+         all_isoforms_with_peptide = paste(sort(seq_pbs), collapse = "; ")) %>%
+  ungroup() %>%
+  mutate(detected_by = ifelse(pep %in% isprm_set, "IS-PRM", "Discovery"),
+         peptide_class = factor(junction_class, levels = EVAL_LV)) %>%
+  select(gene_symbol, cluster, peptide = pep, peptide_class,
+         isoforms_evidenced, n_isoforms_evidenced, all_isoforms_with_peptide, detected_by) %>%
+  arrange(gene_symbol, peptide_class, desc(n_isoforms_evidenced))
+write_csv(detail, OUT_PEPTIDE_EVIDENCE_DETAIL)
+
+pep_list <- function(p, d) {
+  if (!length(p)) return(NA_character_)
+  paste(ifelse(d == "IS-PRM", paste0(p, "*"), p), collapse = "; ")
+}
+
+# Cluster-level summary (IS-PRM peptides marked with *), used for the Results counts below.
+summary_tbl <- detail %>%
+  group_by(gene_symbol, cluster) %>%
+  summarise(
+    n_risk    = sum(peptide_class == "Risk"),
+    n_nonrisk = sum(peptide_class == "Nonrisk"),
+    n_shared  = sum(peptide_class == "Both (shared)"),
+    n_neither = sum(peptide_class == "Neither"),
+    risk_peptides    = pep_list(peptide[peptide_class == "Risk"],
+                                detected_by[peptide_class == "Risk"]),
+    nonrisk_peptides = pep_list(peptide[peptide_class == "Nonrisk"],
+                                detected_by[peptide_class == "Nonrisk"]),
+    shared_peptides  = pep_list(peptide[peptide_class == "Both (shared)"],
+                                detected_by[peptide_class == "Both (shared)"]),
+    risk_isoforms_evidenced = paste(sort(unique(unlist(
+      str_split(isoforms_evidenced[peptide_class == "Risk"], "; ")))), collapse = "; "),
+    nonrisk_isoforms_evidenced = paste(sort(unique(unlist(
+      str_split(isoforms_evidenced[peptide_class == "Nonrisk"], "; ")))), collapse = "; "),
+    isprm_risk    = sum(peptide_class == "Risk"          & detected_by == "IS-PRM"),
+    isprm_nonrisk = sum(peptide_class == "Nonrisk"       & detected_by == "IS-PRM"),
+    isprm_shared  = sum(peptide_class == "Both (shared)" & detected_by == "IS-PRM"),
+    any_isprm     = any(detected_by == "IS-PRM"),
+    .groups = "drop") %>%
+  mutate(evidence_class = case_when(
+           n_risk > 0 & n_nonrisk > 0 ~ "1. BOTH isoforms validated",
+           n_risk > 0 | n_nonrisk > 0 ~ "2. one isoform validated",
+           n_shared > 0               ~ "3. shared peptides only",
+           TRUE                       ~ "4. neither-junction peptides only")) %>%
+  arrange(evidence_class, desc(n_risk + n_nonrisk), desc(n_shared))
+```
+
+## 16. Results counts at the peptide and gene level
+
+These are the peptide-level numbers quoted in Results: the number of CAD sGenes with at least
+one detected peptide, the peptides recovered at CAD sQTL junctions and the fraction mapping to
+sequence shared by the isoforms of a gene, and the validating rate by platform. IS-PRM peptides
+were selected to be isoform-distinguishing, so their higher validating rate reflects the
+targeting design.
+
+```{r results_counts}
+cat(sprintf("CAD sGenes with >= 1 detected peptide: %d of %d\n",
+            n_distinct(pep_class$gene_symbol[pep_class$gene_symbol %in% lfc$gene_name]),
+            n_distinct(lfc$gene_name)))
+
+cat("\nPeptides by junction class:\n")
+print(pep_class %>% count(junction_class) %>% mutate(pct = round(100 * n / sum(n), 1)))
+cat(sprintf("\nEvaluable peptides %d | validating (Risk or Nonrisk) %d (%.1f%%)\n",
+            nrow(ev), sum(ev$junction_validating), 100 * mean(ev$junction_validating)))
+
+plat <- ev %>%
+  left_join(peptides %>% select(pep, via_isprm, via_discovery), by = "pep") %>%
+  mutate(platform = case_when(via_isprm & via_discovery ~ "Both",
+                              via_isprm                 ~ "IS-PRM only",
+                              via_discovery             ~ "Discovery only",
+                              TRUE                      ~ NA_character_)) %>%
+  filter(!is.na(platform))
+cat("\nEvaluable peptides by platform:\n")
+print(plat %>% group_by(platform) %>%
+        summarise(n_total = n(), n_validating = sum(junction_validating),
+                  pct = round(100 * mean(junction_validating), 1), .groups = "drop"))
+```
+
+## 17. Junction-level classification
+
+The same rule as sections 13–14 with the CAD junction, rather than the gene × cluster, as the
+unit, because Fig. 4g and Supplementary Table 13 report per junction. The "other" side of a
+junction is the set of isoforms carrying the competing junction of the same cluster; the gene
+complement is used only when no competing junction was captured in long-read data
+(`used_complement`, weaker evidence). Junctions with no peptide at all are kept as zeros so that
+the denominator is the full set of usable junctions.
+
+```{r junction_classification}
+# One row per gene x cluster x junction x role.
+gj_junc <- lfc %>%
+  transmute(gene = gene_name, cluster, junction_key, dir = effect_direction) %>%
+  mutate(role = case_when(
+    str_detect(dir, regex("increas", ignore_case = TRUE)) ~ "risk",
+    str_detect(dir, regex("decreas", ignore_case = TRUE)) ~ "nonrisk",
+    TRUE ~ NA_character_)) %>%
+  filter(!is.na(role), !is.na(junction_key), !is.na(cluster)) %>%
+  distinct(gene, cluster, junction_key, role)
+stopifnot("a junction carries both roles" =
+  nrow(gj_junc %>% count(gene, cluster, junction_key) %>% filter(n > 1)) == 0)
+
+# Risk / nonrisk isoform sets per junction.
+gs3_junc <- gj_junc %>%
+  rowwise() %>%
+  mutate(
+    own        = list(isoforms_with(junction_key)),
+    comp_juncs = list(gj_junc$junction_key[gj_junc$gene == gene &
+                                           gj_junc$cluster == cluster &
+                                           gj_junc$role != role]),
+    comp       = list(if (length(unlist(comp_juncs)))
+                        isoforms_with(unlist(comp_juncs)) else character(0)),
+    used_complement = length(unlist(comp)) == 0,
+    all_iso    = list(all_iso_of(gene)),
+    other      = list(if (used_complement) setdiff(all_iso, own) else comp),
+    R          = list(if (role == "risk")    own else other),
+    N          = list(if (role == "nonrisk") own else other),
+    amb        = list(intersect(R, N)),
+    R = list(setdiff(R, amb)), N = list(setdiff(N, amb))) %>%
+  ungroup() %>%
+  mutate(nR = lengths(R), nN = lengths(N), usable = nR > 0 & nN > 0)
+
+# Classify every detected peptide against each usable junction's sets.
+pc_j <- cov %>%
+  filter(!is.na(seq_pbs)) %>%
+  inner_join(gs3_junc %>% filter(usable) %>%
+               select(gene, cluster, junction_key, R, N),
+             by = c("gene_symbol" = "gene"), relationship = "many-to-many") %>%
+  mutate(hR = map2_lgl(seq_pbs, R, ~ any(.x %in% .y)),
+         hN = map2_lgl(seq_pbs, N, ~ any(.x %in% .y)),
+         cls = case_when(hR & !hN ~ "Risk", !hR & hN ~ "Nonrisk",
+                         hR &  hN ~ "Both (shared)", TRUE ~ "Neither"))
+
+# Per-junction summary over ALL usable junctions.
+junction_summary <- pc_j %>%
+  group_by(gene_symbol, junction_key) %>%
+  summarise(n_risk    = sum(cls == "Risk"),
+            n_nonrisk = sum(cls == "Nonrisk"),
+            n_shared  = sum(cls == "Both (shared)"),
+            .groups = "drop")
+
+all_usable <- gs3_junc %>% filter(usable) %>%
+  group_by(gene, junction_key) %>%
+  summarise(used_complement = any(used_complement), .groups = "drop")
+
+junction_validation <- all_usable %>%
+  left_join(junction_summary, by = c("gene" = "gene_symbol", "junction_key")) %>%
+  mutate(across(starts_with("n_"), ~ replace_na(.x, 0L)),
+         validated = (n_risk + n_nonrisk) > 0,
+         side = case_when(n_risk > 0 & n_nonrisk > 0 ~ "Both sides",
+                          n_risk > 0                 ~ "Risk only",
+                          n_nonrisk > 0              ~ "Nonrisk only",
+                          TRUE                       ~ "None"))
+
+cat(sprintf("usable junctions %d | validated %d (%.0f%%)\n",
+            nrow(junction_validation), sum(junction_validation$validated),
+            100 * mean(junction_validation$validated)))
+cat("probeable subset:\n")
+print(junction_validation %>% filter(junction_key %in% probeable_keys) %>% count(side))
+
+# Exclusivity ceiling: for each junction, whether a risk- or nonrisk-exclusive tryptic
+# peptide exists in the digest at all, and whether one was detected. Separates
+# "impossible to distinguish" from "possible but not detected".
+cl_by_gene  <- cleaver_lookup %>%
+  select(gene_symbol, peptide_seq_aa, pb_ids_list) %>% split(.$gene_symbol)
+det_by_gene <- detected_pep %>% split(.$gene_symbol)
+
+excl_junc <- gs3_junc %>%
+  filter(usable) %>%
+  select(gene, cluster, junction_key, role, R, N) %>%
+  rowwise() %>%
+  mutate(.res = list({
+    cl <- cl_by_gene[[gene]]
+    if (is.null(cl)) {
+      tibble(n_R_possible = 0L, n_N_possible = 0L,
+             n_R_detected = 0L, n_N_detected = 0L)
+    } else {
+      pbs  <- lapply(cl$pb_ids_list, function(x) intersect(x, c(R, N)))
+      keep <- lengths(pbs) > 0
+      cl   <- cl[keep, ]; pbs <- pbs[keep]
+      hR   <- vapply(pbs, function(x) any(x %in% R), logical(1))
+      hN   <- vapply(pbs, function(x) any(x %in% N), logical(1))
+      cls  <- ifelse(hR & !hN, "R-exclusive",
+              ifelse(!hR & hN, "N-exclusive", "shared"))
+      det  <- det_by_gene[[gene]]$pep
+      tibble(n_R_possible = sum(cls == "R-exclusive"),
+             n_N_possible = sum(cls == "N-exclusive"),
+             n_R_detected = sum(cls == "R-exclusive" & cl$peptide_seq_aa %in% det),
+             n_N_detected = sum(cls == "N-exclusive" & cl$peptide_seq_aa %in% det))
+    }
+  })) %>%
+  ungroup() %>%
+  tidyr::unnest(.res) %>%
+  select(-R, -N) %>%
+  # A junction evaluated in two clusters keeps the maximum, as junction_validation does.
+  group_by(gene, junction_key) %>%
+  summarise(across(c(n_R_possible, n_N_possible, n_R_detected, n_N_detected), max),
+            .groups = "drop") %>%
+  mutate(is_probeable = junction_key %in% probeable_keys,
+         risk_status = case_when(n_R_possible == 0 ~ "impossible (no unique peptide)",
+                                 n_R_detected  > 0 ~ "detected",
+                                 TRUE              ~ "possible, not detected"),
+         nonrisk_status = case_when(n_N_possible == 0 ~ "impossible (no unique peptide)",
+                                    n_N_detected  > 0 ~ "detected",
+                                    TRUE              ~ "possible, not detected"))
+
+# Consistency: the two junction-level tables describe the same junctions and agree on
+# which sides were detected.
+stopifnot("excl_junc and junction_validation differ in size" =
+            nrow(excl_junc) == nrow(junction_validation))
+disagree <- excl_junc %>%
+  select(gene, junction_key, risk_status, nonrisk_status) %>%
+  inner_join(junction_validation %>% select(junction_key, side), by = "junction_key") %>%
+  filter((risk_status == "detected") != (side %in% c("Risk only", "Both sides")) |
+         (nonrisk_status == "detected") != (side %in% c("Nonrisk only", "Both sides")))
+cat(sprintf("side-level disagreements between the two tables: %d\n", nrow(disagree)))
+
+write_excel_csv(junction_validation, OUT_JUNCTION_VALIDATION)
+write_excel_csv(excl_junc, OUT_JUNCTION_EXCLUSIVE_PEPS)
+
+# Reason a junction could not be classified, for the junction master table (script 10).
+gs3_junc <- gs3_junc %>%
+  mutate(not_usable_reason = case_when(
+    usable                ~ NA_character_,
+    lengths(own)   == 0   ~ "junction in no long-read isoform",
+    lengths(other) == 0   ~ "no complementary isoforms",
+    nR == 0 & nN == 0     ~ "both sides emptied by ambiguity",
+    nR == 0               ~ "risk side emptied by ambiguity",
+    nN == 0               ~ "nonrisk side emptied by ambiguity"))
+write_excel_csv(
+  gs3_junc %>% filter(!usable) %>%
+    distinct(junction_key, .keep_all = TRUE) %>%
+    select(gene, junction_key, not_usable_reason),
+  OUT_JUNCTION_NOT_USABLE)
+```
+
+## 18. Evidence chain
+
+One table with every junction count quoted in the text, each with its source object, and the
+arithmetic that must hold between them.
+
+```{r evidence_chain}
+chain <- function(step, n, source) tibble::tibble(step, n, source)
+
+ec <- dplyr::bind_rows(
+  chain("sGenes",                     dplyr::n_distinct(lfc$gene_name),   "lfc"),
+  chain("junction x condition rows",  nrow(lfc),                          "lfc"),
+  chain("distinct CAD junctions",     dplyr::n_distinct(lfc$junction_key), "lfc"),
+  chain("probeable (CDS)",            sum(funnel$probeable),              "funnel"),
+  chain("LR-captured",                sum(funnel$lr_captured),            "funnel"),
+  chain("usable junctions",           nrow(junction_validation),          "gs3_junc"),
+  chain("  probeable & usable",
+        sum(junction_validation$junction_key %in% probeable_keys),        "join"),
+  chain("  UTR & usable",
+        sum(!junction_validation$junction_key %in% probeable_keys),       "join"),
+  chain("validated (probeable)",
+        sum(junction_validation$validated &
+            junction_validation$junction_key %in% probeable_keys),        "join"),
+  chain("  risk only",
+        sum(junction_validation$side == "Risk only" &
+            junction_validation$junction_key %in% probeable_keys),        "join"),
+  chain("  nonrisk only",
+        sum(junction_validation$side == "Nonrisk only" &
+            junction_validation$junction_key %in% probeable_keys),        "join"),
+  chain("  both sides",
+        sum(junction_validation$side == "Both sides" &
+            junction_validation$junction_key %in% probeable_keys),        "join"),
+  chain("validated (UTR)",
+        sum(junction_validation$validated &
+            !junction_validation$junction_key %in% probeable_keys),       "join")
+)
+
+stopifnot(
+  "probeable & usable + probeable & not usable != probeable" =
+    sum(junction_validation$junction_key %in% probeable_keys) +
+    length(setdiff(probeable_keys, junction_validation$junction_key)) ==
+    sum(funnel$probeable),
+  "sides do not sum to validated" =
+    sum(junction_validation$side %in% c("Risk only", "Nonrisk only", "Both sides")) ==
+    sum(junction_validation$validated)
+)
+
+print(as.data.frame(ec), row.names = FALSE, right = FALSE)
+write_excel_csv(ec, OUT_EVIDENCE_CHAIN)
+```
+
+## 19. Supplementary Table 12 — peptide evidence in CAD sGenes
+
+One row per evaluable peptide with its isoform mapping, risk/nonrisk class and detection
+method. Column dictionary: `sqtl_isoform_class` — Risk / Nonrisk / Both (shared) / Neither
+against the risk and nonrisk isoform sets of that cluster; `peptide_specificity` —
+isoform-specific / informative / constitutive, from the Cleaver digest; `isoforms_evidenced` —
+the isoforms the classification rests on; `all_isoforms_with_peptide` — every isoform whose
+digest contains the peptide, including ones outside the cluster's sets; `detection_method` —
+Discovery, IS-PRM or both.
+
+```{r supp_table_peptides}
+# PB -> ENST / category / CPM lookup. tx_transcripts holds the matched reference transcript
+# ("novel" where there is none).
+pb_annot <- read_tsv(F_SQANTI_PROTEIN_TSV, show_col_types = FALSE) %>%
+  transmute(pb_acc     = pb,
+            enst       = na_if(as.character(tx_transcripts), "novel"),
+            tx_cat, pr_splice_cat, is_nmd,
+            gene_id    = as.character(tx_gene)) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+
+cpm_lookup <- sqp %>%
+  transmute(pb_acc = str_extract(as.character(.data[[pbc]]), "PB\\.[0-9]+\\.[0-9]+"),
+            CPM = suppressWarnings(as.numeric(CPM))) %>%
+  filter(!is.na(pb_acc)) %>% distinct(pb_acc, .keep_all = TRUE)
+
+annot_str <- function(pbs, col) {
+  if (!length(pbs)) return(NA_character_)
+  v <- pb_annot[[col]][match(pbs, pb_annot$pb_acc)]
+  v <- v[!is.na(v)]
+  if (!length(v)) NA_character_ else paste(sort(unique(v)), collapse = "; ")
+}
+
+supp_peptides <- detail %>%
+  left_join(cleaver_lookup %>%
+              transmute(gene_symbol, peptide = peptide_seq_aa,
+                        peptide_specificity = cleaver_category,
+                        gene_specificity,
+                        n_isoforms_with_seq, n_isoforms_total) %>%
+              distinct(gene_symbol, peptide, .keep_all = TRUE),
+            by = c("gene_symbol", "peptide")) %>%
+  left_join(peptides %>% transmute(peptide = pep, via_isprm, via_discovery),
+            by = "peptide") %>%
+  mutate(detection_method = case_when(
+           via_isprm & via_discovery ~ "Discovery + IS-PRM",
+           via_isprm                 ~ "IS-PRM",
+           via_discovery             ~ "Discovery",
+           TRUE                      ~ NA_character_)) %>%
+  rowwise() %>%
+  mutate(
+    .ev  = list(str_extract_all(isoforms_evidenced,        "PB\\.[0-9]+\\.[0-9]+")[[1]]),
+    .all = list(str_extract_all(all_isoforms_with_peptide, "PB\\.[0-9]+\\.[0-9]+")[[1]]),
+    ensts_evidenced    = annot_str(.ev,  "enst"),
+    gene_id            = annot_str(.all, "gene_id"),
+    tx_categories      = annot_str(.ev,  "tx_cat"),
+    protein_categories = annot_str(.ev,  "pr_splice_cat"),
+    total_CPM_evidenced = {
+      v <- cpm_lookup$CPM[match(.ev, cpm_lookup$pb_acc)]
+      if (all(is.na(v))) NA_real_ else round(sum(v, na.rm = TRUE), 2)
+    }) %>%
+  ungroup() %>%
+  transmute(
+    gene_symbol,
+    gene_id,
+    leafcutter_cluster        = cluster,
+    peptide,
+    peptide_length            = nchar(peptide),
+    sqtl_isoform_class        = as.character(peptide_class),
+    peptide_specificity,
+    gene_specificity,
+    n_isoforms_with_peptide   = n_isoforms_with_seq,
+    n_isoforms_in_gene        = n_isoforms_total,
+    isoforms_evidenced        = isoforms_evidenced,
+    n_isoforms_evidenced,
+    ensts_evidenced,
+    tx_categories,
+    protein_categories,
+    total_CPM_evidenced,
+    all_isoforms_with_peptide,
+    detection_method) %>%
+  arrange(gene_symbol, leafcutter_cluster,
+          factor(sqtl_isoform_class, levels = c("Risk", "Nonrisk", "Both (shared)", "Neither")),
+          desc(n_isoforms_evidenced))
+
+stopifnot("row count changed against `detail`" = nrow(supp_peptides) == nrow(detail))
+cat(sprintf("Supplementary Table 12: %d peptides | %d genes | %d clusters\n",
+            nrow(supp_peptides), n_distinct(supp_peptides$gene_symbol),
+            n_distinct(supp_peptides$leafcutter_cluster)))
+write_excel_csv(supp_peptides, OUT_PEPTIDE_SUPP_TABLE)
+```
+
+## 20. Peptide-supported isoforms with notable features (Extended Data Fig. 5c)
+
+An isoform is listed when a CAD-validating peptide is exclusive to isoforms sharing a
+feature of interest: novel protein (pNIC/pNNC), novel transcript (NIC/NNC), predicted NMD, or
+retained intron. Exclusivity is assessed over the complete membership set from the digest, so a
+peptide shared with any annotated, non-NMD isoform does not count as evidence for the feature.
+
+```{r interesting_isoforms}
+NOVEL_CATS <- c("novel_in_catalog", "novel_not_in_catalog")
+RI_SUBCATS <- c("intron_retention", "mono-exon_by_intron_retention")
+
+iso_flags <- sqanti_protein_cpm %>%
+  transmute(
+    pb_id = pb, tx_cat, pr_splice_cat, tx_subcat, is_nmd,
+    novel_by_tx     = tx_cat        %in% NOVEL_CATS,
+    novel_by_pr     = pr_splice_cat %in% NOVEL_CATS,
+    nmd_candidate   = is_nmd %in% TRUE,
+    retained_intron = tx_subcat %in% RI_SUBCATS,
+    # Annotated transcript structure with a predicted ORF that differs from the annotated one.
+    alt_orf_on_known_tx = !novel_by_tx & novel_by_pr) %>%
+  filter(!is.na(pb_id))
+
+# One row per (peptide, isoform).
+cleaver_long <- cleaver_lookup %>%
+  transmute(pep = toupper(peptide_seq_aa), gene = gene_symbol, pb_ids_list) %>%
+  tidyr::unnest(pb_ids_list) %>%
+  rename(pb_id = pb_ids_list) %>%
+  filter(str_detect(pb_id, "^PB\\.[0-9]+\\.[0-9]+")) %>%
+  left_join(iso_flags, by = "pb_id")
+
+# Per-peptide exclusivity over the full membership set.
+pep_excl <- cleaver_long %>%
+  group_by(pep) %>%
+  summarise(
+    any_novel_pr = any(novel_by_pr,         na.rm = TRUE),
+    any_novel_tx = any(novel_by_tx,         na.rm = TRUE),
+    any_nmd      = any(nmd_candidate,       na.rm = TRUE),
+    any_ir       = any(retained_intron,     na.rm = TRUE),
+    any_altorf   = any(alt_orf_on_known_tx, na.rm = TRUE),
+    n_known_pr   = sum(novel_by_pr         == FALSE, na.rm = TRUE),
+    n_known_tx   = sum(novel_by_tx         == FALSE, na.rm = TRUE),
+    n_nonnmd     = sum(nmd_candidate       == FALSE, na.rm = TRUE),
+    n_nonir      = sum(retained_intron     == FALSE, na.rm = TRUE),
+    n_nonaltorf  = sum(alt_orf_on_known_tx == FALSE, na.rm = TRUE),
+    .groups = "drop") %>%
+  mutate(only_novel_pr = any_novel_pr & n_known_pr  == 0,
+         only_novel_tx = any_novel_tx & n_known_tx  == 0,
+         only_nmd      = any_nmd      & n_nonnmd    == 0,
+         only_ir       = any_ir       & n_nonir     == 0,
+         only_altorf   = any_altorf   & n_nonaltorf == 0)
+
+# CAD-validating peptides: Risk or Nonrisk in the junction-membership classification.
+pep_source_cad <- pep_class %>%
+  filter(junction_validating) %>%
+  transmute(pep) %>% distinct() %>%
+  left_join(peptides %>% transmute(pep, via_isprm, via_dda = via_discovery), by = "pep")
+
+# Roll up to isoforms.
+build_cand <- function(src) {
+  cleaver_long %>%
+    semi_join(src, by = "pep") %>%
+    left_join(select(pep_excl, pep, only_novel_pr, only_novel_tx,
+                     only_nmd, only_ir, only_altorf), by = "pep") %>%
+    left_join(src, by = "pep") %>%
+    group_by(pb_id) %>%
+    summarise(
+      gene                = dplyr::first(na.omit(gene)),
+      novel_protein       = any(novel_by_pr         & only_novel_pr, na.rm = TRUE),
+      novel_tx            = any(novel_by_tx         & only_novel_tx, na.rm = TRUE),
+      nmd                 = any(nmd_candidate       & only_nmd,      na.rm = TRUE),
+      retained_intron     = any(retained_intron     & only_ir,       na.rm = TRUE),
+      alt_orf_on_known_tx = any(alt_orf_on_known_tx & only_altorf,   na.rm = TRUE),
+      n_excl_pep = n_distinct(pep[only_novel_pr | only_novel_tx |
+                                  only_nmd | only_ir | only_altorf]),
+      via_isprm  = any(via_isprm, na.rm = TRUE),
+      via_dda    = any(via_dda,   na.rm = TRUE),
+      .groups = "drop") %>%
+    filter(novel_protein | novel_tx | nmd | retained_intron | alt_orf_on_known_tx) %>%
+    arrange(desc(nmd), desc(novel_protein), desc(n_excl_pep))
+}
+
+cand <- build_cand(pep_source_cad)
+cat(sprintf("CAD-validating candidate isoforms: %d (novel protein %d | novel transcript %d | NMD %d | retained intron %d)\n",
+            nrow(cand), sum(cand$novel_protein), sum(cand$novel_tx),
+            sum(cand$nmd), sum(cand$retained_intron)))
+write_excel_csv(cand, OUT_INTERESTING_ISOFORMS)
+```
+
+## 21. IS-PRM target accounting (Methods)
+
+The IS-PRM acquisition targeted 173 peptides selected from the digest to distinguish the risk
+from the nonrisk pool of CAD sQTL isoform pairs. This section reports the targets by digest
+specificity class and the number of genes covered, which are the numbers given in Methods, and
+how many targets were detected.
+
+```{r isprm_targets}
+cad173 <- read_csv(F_CAD173_TARGETS, show_col_types = FALSE) %>%
+  filter(!is.na(AAseq), AAseq != "")
+cad173_peps <- unique(toupper(cad173$AAseq))
+
+# Gene and specificity for each target, from the digest (first match per sequence).
+pep_gene <- cleaver_lookup %>%
+  transmute(pep = toupper(peptide_seq_aa), gene = gene_symbol,
+            cleaver_category, gene_specificity) %>%
+  distinct(pep, .keep_all = TRUE)
+
+isprm_targets <- tibble(pep = cad173_peps) %>%
+  left_join(pep_gene, by = "pep") %>%
+  mutate(detected_isprm = pep %in% toupper(isprm_peptide_seqs)) %>%
+  arrange(gene, pep)
+
+cat(sprintf("IS-PRM targets: %d peptides from %d genes; %d detected\n",
+            nrow(isprm_targets), n_distinct(na.omit(isprm_targets$gene)),
+            sum(isprm_targets$detected_isprm)))
+print(count(isprm_targets, cleaver_category))
+write_csv(isprm_targets, file.path(RES_05, "isprm_cad173_target_summary.csv"))
+```
+# C. Manuscript browser panels
+
+## 22. Genome-browser panels
+
+Every genome-browser panel in the manuscript is drawn here from the plotting machinery of Part A
+and the evidence tables of Part B. Each panel is written to `BROWSER_DIR` as
+`<panel>_<gene>.png/.svg` (genomic view) and `<panel>_<gene>_exonview.png/.svg` (introns
+collapsed); `BROWSER_MANIFEST.csv` records what was drawn (isoforms, peptides, size) and which
+view the figure uses. Peptide panels take their isoforms and peptides from `detail`
+(section 15): the risk isoform is the risk-junction isoform with the most distinguishing-peptide
+evidence, the nonrisk isoform likewise, and each peptide is coloured by its junction class.
+
+| Panel | Gene | Content |
+|---|---|---|
+| Fig. 3e, 3f; ED Fig. 3g, 3h | CABIN1, CNN1, RNF5, HEPH | novelty-coloured transcript models |
+| Fig. 1e | R3HCC1L | six GENCODE transcripts, seven SNPs |
+| ED Fig. 1b | TRIM65 | GENCODE pair |
+| Fig. 2c | ADAMTS7 | five GENCODE transcripts |
+| Fig. 2f | PARP12 | GENCODE pair and RT-PCR amplicon |
+| ED Fig. 2d, 2f, 2h | WIPI1, DCLRE1B, ITGA1 | GENCODE pair (nonrisk only for ITGA1) and amplicon |
+| Fig. 4i | FURIN | peptide panel |
+| ED Fig. 4b | WIPI1 | long-read pair, two predicted ORFs, GENCODE shadows, WD repeats |
+| ED Fig. 4d | PARP12 | long-read pair, GENCODE shadow, domains |
+| ED Fig. 6a, 6c, 6e, 6g | HSD17B12, ITGA2, DAGLB, DSTN | peptide panels |
+| Fig. 6a, 6f, 6k | SRP54, MLX, ITGA1 | AP-MS bait pairs |
+
+```{r browser_panels}
+stopifnot("Part B must run first (`detail` is required)" = exists("detail"))
+
+# ---- helpers -----------------------------------------------------------------
+
+# Versioned ENST id(s) present in gencode_exon_data for a base or versioned id.
+resolve_enst <- function(x) {
+  bl <- str_replace(gencode_exon_data$trans_id, "\\.[0-9]+$", "")
+  q  <- str_replace(x, "\\.[0-9]+$", "")
+  hit <- unique(gencode_exon_data$trans_id[bl %in% q | gencode_exon_data$trans_id %in% x])
+  if (!length(hit)) warning("ENST not in gencode_exon_data: ", paste(x, collapse = ", "))
+  hit
+}
+
+# ENSTs in the order requested.
+resolve_enst_ordered <- function(base_ids) {
+  ids <- resolve_enst(base_ids)
+  ids[order(match(str_replace(ids, "\\.[0-9]+$", ""), str_replace(base_ids, "\\.[0-9]+$", "")))]
+}
+
+# GENCODE pair tibble in the shape risk_nonrisk_pairs expects.
+enst_rp <- function(gene, risk = NULL, nonrisk = NULL) {
+  tibble(gene_name = gene,
+         risk_isoform    = if (!is.null(risk))    resolve_enst(risk)    else NA_character_,
+         nonrisk_isoform = if (!is.null(nonrisk)) resolve_enst(nonrisk) else NA_character_,
+         risk_pb = NA_character_, nonrisk_pb = NA_character_)
+}
+
+# Copy of snp_data with the named variant(s) flagged as lead (drawn bold).
+mark_lead <- function(sdat, rsids) {
+  gone <- setdiff(rsids, sdat$rsid)
+  if (length(gone)) warning("not in snp_data, will not be drawn: ", paste(gone, collapse = ", "))
+  sdat %>% mutate(is_lead = if_else(rsid %in% rsids, TRUE, is_lead))
+}
+
+# Arguments shared by every panel; `extra` replaces whole elements (tibbles included), which
+# modifyList() would instead merge column-wise.
+base_args <- function(extra) {
+  args <- list(
+    exon_data = exon_data, cds_data = cds_data,
+    sqanti_data        = sqanti_protein_cpm,
+    cluster_data       = cluster_data,
+    risk_nonrisk_pairs = risk_pairs,
+    pogo_data          = pogo_data,
+    gencode_exon_data  = gencode_exon_data,
+    gencode_cds_data   = gencode_cds_data,
+    snp_data           = snp_data,
+    color_by           = "risk",
+    show_sqtl          = TRUE,
+    show_peptides      = FALSE,
+    show_snps          = TRUE,
+    sqtl_cap_pt        = 1.2,
+    plot_width_in      = 3.5)
+  for (nm in names(extra)) args[[nm]] <- extra[[nm]]
+  args
+}
+# Legend options shared by the long-read panels: no risk-status row, text-only row explaining
+# the transcript labels.
+legend_args <- function() list(show_risk_legend = FALSE, transcript_label_legend = TRUE)
+
+# Save one panel in both views and record it in the manifest.
+MANIFEST <- list()
+save_panel <- function(args, stem, panel, gene, w, h, view = c("genomic", "exon"), expect = "") {
+  view <- match.arg(view)
+  args$plot_width_in <- w                       # keeps the sQTL cap geometry at the final width
+  p_gen <- do.call(plot_transcripts_peptides_sqtl_v2, c(args, list(collapse_introns = FALSE)))
+  p_ev  <- do.call(plot_transcripts_peptides_sqtl_v2, c(args, list(collapse_introns = TRUE)))
+  for (ext in c("png", "svg")) {
+    ggsave(file.path(BROWSER_DIR, sprintf("%s.%s", stem, ext)), p_gen,
+           width = w, height = h, units = "in", dpi = 300)
+    ggsave(file.path(BROWSER_DIR, sprintf("%s_exonview.%s", stem, ext)), p_ev,
+           width = w, height = h, units = "in", dpi = 300)
+  }
+  MANIFEST[[length(MANIFEST) + 1]] <<- tibble(
+    panel = panel, gene = gene, stem = stem, view = view, width_in = w, height_in = h,
+    transcripts = paste(args$transcript_ids, collapse = "; "),
+    risk    = paste(c(args$manual_risk_pbs,
+                      args$risk_nonrisk_pairs$risk_isoform[args$risk_nonrisk_pairs$gene_name == gene]),
+                    collapse = "; "),
+    nonrisk = paste(c(args$manual_nonrisk_pbs,
+                      args$risk_nonrisk_pairs$nonrisk_isoform[args$risk_nonrisk_pairs$gene_name == gene]),
+                    collapse = "; "),
+    peptides = if (is.null(args$selected_peptides)) "" else
+      paste(sprintf("%s=%s", args$selected_peptides,
+                    args$peptide_status_map[args$selected_peptides]), collapse = "; "),
+    expected_content = expect)
+  cat(sprintf("  %-10s %-9s %s  (%.1f x %.1f in, %s view)\n", panel, gene, stem, w, h, view))
+  invisible(list(genomic = p_gen, exonview = p_ev))
+}
+
+# ---- peptide panels ------------------------------------------------------------
+# Risk isoform = the risk-junction isoform with the most distinguishing-peptide evidence;
+# nonrisk likewise. Peptide colour = its class (Risk / Nonrisk / Both).
+best_isoform <- function(g, side) {
+  d <- detail %>% filter(gene_symbol == g, peptide_class == side,
+                         !is.na(isoforms_evidenced), isoforms_evidenced != "")
+  if (!nrow(d)) return(NA_character_)
+  d %>% separate_rows(isoforms_evidenced, sep = ";\\s*") %>%
+    filter(isoforms_evidenced != "") %>%
+    count(pb = isoforms_evidenced, sort = TRUE) %>% slice(1) %>% pull(pb)
+}
+
+# Peptides to draw for one gene.
+#   include_shared : keep "Both (shared)" peptides
+#   prefer_specific: when a Risk or Nonrisk peptide exists, drop the shared ones
+#   isprm_only / isprm_classes : restrict (all classes / named classes) to IS-PRM detections
+#   max_per_class  : best N per class (IS-PRM first, then most isoforms, then longest)
+peptides_jm <- function(g, include_shared = FALSE, prefer_specific = TRUE,
+                        isprm_only = FALSE, isprm_classes = NULL, max_per_class = 1) {
+  d <- detail %>% filter(gene_symbol == g, peptide_class != "Neither")
+  if (isprm_only) d <- d %>% filter(detected_by == "IS-PRM")
+  if (!is.null(isprm_classes))
+    d <- d %>% filter(!(peptide_class %in% isprm_classes) | detected_by == "IS-PRM")
+  if (!include_shared) d <- d %>% filter(peptide_class != "Both (shared)")
+  if (prefer_specific && any(d$peptide_class %in% c("Risk", "Nonrisk")))
+    d <- d %>% filter(peptide_class %in% c("Risk", "Nonrisk"))
+  if (!is.null(max_per_class))
+    d <- d %>%
+      mutate(.isprm = as.integer(detected_by == "IS-PRM"), .nlen = nchar(peptide)) %>%
+      arrange(peptide_class, desc(.isprm), desc(n_isoforms_evidenced), desc(.nlen), peptide) %>%
+      group_by(peptide_class) %>% slice_head(n = max_per_class) %>% ungroup()
+  d <- d %>% mutate(status = recode(as.character(peptide_class), "Both (shared)" = "Both")) %>%
+    distinct(peptide, status)
+  list(seqs = d$peptide, status_map = setNames(d$status, d$peptide))
+}
+
+# One peptide panel.
+#   risk_pb / nonrisk_pb : NULL = pick by evidence (best_isoform)
+#   pf_override          : named vector c(PEPTIDE = "Risk", ...) to draw exactly these peptides
+#   drop_direction       : hide sQTL junctions with this effect_direction (e.g. "Increased")
+#   keep_features        : regex on unip_interest$name to keep only some regions of interest
+peptide_panel <- function(g, panel, stem, w = 4.5, h = 2,
+                          risk_pb = NULL, nonrisk_pb = NULL, pf_override = NULL,
+                          show_tracks = c("domains"), show_features = c("domain"),
+                          keep_features = NULL, drop_direction = NULL,
+                          include_shared = FALSE, max_per_class = 1, isprm_only = FALSE,
+                          isprm_classes = NULL, exact_peptides = TRUE,
+                          collapse_rpt = g %in% c("LDLR"), expect = "") {
+  if (is.null(risk_pb))    risk_pb    <- best_isoform(g, "Risk")
+  if (is.null(nonrisk_pb)) nonrisk_pb <- best_isoform(g, "Nonrisk")
+  if (is.na(risk_pb) || is.na(nonrisk_pb)) {
+    warning(g, ": no evidenced isoform on one side; skipped"); return(invisible(NULL))
+  }
+  tx_ids <- get_transcript_ids_for_gene(exon_data, g, c(risk_pb, nonrisk_pb))
+  if (length(tx_ids) < 2) {
+    warning(g, ": ", length(tx_ids), "/2 transcripts in exon_data; skipped"); return(invisible(NULL))
+  }
+
+  pf <- if (!is.null(pf_override))
+          list(seqs = names(pf_override), status_map = pf_override)
+        else peptides_jm(g, include_shared = include_shared, max_per_class = max_per_class,
+                         isprm_only = isprm_only, isprm_classes = isprm_classes)
+  if (!length(pf$seqs)) { warning(g, ": no peptides; skipped"); return(invisible(NULL)) }
+
+  ui <- if (is.null(keep_features)) unip_interest else
+          unip_interest %>% filter(str_detect(name, keep_features))
+  args <- base_args(c(list(
+    unip_domain = unip_domain, unip_interest = ui, unip_transmembrane = unip_transmembrane,
+    transcript_ids = tx_ids, gene_name_for_cluster = g,
+    manual_risk_pbs = risk_pb, manual_nonrisk_pbs = nonrisk_pb,
+    show_snps = FALSE, show_peptides = TRUE, peptides_overlap_sqtl = FALSE,
+    show_tracks = show_tracks, show_features = show_features,
+    transcript_label_wrap = FALSE, collapse_repeat_numbers = collapse_rpt,
+    selected_peptides = pf$seqs, peptide_status_map = pf$status_map,
+    exact_peptides = exact_peptides, title = g), legend_args()))
+  if (!is.null(drop_direction))
+    args$cluster_data <- args$cluster_data %>%
+      filter(!(gene_name == g & effect_direction %in% drop_direction))
+  save_panel(args, stem, panel, g, w, h, view = "exon", expect = expect)
+}
+
+# ==============================================================================
+# 1. Fig. 3e CABIN1, 3f CNN1; ED Fig. 3g RNF5, 3h HEPH — transcript models coloured by novelty
+#    (the right-hand half of each donut panel; no sQTL tracks)
+# ==============================================================================
+novelty <- tribble(
+  ~panel,        ~gene,    ~stem,          ~ids,                                   ~expect,
+  "Fig. 3e",     "CABIN1", "Fig3e_CABIN1", list(c("PB.18162.3", "PB.18162.29")),   "novel PB.18162.29 vs annotated ENST00000263119.10",
+  "Fig. 3f",     "CNN1",   "Fig3f_CNN1",   list(c("PB.16522.1", "PB.16522.2")),    "novel PB.16522.2 vs annotated ENST00000252456.7",
+  "ED Fig. 3g",  "RNF5",   "ED3g_RNF5",    list(c("ENST00000375094", "PB.6529.2")), "novel PB.6529.2 vs GENCODE ENST00000375094.4 (no VSMC FSM)",
+  "ED Fig. 3h",  "HEPH",   "ED3h_HEPH",    list(c("PB.18756.1", "PB.18756.6")),    "novel PB.18756.6 vs annotated ENST00000343002.7")
+for (i in seq_len(nrow(novelty))) {
+  r   <- novelty[i, ]
+  ids <- unlist(r$ids)
+  tx_ids <- unlist(lapply(ids, function(x) if (grepl("^ENST", x)) resolve_enst(x)
+                                          else get_transcript_ids_for_gene(exon_data, r$gene, x)))
+  if (length(tx_ids) < 2) { warning(r$gene, ": ", length(tx_ids), "/2 transcripts found; skipped"); next }
+  save_panel(base_args(list(
+    transcript_ids = tx_ids, gene_name_for_cluster = r$gene,
+    color_by = "novelty", show_tracks = character(0),
+    show_snps = FALSE, show_sqtl = FALSE, show_peptides = FALSE, shadow_gencode = FALSE,
+    transcript_label_wrap = FALSE, title = r$gene, transcript_label_legend = TRUE)),
+    r$stem, r$panel, r$gene, w = 5.1, h = 2.0, view = "genomic", expect = r$expect)
+}
+
+# ==============================================================================
+# 2. Fig. 1e — R3HCC1L, six GENCODE transcripts, seven SNPs (genomic view)
+# ==============================================================================
+r3_ensts <- resolve_enst_ordered(c("ENST00000298999", "ENST00000314594", "ENST00000370584",
+                                   "ENST00000370586", "ENST00000612478", "ENST00000613938"))
+r3_snps  <- c("rs10736122",                                   # lead sQTL variant
+              "rs7911317", "rs884811", "rs1325494",           # rs884811 = lead CAD GWAS variant
+              "rs4919185", "rs10748719", "rs10748721")
+save_panel(base_args(list(
+  snp_data = mark_lead(snp_data, c("rs10736122", "rs884811")),
+  transcript_ids = r3_ensts, gene_name_for_cluster = "R3HCC1L",
+  show_tracks = character(0), snps_to_show = r3_snps, title = "R3HCC1L")),
+  "Fig1e_R3HCC1L", "Fig. 1e", "R3HCC1L", w = 4.2, h = 2.6, view = "genomic",
+  expect = "six GENCODE transcripts; rs10736122 and rs884811 bold")
+
+# ==============================================================================
+# 3. ED Fig. 1b — TRIM65, GENCODE pair, rs4398150 (genomic view)
+# ==============================================================================
+trim65_rp <- enst_rp("TRIM65", risk = "ENST00000269383", nonrisk = "ENST00000540128")
+save_panel(base_args(list(
+  snp_data = mark_lead(snp_data, "rs4398150"), risk_nonrisk_pairs = trim65_rp,
+  transcript_ids = c(trim65_rp$risk_isoform, trim65_rp$nonrisk_isoform),
+  gene_name_for_cluster = "TRIM65", show_tracks = character(0),
+  snps_to_show = "rs4398150", title = "TRIM65")),
+  "ED1b_TRIM65", "ED Fig. 1b", "TRIM65", w = 5.5, h = 3.0, view = "genomic",
+  expect = "two GENCODE transcripts; rs4398150")
+
+# ==============================================================================
+# 4. Fig. 2c ADAMTS7 (five GENCODE transcripts) and Fig. 2f PARP12 (GENCODE pair + amplicon)
+# ==============================================================================
+adamts7_ensts <- resolve_enst_ordered(c("ENST00000388820", "ENST00000565793", "ENST00000566303",
+                                        "ENST00000568712", "ENST00000569934"))
+# rs71448830, the lead sQTL variant of the quiescent ADAMTS7 cluster, is not in the
+# LD-expanded SNP table; it is added here with its hg38 position and alleles so that it can
+# be drawn on the panel.
+snp_adamts7 <- snp_data
+if (!any(snp_adamts7$rsid == "rs71448830"))
+  snp_adamts7 <- bind_rows(snp_adamts7, tibble(
+    rsid = "rs71448830", chr = "chr15", pos = 78799555L, ref = "A", alt = "G",
+    gene_name = "ADAMTS7", lead_rsid_for_this_snp = "rs71448830", lead_source = "manual",
+    is_lead = TRUE))
+save_panel(base_args(list(
+  snp_data = snp_adamts7, transcript_ids = adamts7_ensts, gene_name_for_cluster = "ADAMTS7",
+  show_tracks = character(0), snps_to_show = "rs71448830", title = "ADAMTS7")),
+  "Fig2c_ADAMTS7", "Fig. 2c", "ADAMTS7", w = 4.0, h = 2.2, view = "genomic",
+  expect = "five GENCODE transcripts; cluster shading; rs71448830")
+
+parp12_rp_e <- enst_rp("PARP12", risk = "ENST00000263549", nonrisk = "ENST00000489809")
+save_panel(base_args(list(
+  snp_data = mark_lead(snp_data, "rs2286196"), risk_nonrisk_pairs = parp12_rp_e,
+  transcript_ids = c(parp12_rp_e$risk_isoform, parp12_rp_e$nonrisk_isoform),
+  gene_name_for_cluster = "PARP12", show_tracks = character(0), snps_to_show = "rs2286196",
+  primer_data = primer_data, primer_color = "#7F7F7F", title = "PARP12")),
+  "Fig2f_PARP12", "Fig. 2f", "PARP12", w = 4.5, h = 2.5, view = "genomic",
+  expect = "rs2286196; RT-PCR amplicon; GENCODE risk (red) and nonrisk (blue)")
+
+# ==============================================================================
+# 5. ED Fig. 2d WIPI1, 2f DCLRE1B, 2h ITGA1 — GENCODE pairs with the RT-PCR amplicon
+# ==============================================================================
+ed2 <- tribble(
+  ~panel,        ~gene,     ~stem,          ~risk,             ~nonrisk,          ~snp,
+  "ED Fig. 2d",  "WIPI1",   "ED2d_WIPI1",   "ENST00000546360", "ENST00000262139", "rs883541",
+  "ED Fig. 2f",  "DCLRE1B", "ED2f_DCLRE1B", "ENST00000650450", "ENST00000648795", "rs3761936",
+  "ED Fig. 2h",  "ITGA1",   "ED2h_ITGA1",   NA_character_,     "ENST00000282588", "rs4074793")
+for (i in seq_len(nrow(ed2))) {
+  r  <- ed2[i, ]
+  rp <- enst_rp(r$gene, risk = if (is.na(r$risk)) NULL else r$risk, nonrisk = r$nonrisk)
+  save_panel(base_args(list(
+    snp_data = mark_lead(snp_data, r$snp), risk_nonrisk_pairs = rp,
+    transcript_ids = na.omit(c(rp$risk_isoform, rp$nonrisk_isoform)),
+    gene_name_for_cluster = r$gene, show_tracks = character(0), snps_to_show = r$snp,
+    primer_data = primer_data, primer_color = "#7F7F7F", title = r$gene)),
+    r$stem, r$panel, r$gene, w = 3.7, h = 2.0, view = "genomic",
+    expect = sprintf("%s; amplicon; GENCODE %s", r$snp, if (is.na(r$risk)) "nonrisk only" else "pair"))
+}
+
+# ==============================================================================
+# 6. Fig. 4i — FURIN peptide panel (full-width row: 8.0 x 1.9 in)
+# ==============================================================================
+peptide_panel("FURIN", "Fig. 4i", "Fig4i_FURIN", w = 8.0, h = 1.9,
+              show_tracks = c("domains"), show_features = c("domain", "interest"),
+              expect = "nonrisk PB.14062.13; risk PB.14062.1; peptidase S8 pro-domain")
+
+# ==============================================================================
+# 7. ED Fig. 4b WIPI1 (long-read pair, two predicted ORFs, GENCODE shadows, WD repeats) and
+#    ED Fig. 4d PARP12 (long-read pair, GENCODE shadow, domains)
+# ==============================================================================
+# The risk transcript PB.15761.9 is drawn twice, once per predicted ORF. ORF4 is the ORF
+# in the long-read GTF; ORF2 is the alternative CPAT ORF (570 nt spliced CDS on the minus
+# strand, start codon at chr17:68,450,814), whose CDS blocks are given explicitly because
+# the GTF carries only one ORF per transcript.
+ORF4_ID     <- "WIPI1|PB.15761.9|45"
+ORF4_ID_NEW <- "PB.15761.9|45 (ORF4)"
+ORF2_ID     <- "PB.15761.9|45 (ORF2)"
+stopifnot("PB.15761.9 not in exon_data under the expected label" = ORF4_ID %in% exon_data$trans_id)
+exon_orf2 <- exon_data %>% filter(trans_id == ORF4_ID) %>% mutate(trans_id = ORF2_ID)
+exon_orf4 <- exon_data %>% filter(trans_id == ORF4_ID) %>% mutate(trans_id = ORF4_ID_NEW)
+cds_orf4  <- cds_data  %>% filter(transcript_id == ORF4_ID) %>% mutate(transcript_id = ORF4_ID_NEW)
+cds_orf2 <- tibble(
+  seqnames = "chr17",
+  start = c(68450727, 68444492, 68436381, 68435619, 68434436),
+  end   = c(68450814, 68444589, 68436479, 68435712, 68434626),
+  strand = "-", source = "hg38_canon", type = "CDS", score = NA_real_, phase = NA_integer_,
+  gene_id = "WIPI1", transcript_id = ORF2_ID) %>%
+  mutate(width = end - start + 1) %>% select(all_of(names(cds_data)))
+stopifnot("ORF2 CDS is not 570 nt" = sum(cds_orf2$width) == 570)
+wipi1_rp <- tibble(gene_name = "WIPI1",
+                   risk_isoform = "ENST00000546360.5", nonrisk_isoform = "ENST00000262139.10",
+                   risk_pb = "PB.15761.9", nonrisk_pb = "PB.15761.1")
+wipi1_args <- base_args(c(list(
+  exon_data = bind_rows(exon_data, exon_orf2, exon_orf4),
+  cds_data  = bind_rows(cds_data,  cds_orf2,  cds_orf4),
+  snp_data = mark_lead(snp_data, "rs883541"), risk_nonrisk_pairs = wipi1_rp,
+  unip_repeat = unip_repeat,
+  transcript_ids = c("ENST00000546360.5", "ENST00000262139.10", ORF2_ID, ORF4_ID_NEW,
+                     get_transcript_ids_for_gene(exon_data, "WIPI1", "PB.15761.1")),
+  gene_name_for_cluster = "WIPI1", show_tracks = c("domains"), show_features = c("repeat"),
+  snps_to_show = "rs883541", shadow_gencode = TRUE, transcript_label_wrap = FALSE,
+  title = "WIPI1"), legend_args()))
+save_panel(wipi1_args, "ED4b_WIPI1", "ED Fig. 4b", "WIPI1", w = 4.5, h = 3.0, view = "exon",
+           expect = "rs883541; PB.15761.1 nonrisk; PB.15761.9 ORF4 and ORF2 risk; GENCODE shadows; WD repeats")
+
+parp12_rp <- tibble(gene_name = "PARP12", nonrisk_isoform = "ENST00000489809.5",
+                    risk_pb = "PB.8076.1", nonrisk_pb = "PB.8076.5")
+save_panel(base_args(c(list(
+  snp_data = mark_lead(snp_data, "rs2286196"), risk_nonrisk_pairs = parp12_rp,
+  unip_domain = unip_domain, unip_interest = unip_interest,
+  transcript_ids = c("ENST00000489809.5",
+                     get_transcript_ids_for_gene(exon_data, "PARP12", "PB.8076.1"),
+                     get_transcript_ids_for_gene(exon_data, "PARP12", "PB.8076.5")),
+  gene_name_for_cluster = "PARP12", show_tracks = c("domains"), show_features = c("domain"),
+  snps_to_show = "rs2286196", shadow_gencode = TRUE, transcript_label_wrap = FALSE,
+  title = "PARP12"), legend_args())),
+  "ED4d_PARP12", "ED Fig. 4d", "PARP12", w = 4.5, h = 3.0, view = "exon",
+  expect = "rs2286196; nonrisk PB.8076.5; risk PB.8076.1 (labelled ENST00000263549.8); GENCODE shadow; zinc-finger, WWE, PARP catalytic")
+
+# ==============================================================================
+# 8. ED Fig. 6a HSD17B12, 6c ITGA2, 6e DAGLB, 6g DSTN — peptide panels
+# ==============================================================================
+ed6 <- tribble(
+  ~panel,        ~gene,      ~stem,           ~tracks,                        ~features,                          ~expect,
+  "ED Fig. 6a",  "HSD17B12", "ED6a_HSD17B12", list(c("domains", "topology")), list(c("domain", "transmembrane")), "nonrisk ENST00000278353.10; risk ENST00000395700.4; transmembrane regions",
+  "ED Fig. 6c",  "ITGA2",    "ED6c_ITGA2",    list("domains"),                list("domain"),                     "nonrisk ENST00000296585.10; risk PB.5451.14; VWFA domain",
+  "ED Fig. 6e",  "DAGLB",    "ED6e_DAGLB",    list("domains"),                list("domain"),                     "nonrisk PB.7302.14; risk PB.7302.1; fungal lipase-type domain",
+  "ED Fig. 6g",  "DSTN",     "ED6g_DSTN",     list("domains"),                list("domain"),                     "nonrisk ENST00000474024.5; risk PB.17466.1; ADF-H domain")
+for (i in seq_len(nrow(ed6))) {
+  r <- ed6[i, ]
+  peptide_panel(r$gene, r$panel, r$stem, w = 4.5, h = 2,
+                show_tracks = unlist(r$tracks), show_features = unlist(r$features), expect = r$expect)
+}
+
+# ==============================================================================
+# 9. Fig. 6a SRP54, 6f MLX, 6k ITGA1 — AP-MS bait pairs (isoforms fixed to the baits)
+# ==============================================================================
+peptide_panel("SRP54", "Fig. 6a", "Fig6a_SRP54", w = 4.2, h = 2,
+              risk_pb = "PB.13005.14", nonrisk_pb = "PB.13005.1",
+              pf_override = c(LMTIMDSMNDQGGDMSK = "Risk", DVQELLTQYTK = "Nonrisk"),
+              show_tracks = c("domains"), show_features = c("interest"), keep_features = "M-domain",
+              expect = "nonrisk ENST00000216774.11; risk ENST00000555746.6; M-domain")
+peptide_panel("MLX", "Fig. 6f", "Fig6f_MLX", w = 4.2, h = 2,
+              risk_pb = "PB.15434.2", nonrisk_pb = "PB.15434.10", include_shared = TRUE,
+              show_tracks = c("domains"), show_features = c("interest"),
+              expect = "nonrisk PB.15434.10; risk ENST00000435881.7; disordered regions; leucine zipper")
+peptide_panel("ITGA1", "Fig. 6k", "Fig6k_ITGA1", w = 4.2, h = 2,
+              risk_pb = "PB.5448.10", nonrisk_pb = "PB.5448.2", include_shared = TRUE,
+              pf_override = c(VTLDSLR = "Nonrisk", GESLPCVK = "Both"),
+              show_tracks = c("domains", "topology"), show_features = c("domain", "transmembrane"),
+              drop_direction = "Increased",
+              expect = "nonrisk ENST00000282588.7; risk PB.5448.10; decreased junction only; VWFA; transmembrane")
+
+# ==============================================================================
+# 10. Manifest
+# ==============================================================================
+manifest <- bind_rows(MANIFEST)
+write_csv(manifest, file.path(BROWSER_DIR, "BROWSER_MANIFEST.csv"))
+cat(sprintf("\n%d panels written to %s\n", nrow(manifest), BROWSER_DIR))
+```
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

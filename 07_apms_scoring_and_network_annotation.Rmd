@@ -1,0 +1,648 @@
+---
+title: "AP-MS interaction scoring, isoform specificity and network annotation"
+output: html_document
+---
+
+## Purpose
+
+Affinity-purification mass spectrometry (AP-MS) was performed on 13 pairs of CAD
+sQTL-derived protein isoforms (26 3xFLAG-tagged baits) plus RAB11B, GFP and bead
+controls in HEK293T cells. Bait–prey pairs were scored independently with CompPASS and
+SAINTexpress; this script applies the thresholds given in Methods to each scorer,
+retains only preys that pass both (the high-confidence set), removes self-hits, and
+labels every prey of a bait pair as risk-specific, nonrisk-specific or shared according
+to which isoform(s) it passed the thresholds with. Each prey is then annotated with
+VSMC expression support (Human Protein Atlas smooth-muscle-cell set, VSMC discovery
+proteomics and VSMC long-read transcriptome), prior evidence in BioGRID and membership
+in the Aragam et al. (2022) CAD GWAS causal-gene list, and the result is exported as the
+master network used by every downstream AP-MS analysis and by Cytoscape. A final
+section runs the control checks reported in Results: RAB11B positive-control recovery
+and replicate consistency, GFP/bead negative-control pass-through, and recovery of
+known partners from BioGRID.
+
+## Manuscript outputs produced
+
+- Methods, "Interaction scoring and network annotation" (thresholds, specificity
+  definition, BioGRID / HPA / VSMC annotation).
+- Results, "Isoform-resolved AP-MS reveals extensive rewiring…": 601 high-confidence
+  interactions, 496 (83 %) detected with one isoform, mean 46 per pair; RAB11B control
+  recovery; GFP/bead pass-through; known-partner recovery; 36 of 601 interactions in
+  BioGRID (Fig. 5e).
+- Inputs to Fig. 5b–h and Extended Data Fig. 7 (drawn in `10_figure_and_table_generation`
+  and Cytoscape), Supplementary Table 17 (via script 10) and the GO enrichment of script 08.
+
+## Inputs
+
+- `F_SAINT_SET`, `F_COMPPASS_SET` — SAINTexpress and CompPASS output for the three
+  experimental sets (deposited search results, PRIDE).
+- `F_HPA_SMC_GENES` — Human Protein Atlas genes expressed in smooth muscle cells.
+- `F_SMC_SPECIFICITY_MANUAL` — manual VSMC-expression check (discovery proteomics and
+  long-read transcriptome) for the preys absent from the HPA set.
+- `F_ARAGAM_S31_GENES` — most likely causal CAD genes, Aragam et al. 2022 Supp. Table 31.
+- `F_BIOGRID_TAB3` — BioGRID 5.0.252, Homo sapiens, tab3 format.
+
+## Outputs (all in `RES_07`)
+
+- `saint_combined.tsv` — the three SAINT sets concatenated (background for the recovery
+  analysis).
+- `MASTER_network_LFC.csv` — Cytoscape edge table: bait gene, prey, log2 PSM fold change,
+  specificity, PSM per isoform, BioGRID flag.
+- `master_network_full_annotated.csv` — the edge table with harmonised gene names, the
+  Aragam CAD-gene flag and Cytoscape helper columns; read by scripts 08, 09 and 10.
+- `combined_shared_full_annot_summary.csv` — per bait × prey VSMC support flags (Fig. 5b,
+  Supplementary Table 17).
+- `CAD_APMS_long_summary.csv`, `CAD_APMS_wide_summary.csv` — interactions per pair and
+  specificity class (Results numbers; Fig. 5d).
+- Control checks: `rab11b_high_confidence_interactions.tsv`,
+  `rab11b_replicate_consistency.csv`, `rab11b_control_biogrid_human_apms_overlap.csv`,
+  `known_partner_recovery_per_gene.csv`, `known_partner_recovery_summary.csv`,
+  `shared_vs_specific_known_fisher.csv`.
+
+## Run order
+
+Independent of scripts 01–06 (it reads only AP-MS and public inputs); must run before
+08, 09 and 10.
+
+# 1. Setup
+
+```{r setup, message = FALSE, warning = FALSE}
+source("config.R")
+library(tidyverse)
+library(data.table)
+ensure_dir(RES_07)
+require_files(F_SAINT_SET, F_COMPPASS_SET, F_HPA_SMC_GENES, F_SMC_SPECIFICITY_MANUAL,
+              F_ARAGAM_S31_GENES, F_BIOGRID_TAB3)
+
+CTRL_BAIT <- "RAB11B-3xFLAG"   # positive-control bait; not a CAD sQTL locus
+
+# Strip the isoform suffix from a bait or prey label to obtain the gene symbol
+# (e.g. "ITGA1-PB5448-10" -> "ITGA1", "PARP12_PB_8076_5" -> "PARP12"), used to
+# remove self-hits and to compare bait genes with prey genes.
+first_gene <- function(x) str_remove(x, "[-_].*")
+```
+
+# 2. The 13 risk/nonrisk bait pairs
+
+Bait labels in the SAINT and CompPASS output encode gene and PacBio accession
+(`GENE-PB<gene>-<isoform>`). The pair table is defined once here so that specificity,
+fold changes and the network share one source of truth. The CFDP1 (RP11-77K12.1) risk
+bait PB.14782.8 is listed for completeness but is absent from the scoring output
+(the construct yielded no scorable pulldown), so CFDP1 contributes nonrisk-bait
+interactions only.
+
+```{r bait_pairs}
+isoform_pairs <- tibble(
+  risk = c("FAAP20-PB-52-18", "SRP54-PB-13005-14", "SLC9A3R2-PB14193-3", "DPYD-PB866-1",
+           "COA8-PB-13446-1", "NOB1-PB-14720-2", "ADAMTS7-PB13964-5", "LDLR-PB-16511-5",
+           "MLX-PB-15434-2", "RP11-77K12-1-PB-14782-8", "TRIM5-PB-10574-10",
+           "ITGA1-PB5448-10", "PARP12-PB8076-1"),
+  nonrisk = c("FAAP20-PB-52-24", "SRP54-PB-13005-1", "SLC9A3R2-PB14193-1", "DPYD-PB866-2",
+              "COA8-PB-13446-9", "NOB1-PB-14720-9", "ADAMTS7-PB13964-7", "LDLR-PB-16511-1",
+              "MLX-PB-15434-10", "RP11-77K12-1-PB-14782-7", "TRIM5-PB-10574-4",
+              "ITGA1-PB5448-2", "PARP12-PB8076-5")
+) %>%
+  mutate(gene      = sub("-PB.*$", "", risk),
+         gene_pair = paste0(gene, "_vs_", sub("-PB.*$", "", nonrisk)))
+
+# one row per bait, with its role in the pair
+iso_bait_long <- isoform_pairs %>%
+  select(gene_pair, risk, nonrisk) %>%
+  pivot_longer(c(risk, nonrisk), names_to = "bait_type", values_to = "Bait")
+
+# Symbols under which a bait gene may appear in BioGRID (older or alternative HGNC
+# symbols). Used for the BioGRID edge flag and for the known-partner recovery below.
+BAIT_ALIASES <- list(
+  "SLC9A3R2"     = c("NHERF2"),
+  "RP11-77K12-1" = c("CFDP1", "RP11-77K12.1"),
+  "RP11-77K12.1" = c("CFDP1", "RP11-77K12-1"),
+  "COA8"         = c("APOPT1", "C14orf153", "APOP1", "APOP", "APOP-1", "MC4DN17", "MGC2562"),
+  "FAAP20"       = c("C1ORF86")
+)
+alias_set <- function(g) unique(toupper(str_trim(c(g, BAIT_ALIASES[[g]]))))
+```
+
+# 3. Scoring output and thresholds
+
+CompPASS and SAINTexpress were run separately on each of the three experimental sets;
+the sets are concatenated before filtering because thresholds are absolute. The
+thresholds are those stated in Methods: CompPASS WD-score ≥ 1, Z-score ≥ 1.2,
+entropy > 0.75 and mean PSM ≥ 2; SAINT score ≥ 0.8, Bayesian FDR ≤ 0.05, fold change
+over controls ≥ 5 and mean spectral count ≥ 2. Self-hits (prey gene equal to the bait
+gene) are removed on both sides.
+
+```{r load_scores}
+saint    <- map_dfr(F_SAINT_SET,    read_csv, show_col_types = FALSE)
+comppass <- map_dfr(F_COMPPASS_SET, read_csv, show_col_types = FALSE)
+write_tsv(saint, OUT_SAINT_COMBINED)
+
+comppass_filtered <- comppass %>%
+  filter(Z >= 1.2 & Entropy > 0.75 & WD >= 1 & AvePSM >= 2) %>%
+  filter(sub("-.*", "", Bait) != Prey)
+
+saint_filtered <- saint %>%
+  filter(SaintScore >= 0.8 & BFDR <= 0.05 & FoldChange >= 5 & AvgSpec >= 2) %>%
+  filter(sub("-.*", "", Bait) != PreyGene)
+
+# second, stricter self-hit removal at the gene level (handles "_"-separated labels)
+saint2 <- saint_filtered %>%
+  mutate(bait_gene = first_gene(Bait), prey_gene = first_gene(PreyGene)) %>%
+  filter(bait_gene != prey_gene) %>%
+  select(-bait_gene, -prey_gene)
+
+comp2 <- comppass_filtered %>%
+  mutate(bait_gene = first_gene(Bait), prey_gene = first_gene(Prey)) %>%
+  filter(bait_gene != prey_gene) %>%
+  select(-bait_gene, -prey_gene)
+```
+
+# 4. High-confidence set: CompPASS ∩ SAINT
+
+Only bait–prey pairs passing both scorers are retained. Each side is reduced to one row
+per (bait, prey) before the metadata are joined, so the final table has exactly one row
+per high-confidence interaction.
+
+```{r intersect_scores}
+saint_pairs <- saint2 %>%
+  transmute(Bait, Prey = PreyGene) %>%
+  mutate(across(c(Bait, Prey), ~ trimws(.))) %>%
+  distinct()
+comp_pairs <- comp2 %>%
+  transmute(Bait, Prey) %>%
+  mutate(across(c(Bait, Prey), ~ trimws(.))) %>%
+  distinct()
+
+shared_pairs <- inner_join(saint_pairs, comp_pairs, by = c("Bait", "Prey"))
+n_shared <- nrow(shared_pairs)
+
+saint_one_row <- saint2 %>%
+  group_by(Bait, PreyGene) %>%
+  summarise(across(everything(), ~ dplyr::first(.x)), .groups = "drop")
+comp_one_row <- comp2 %>%
+  group_by(Bait, Prey) %>%
+  summarise(across(everything(), ~ dplyr::first(.x)), .groups = "drop")
+
+saint_shared    <- saint_one_row %>% semi_join(shared_pairs, by = c("Bait", "PreyGene" = "Prey"))
+comppass_shared <- comp_one_row  %>% semi_join(shared_pairs, by = c("Bait", "Prey"))
+stopifnot(nrow(saint_shared) == n_shared, nrow(comppass_shared) == n_shared)
+
+# SAINT columns first, CompPASS metrics (WD, Z, Entropy, AvePSM) appended
+combined_shared_full <- left_join(saint_shared, comppass_shared,
+                                  by = c("Bait" = "Bait", "PreyGene" = "Prey"))
+message(sprintf("%d high-confidence bait-prey pairs across %d baits (controls included)",
+                nrow(combined_shared_full), n_distinct(combined_shared_full$Bait)))
+
+# RAB11B positive-control preys, used by the Controls section and by script 10
+combined_shared_full %>%
+  filter(Bait == CTRL_BAIT) %>%
+  write_tsv(file.path(RES_07, "rab11b_high_confidence_interactions.tsv"))
+```
+
+# 5. Isoform specificity
+
+Within each bait pair, a prey is *shared* if it passed the thresholds with both the risk
+and the nonrisk bait, and *risk-* or *nonrisk-specific* if it passed with only one of
+them. Specificity therefore reflects passing the threshold, not absence from the other
+pulldown. The control bait has no pair, so its specificity is undefined (NA).
+
+```{r specificity}
+missing_baits <- anti_join(iso_bait_long, distinct(combined_shared_full, Bait), by = "Bait")
+if (nrow(missing_baits) > 0)
+  message("Bait(s) without high-confidence interactions: ",
+          paste(unique(missing_baits$Bait), collapse = ", "))
+
+combined_tagged <- combined_shared_full %>%
+  select(-any_of(c("gene_pair", "bait_type"))) %>%
+  left_join(iso_bait_long, by = "Bait")
+
+specificity_flags <- combined_tagged %>%
+  filter(!is.na(bait_type)) %>%
+  group_by(gene_pair, PreyGene) %>%
+  summarise(has_risk    = any(bait_type == "risk"),
+            has_nonrisk = any(bait_type == "nonrisk"), .groups = "drop") %>%
+  mutate(specificity = case_when(
+    has_risk & has_nonrisk  ~ "shared",
+    has_risk & !has_nonrisk ~ "risk-specific",
+    !has_risk & has_nonrisk ~ "nonrisk-specific",
+    TRUE                    ~ NA_character_)) %>%
+  select(gene_pair, PreyGene, specificity)
+
+combined_shared_full_annot <- combined_tagged %>%
+  left_join(specificity_flags, by = c("gene_pair", "PreyGene"))
+```
+
+# 6. Log2 PSM fold change (risk versus nonrisk)
+
+For every prey of a pair, the mean PSM in the risk pulldowns is compared with that in
+the nonrisk pulldowns as log2((PSM_risk + 1) / (PSM_nonrisk + 1)); a prey not passing
+with one isoform contributes 0 on that side. This value shades the prey nodes in
+Extended Data Fig. 7 and is reported in Supplementary Table 17.
+
+```{r psm_fold_change}
+shared_wide <- combined_shared_full_annot %>%
+  select(gene_pair, Prey, bait_type, AvePSM) %>%
+  pivot_wider(names_from = bait_type, values_from = AvePSM, values_fill = 0) %>%
+  rename(PSM_risk = risk, PSM_nonrisk = nonrisk)
+
+all_PSM_LFC <- shared_wide %>%
+  mutate(log2FC_PSM = log2((PSM_risk + 1) / (PSM_nonrisk + 1))) %>%
+  left_join(combined_shared_full_annot, join_by(gene_pair == gene_pair, Prey == PreyGene)) %>%
+  select(gene_pair, Prey, PSM_risk, PSM_nonrisk, log2FC_PSM, specificity)
+```
+
+# 7. VSMC expression support for the interactors
+
+Because the pulldowns were performed in HEK293T cells, each prey is checked for
+expression in VSMCs from three sources: the HPA smooth-muscle-cell expression set, the
+VSMC discovery proteomics data and the VSMC long-read transcriptome. Preys absent from
+the HPA set were looked up manually in the latter two datasets
+(`F_SMC_SPECIFICITY_MANUAL`); preys present in HPA are taken as supported by all three.
+
+```{r vsmc_support}
+hpa_smc <- read_tsv(F_HPA_SMC_GENES, show_col_types = FALSE) %>%
+  select(Gene, `Gene description`)
+smc_specificity <- read_csv(F_SMC_SPECIFICITY_MANUAL, show_col_types = FALSE)
+
+combined_shared_full_annot <- combined_shared_full_annot %>%
+  left_join(hpa_smc, join_by(PreyGene == Gene)) %>%
+  mutate(In_SMCs_in_HPA = if_else(!is.na(`Gene description`), "YES", "NO")) %>%
+  left_join(smc_specificity, by = "PreyGene") %>%
+  mutate(across(all_of(c("SMC Protein", "SMC LR RNAseq")), ~ replace_na(.x, "YES")))
+
+combined_shared_full_annot_summary <- combined_shared_full_annot %>%
+  mutate(specificity = forcats::fct_infreq(as.factor(specificity)),
+         gene_pair   = as.factor(gene_pair))
+
+# per bait x prey support flags (Fig. 5b; Supplementary Table 17)
+combined_shared_full_annot_summary %>%
+  select(Bait, PreyGene, specificity, In_SMCs_in_HPA, `SMC Protein`, `SMC LR RNAseq`) %>%
+  write_excel_csv(OUT_PREY_VSMC_SUPPORT)
+```
+
+# 8. Interaction counts per pair
+
+Counts of risk-specific, shared and nonrisk-specific interactions per bait pair give
+the totals quoted in Results and the proportions shown in Fig. 5d.
+
+```{r pair_summaries}
+sum_long <- combined_shared_full_annot_summary %>%
+  count(gene_pair, specificity, name = "n") %>%
+  group_by(gene_pair) %>%
+  mutate(total = sum(n), pct = n / total) %>%
+  ungroup() %>%
+  arrange(gene_pair, specificity)
+
+sum_wide <- sum_long %>%
+  select(-pct) %>%
+  pivot_wider(names_from = specificity, values_from = n, values_fill = 0) %>%
+  rowwise() %>%
+  mutate(row_total = sum(c_across(where(is.numeric)))) %>%
+  ungroup() %>%
+  arrange(gene_pair)
+
+write_csv(sum_long, OUT_APMS_LONG_SUMMARY)
+write_csv(sum_wide, OUT_APMS_WIDE_SUMMARY)
+
+# numbers for the text (CAD baits only; the control bait has no specificity)
+apms_cad <- combined_shared_full_annot_summary %>% filter(!Bait %in% CTRL_BAIT)
+apms_cad %>%
+  summarise(interactions = n(), distinct_prey = n_distinct(PreyGene),
+            baits = n_distinct(Bait)) %>%
+  print()
+print(count(apms_cad, specificity))
+combined_shared_full_annot_summary %>%
+  distinct(PreyGene, In_SMCs_in_HPA, `SMC Protein`, `SMC LR RNAseq`) %>%
+  mutate(any_support = In_SMCs_in_HPA == "YES" | `SMC Protein` == "YES" |
+                       `SMC LR RNAseq` == "YES") %>%
+  count(any_support, name = "n_prey") %>%
+  print()
+```
+
+# 9. BioGRID prior evidence
+
+BioGRID 5.0.252 (human) is loaded once with the columns needed here and in the
+Controls section. Prior evidence for each high-confidence interaction is assessed at the
+gene level: every BioGRID record in which Official Symbol Interactor A or B equals the
+bait gene (or one of its alternative symbols) is collected, the partners from both
+columns are pooled, self-interactions are removed, and a prey is flagged `in_biogrid`
+when it is among its bait gene's partners. Matching is case-insensitive.
+
+```{r biogrid_load}
+bg_cols <- c("Entrez Gene Interactor A", "Entrez Gene Interactor B",
+             "Official Symbol Interactor A", "Official Symbol Interactor B",
+             "Synonyms Interactor A", "Synonyms Interactor B",
+             "Organism ID Interactor A", "Organism ID Interactor B",
+             "Experimental System", "Experimental System Type", "Publication Source")
+bg <- fread(F_BIOGRID_TAB3, sep = "\t", quote = "", select = bg_cols,
+            showProgress = FALSE) %>% as_tibble()
+
+bg_sym <- bg %>%
+  transmute(symA = toupper(`Official Symbol Interactor A`),
+            symB = toupper(`Official Symbol Interactor B`))
+
+# gene-level BioGRID partner set per bait gene
+biogrid_partners <- function(gene) {
+  syms <- alias_set(gene)
+  hits <- bg_sym %>% filter(symA %in% syms | symB %in% syms)
+  setdiff(unique(c(hits$symA, hits$symB)), syms)
+}
+bait_partner_sets <- set_names(unique(isoform_pairs$gene)) %>% map(biogrid_partners)
+```
+
+# 10. Master network for Cytoscape
+
+One edge per bait gene → prey with the fold change, specificity and PSM values; preys
+lacking VSMC support in all three sources are removed, as stated in Methods. The
+`in_biogrid` flag is appended here, and the table is written as the Cytoscape input.
+
+```{r master_network_lfc}
+master_pre <- combined_shared_full_annot %>%
+  left_join(shared_wide, join_by(gene_pair == gene_pair, Prey == Prey)) %>%
+  mutate(log2FC_PSM = log2((PSM_risk + 1) / (PSM_nonrisk + 1)))
+
+# The VSMC support flags are prey-level attributes already carried by every row
+# (section 7), so the filter is applied to them directly.
+master_network <- master_pre %>%
+  mutate(`Gene Name Source` = sub("_vs_.*$", "", gene_pair),
+         `Gene Name Target` = Prey,
+         Interaction        = "Interaction",
+         weight             = abs(log2FC_PSM)) %>%
+  filter(!(In_SMCs_in_HPA == "NO" & `SMC Protein` == "NO" & `SMC LR RNAseq` == "NO")) %>%
+  select(`Gene Name Source`, `Gene Name Target`, log2FC_PSM, weight, specificity,
+         PSM_risk, PSM_nonrisk, Interaction)
+
+in_bg <- function(bait_gene, prey) {
+  if (is.na(bait_gene) || is.null(bait_partner_sets[[bait_gene]])) return("NO")
+  if_else(toupper(prey) %in% bait_partner_sets[[bait_gene]], "YES", "NO")
+}
+master_network <- master_network %>%
+  mutate(in_biogrid = map2_chr(`Gene Name Source`, `Gene Name Target`, in_bg))
+
+# shared preys are stored once per bait of the pair; count each bait-prey edge once
+edge_bg <- master_network %>%
+  filter(!is.na(`Gene Name Source`)) %>%
+  distinct(`Gene Name Source`, `Gene Name Target`, .keep_all = TRUE)
+message(sprintf("%d of %d high-confidence CAD-bait interactions are annotated in BioGRID",
+                sum(edge_bg$in_biogrid == "YES"), nrow(edge_bg)))
+write_csv(master_network, OUT_MASTER_NETWORK_LFC)
+```
+
+# 11. Annotated master network
+
+Gene symbols are harmonised to the names used for GO lookups in the network figures
+(display names in tables and panels are produced downstream with `display_gene()`),
+preys encoded by independent CAD GWAS loci are flagged from the Aragam et al. (2022)
+causal-gene list (black outlines in Extended Data Fig. 7), and three duplicate columns
+are added because Cytoscape styles map one column to one visual property.
+
+```{r master_network_annotated}
+cad_gwas_aragam <- read_csv(F_ARAGAM_S31_GENES, show_col_types = FALSE)
+
+master_network <- master_network %>%
+  mutate(
+    source_harmonized = case_when(`Gene Name Source` == "RP11-77K12-1" ~ "CFDP1",
+                                  `Gene Name Source` == "SLC9A3R2"     ~ "NHERF2",
+                                  TRUE ~ `Gene Name Source`),
+    target_harmonized = case_when(`Gene Name Target` == "C1orf112" ~ "FIRRM",
+                                  TRUE ~ `Gene Name Target`),
+    in_cad_gwas_aragam_2022 = if_else(
+      `Gene Name Target` %in% cad_gwas_aragam$most_likely_causal_gene, "YES", "NO"),
+    specificity_target = specificity,       # node colour for prey (Cytoscape)
+    in_biogrid_edge    = in_biogrid,        # edge style (Cytoscape)
+    source_for_target  = `Gene Name Source` # bait assignment per prey node (Cytoscape)
+  )
+
+write_csv(master_network, OUT_MASTER_NETWORK_ANNOT)
+```
+
+# 12. Controls
+
+## 12.1 RAB11B positive control: recovery and replicate consistency
+
+Per-replicate spectral counts are stored as `a|b|c`; a prey is consistently recovered
+if it has counts in every bait replicate run.
+
+```{r rab11b_recovery}
+rab_shared <- combined_shared_full %>% filter(Bait == CTRL_BAIT)
+
+rab_rep <- rab_shared %>%
+  transmute(PreyGene,
+            NumReplicates = suppressWarnings(as.integer(NumReplicates)),
+            spec_vec      = str_split(as.character(Spec), "\\|")) %>%
+  mutate(spec_vec   = map(spec_vec, ~ suppressWarnings(as.numeric(.x))),
+         n_reps_obs = map_int(spec_vec, ~ sum(.x > 0, na.rm = TRUE)),
+         n_reps_str = map_int(spec_vec, ~ sum(!is.na(.x))),
+         n_reps_tot = coalesce(NumReplicates, n_reps_str),
+         all_reps   = n_reps_obs == n_reps_tot & n_reps_tot > 0)
+if (any(rab_rep$n_reps_str != rab_rep$n_reps_tot))
+  warning("Spec length differs from NumReplicates for some RAB11B preys")
+
+saint_set <- unique(saint2$PreyGene[saint2$Bait == CTRL_BAIT])
+comp_set  <- unique(comp2$Prey[comp2$Bait == CTRL_BAIT])
+n_rab     <- length(unique(rab_shared$PreyGene))
+cat(sprintf("RAB11B high-confidence preys (SAINT and CompPASS): %d\n", n_rab),
+    sprintf("  passing SAINT: %d | passing CompPASS: %d\n", length(saint_set), length(comp_set)),
+    sprintf("  detected in all replicates: %d of %d\n", sum(rab_rep$all_reps), n_rab), sep = "")
+
+rab_rep %>%
+  mutate(Spec = map_chr(spec_vec, ~ paste(.x, collapse = "|"))) %>%
+  select(-spec_vec) %>%
+  write_csv(file.path(RES_07, "rab11b_replicate_consistency.csv"))
+```
+
+## 12.2 RAB11B preys previously reported by human AP-MS
+
+Human–human Affinity Capture-MS records involving RAB11B are taken from BioGRID using the
+Entrez identifier (9230), because symbol matching alone would also pick up rodent Rab11b
+and RAB43 records.
+
+```{r rab11b_biogrid}
+CTRL_GENE <- "RAB11B"
+CTRL_ENT  <- "9230"
+
+ctrl_hits <- bg %>%
+  filter(`Experimental System` == "Affinity Capture-MS",
+         `Organism ID Interactor A` == 9606, `Organism ID Interactor B` == 9606,
+         `Entrez Gene Interactor A` == CTRL_ENT | `Entrez Gene Interactor B` == CTRL_ENT)
+ctrl_partner <- toupper(ifelse(ctrl_hits$`Entrez Gene Interactor A` == CTRL_ENT,
+                               ctrl_hits$`Official Symbol Interactor B`,
+                               ctrl_hits$`Official Symbol Interactor A`))
+bg_apms <- setdiff(unique(ctrl_partner), CTRL_GENE)
+
+rab_preys  <- rab_shared %>%
+  mutate(prey = toupper(first_gene(PreyGene))) %>% pull(prey) %>% unique()
+n_prior_ms <- sum(rab_preys %in% bg_apms)
+cat(sprintf("RAB11B: %d preys; %d previously reported by human AP-MS (%d BioGRID publications)\n",
+            length(rab_preys), n_prior_ms, n_distinct(ctrl_hits$`Publication Source`)))
+
+rab_overlap <- tibble(prey = rab_preys) %>%
+  left_join(tibble(prey = ctrl_partner, pub = ctrl_hits$`Publication Source`) %>%
+              group_by(prey) %>%
+              summarise(n_pubs = n_distinct(pub), pubs = paste(unique(pub), collapse = ";"),
+                        .groups = "drop"),
+            by = "prey") %>%
+  mutate(in_biogrid_human_apms = !is.na(n_pubs), n_pubs = coalesce(n_pubs, 0L)) %>%
+  arrange(desc(in_biogrid_human_apms), prey)
+write_csv(rab_overlap, file.path(RES_07, "rab11b_control_biogrid_human_apms_overlap.csv"))
+```
+
+## 12.3 GFP and bead negative controls
+
+GFP-transfected and bead-only pulldowns are the SAINT control set; this check asks how
+many of their preys would pass the CompPASS thresholds on their own and whether any such
+prey survives in the final network.
+
+```{r negative_controls}
+GFP_BAITS <- comppass %>% distinct(Bait) %>%
+  filter(str_detect(toupper(Bait), "GFP")) %>% pull(Bait)
+stopifnot(length(GFP_BAITS) > 0)
+
+cp_pass <- comppass_filtered %>%
+  count(Bait, name = "n_pass") %>%
+  right_join(comppass %>% distinct(Bait), by = "Bait") %>%
+  mutate(n_pass = coalesce(n_pass, 0L),
+         type = case_when(Bait %in% c(GFP_BAITS, "beads") ~ "negative control",
+                          Bait == CTRL_BAIT                ~ "positive control",
+                          TRUE                             ~ "isoform bait"))
+cp_pass %>%
+  group_by(type) %>%
+  summarise(n_baits = n(), median_pass = median(n_pass), min_pass = min(n_pass),
+            max_pass = max(n_pass), .groups = "drop") %>%
+  print()
+
+# network edges at the gene level (CAD baits only), used here and in 12.4
+spec_side <- function(s) case_when(
+  grepl("non", s, ignore.case = TRUE) & grepl("risk", s, ignore.case = TRUE) ~ "nonrisk",
+  grepl("shared|both", s, ignore.case = TRUE)                                ~ "shared",
+  grepl("risk", s, ignore.case = TRUE)                                       ~ "risk",
+  TRUE                                                                       ~ "other")
+mn2 <- master_network %>%
+  transmute(bait = `Gene Name Source`, prey = `Gene Name Target`, sc = spec_side(specificity)) %>%
+  filter(!is.na(prey), prey != "", bait != CTRL_GENE) %>%
+  distinct()
+
+# control-passing preys (GFP protein itself excluded) that remain in the final network
+ctrl_prey <- comppass_filtered %>%
+  filter(Bait %in% c(GFP_BAITS, "beads")) %>%
+  distinct(Prey) %>%
+  mutate(Prey = toupper(Prey)) %>%
+  filter(Prey != "EGFP")
+retained <- mn2 %>%
+  mutate(prey_u = toupper(prey)) %>%
+  filter(prey_u %in% ctrl_prey$Prey) %>%
+  distinct(bait, prey_u, sc)
+message(sprintf("%d control-passing preys; %d retained network edges involve one of them",
+                nrow(ctrl_prey), nrow(retained)))
+```
+
+## 12.4 Recovery of known partners from BioGRID
+
+For each bait gene and for RAB11B, the high-confidence preys are compared with the
+partners reported by human Affinity Capture-MS in BioGRID (any direction) and with the
+subset reported by BioPlex with the gene as bait. Expected recovery is computed against
+the background of every prey gene detected in any unfiltered pulldown, giving precision,
+recall and fold enrichment per gene. Shared and isoform-specific preys are then compared
+for prior BioGRID evidence (Fisher's exact test), with sensitivity analyses excluding
+CFDP1 and the bead-flagged preys.
+
+```{r known_partner_recovery}
+BIOPLEX_PMIDS <- c("PUBMED:26186194", "PUBMED:28514442", "PUBMED:33961781")
+
+bg_h <- bg %>%
+  filter(`Experimental System` == "Affinity Capture-MS",
+         `Organism ID Interactor A` == 9606, `Organism ID Interactor B` == 9606) %>%
+  transmute(symA = toupper(`Official Symbol Interactor A`),
+            symB = toupper(`Official Symbol Interactor B`),
+            pmid = `Publication Source`)
+ref_long <- bind_rows(
+  bg_h %>% transmute(sym = symA, partner = symB, pmid, dir = "bait"),
+  bg_h %>% transmute(sym = symB, partner = symA, pmid, dir = "prey"))
+
+# observed gene-level preys: CAD baits plus the RAB11B control
+obs <- bind_rows(
+  mn2 %>% transmute(gene = bait, prey = toupper(prey), sc),
+  rab_shared %>% transmute(gene = CTRL_GENE, prey = toupper(first_gene(PreyGene)), sc = "control")
+) %>% filter(sc != "other") %>% distinct()
+
+# bait gene -> BioGRID official symbol(s)
+bait_syms <- tibble(gene = unique(obs$gene)) %>%
+  mutate(sym = map(gene, alias_set)) %>% unnest(sym) %>%
+  semi_join(ref_long, by = "sym")
+stopifnot(all(c("FAAP20", "RP11-77K12-1") %in% bait_syms$gene))
+
+ref_all <- bait_syms %>%
+  inner_join(ref_long, by = "sym", relationship = "many-to-many") %>%
+  filter(partner != sym) %>%
+  distinct(gene, partner, pmid, dir)
+ref_sets <- list(
+  "human AP-MS, any direction" = ref_all %>% distinct(gene, partner),
+  "BioPlex, gene as bait"      = ref_all %>% filter(dir == "bait", pmid %in% BIOPLEX_PMIDS) %>%
+                                   distinct(gene, partner))
+
+# background: every prey gene detected in any unfiltered pulldown
+bg_prot <- saint %>% transmute(p = toupper(first_gene(PreyGene))) %>% pull(p) %>% unique()
+N_bg    <- length(bg_prot)
+
+recovery <- imap_dfr(ref_sets, function(ref, label) {
+  obs_g <- obs %>% distinct(gene, prey)
+  obs_g %>% count(gene, name = "n_preys") %>%
+    left_join(ref %>% count(gene, name = "n_known"), by = "gene") %>%
+    left_join(ref %>% filter(partner %in% bg_prot) %>% count(gene, name = "n_known_bg"),
+              by = "gene") %>%
+    left_join(obs_g %>% semi_join(ref, by = c("gene", "prey" = "partner")) %>%
+                count(gene, name = "n_recovered"), by = "gene") %>%
+    mutate(across(starts_with("n_"), ~ coalesce(.x, 0L)),
+           expected  = n_preys * n_known_bg / N_bg,
+           precision = n_recovered / n_preys,
+           recall    = if_else(n_known > 0, n_recovered / n_known, NA_real_),
+           reference = label,
+           group     = if_else(gene == CTRL_GENE, "RAB11B control", "CAD baits"))
+})
+
+summary_tbl <- recovery %>%
+  group_by(reference, group) %>%
+  summarise(genes           = n(),
+            genes_with_ref  = sum(n_known > 0),
+            preys           = sum(n_preys),
+            known_partners  = sum(n_known),
+            recovered       = sum(n_recovered),
+            precision_pct   = 100 * recovered / preys,
+            recall_pct      = 100 * sum(n_recovered[n_known > 0]) / sum(n_known),
+            expected        = sum(expected),
+            fold_enrichment = recovered / expected,
+            p_approx        = ppois(recovered - 1, expected, lower.tail = FALSE),
+            .groups = "drop")
+print(summary_tbl, width = Inf)
+
+# shared versus isoform-specific preys: prior BioGRID evidence (CAD baits only)
+spec_tbl <- obs %>%
+  filter(gene != CTRL_GENE) %>%
+  mutate(class = if_else(sc == "shared", "shared", "isoform-specific")) %>%
+  distinct(gene, prey, class) %>%
+  left_join(ref_sets[["human AP-MS, any direction"]] %>% mutate(known = TRUE),
+            by = c("gene", "prey" = "partner")) %>%
+  mutate(known = coalesce(known, FALSE))
+flagged <- retained %>% transmute(gene = bait, prey = prey_u)
+
+run_fisher <- function(d, label) {
+  ft <- fisher.test(table(d$class, d$known))
+  d %>% group_by(class) %>%
+    summarise(n = n(), n_known = sum(known), pct_known = 100 * mean(known), .groups = "drop") %>%
+    mutate(analysis = label, odds_ratio = unname(ft$estimate),
+           ci_low = ft$conf.int[1], ci_high = ft$conf.int[2], p = ft$p.value)
+}
+spec_results <- bind_rows(
+  run_fisher(spec_tbl, "all genes"),
+  run_fisher(spec_tbl %>% filter(gene != "RP11-77K12-1"), "excl. CFDP1 (RP11-77K12.1)"),
+  run_fisher(spec_tbl %>% anti_join(flagged, by = c("gene", "prey")), "excl. bead-flagged"))
+print(spec_results, width = Inf)
+
+write_csv(recovery,     file.path(RES_07, "known_partner_recovery_per_gene.csv"))
+write_csv(summary_tbl,  file.path(RES_07, "known_partner_recovery_summary.csv"))
+write_csv(spec_results, file.path(RES_07, "shared_vs_specific_known_fisher.csv"))
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

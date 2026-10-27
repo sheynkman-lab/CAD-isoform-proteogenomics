@@ -1,0 +1,1037 @@
+---
+title: "Junction–isoform mapping and definition of risk/nonrisk isoform pairs"
+output: html_document
+---
+
+## Purpose
+
+A CAD-colocalized sQTL identifies an intron-excision junction whose usage changes
+with the risk allele, but the junction alone does not say which transcript or
+protein isoform carries the change. This script maps every CAD sQTL junction, and
+every non-CAD VSMC sQTL junction used as background, onto the long-read VSMC
+transcript models and classifies each junction as coding or noncoding, so that all
+downstream scripts stratify junctions with one shared definition. Within each
+LeafCutter cluster the junction whose usage increases with the risk allele is
+designated the risk-associated junction and its counterpart the nonrisk-associated
+junction; the two junctions are then resolved to the highest-expressed non-NMD
+isoform that contains each, with a documented fallback when only one side of the
+cluster is represented in the long-read data. The resulting unified pair table (94
+sQTL-derived pairs plus the 13 AP-MS bait pairs fixed before proteomic detection)
+is the input of every protein-level, peptide-level and interactome analysis.
+Finally, each junction is projected onto amino-acid coordinates of every isoform
+that contains it, because the junction-region property comparisons of script 03
+need a protein-space window around the splice site.
+
+## Manuscript outputs produced
+
+- Fig. 4b–4d and Supplementary Table 13 — junction annotation status and coding
+  class (the panels and the table are assembled by `10_figure_and_table_generation.Rmd`
+  from the exports below).
+- Supplementary Table 16 — the 94 computed risk/nonrisk isoform pairs (69 with both
+  junctions represented, 25 with a counterpart selected from the gene's other
+  isoforms) in 85 genes, plus the 13 AP-MS pairs; completed with property axes in
+  script 06.
+- Methods, "Mapping CAD sQTL junctions to transcripts and proteins" and "Definition
+  of risk- and nonrisk-associated junctions and isoform pairs".
+
+## Inputs
+
+- `OUT_LFC_INTEGRATED` — integrated CAD sQTL junction table from script 01 (one row
+  per junction × condition; `effect_direction` is already expressed relative to the
+  CAD risk allele).
+- `F_GENERAL_SQTL_LR` — all VSMC sQTL junctions mapped to long-read isoforms (the
+  non-CAD background; Aherrahrou et al. 2023).
+- `F_LEAFCUTTER_BED_PROLIF`, `F_LEAFCUTTER_BED_QUIESC` — LeafCutter cluster BEDs
+  (cluster identifier ↔ junction coordinates, per culture condition).
+- `F_LEAFCUTTER_COUNTS_PROLIF`, `F_LEAFCUTTER_COUNTS_QUIESC` — LeafCutter
+  numerator/denominator counts per junction per donor (percent spliced in).
+- `F_SMC_GTF`, `F_SMC_INTRON_COORDS`, `F_SMC_PSL` — long-read transcript models with
+  CDS, their intron coordinates, and their exon block structure.
+- `F_SQANTI_PROTEIN_CPM` — SQANTI Protein classification with CPM, NMD flag and ORF
+  coordinates per isoform.
+- `F_SMC_PROTEIN_FASTA` — predicted VSMC protein sequences.
+- `F_GENCODE_V38_GTF` — GENCODE v38 (gene biotype).
+- `F_APMS_BAIT_PAIRS` — the 13 AP-MS bait pairs (gene, risk PB, nonrisk PB).
+
+## Outputs (in `RES_02`)
+
+- `cad_junction_coding_classification.csv`, `noncad_junction_coding_classification.csv`
+  — coding class per junction (scripts 04, 05, 10).
+- `full_junction_universe_for_AS.csv`, `full_junction_isoform_map_for_AS.csv` — every
+  CAD and non-CAD junction with its coding label, and every isoform containing it
+  (scripts 04, 05, 10).
+- `cad_junction_cluster_map.csv`, `cad_cluster_siblings_with_psi.csv`,
+  `cad_risk_nonrisk_junction_pairs.csv` — cluster membership, sibling PSI and the
+  risk/nonrisk junction assignment (script 04).
+- `leafcutter_isoform_pairs_all.csv`, `leafcutter_isoform_pairs_full_pools.csv` —
+  cluster-derived isoform pairs and the full candidate isoform pool per junction side
+  (script 05).
+- `leafcutter_isoform_pairs_unified.csv`, `leafcutter_isoform_pairs_unified_flagged.csv`
+  — the unified pair table (strict, salvaged and AP-MS pairs) with the inclusion flags
+  that define the 94-pair analysis set (scripts 03, 04, 05, 06,
+  `python/compute_af3_metrics.py`).
+- `junction_aa_mapping.csv` — amino-acid position and ±10-residue window of every
+  pair junction in every isoform that contains it (script 03,
+  `python/compute_af3_metrics.py`).
+
+## Run order
+
+Script 01 must have been run.
+
+```{r setup, message=FALSE, warning=FALSE}
+source("config.R")
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(Biostrings)
+library(pwalign)
+library(data.table)
+
+# purrr::reduce and IRanges::reduce share a name, and dplyr verbs are masked by
+# S4 generics once GenomicRanges is attached; bind the intended versions.
+reduce <- GenomicRanges::reduce
+filter <- dplyr::filter
+select <- dplyr::select
+rename <- dplyr::rename
+slice  <- dplyr::slice
+
+set.seed(42)
+ensure_dir(RES_02)
+
+require_files(OUT_LFC_INTEGRATED, F_GENERAL_SQTL_LR,
+              F_LEAFCUTTER_BED_PROLIF, F_LEAFCUTTER_BED_QUIESC,
+              F_LEAFCUTTER_COUNTS_PROLIF, F_LEAFCUTTER_COUNTS_QUIESC,
+              F_SMC_GTF, F_SMC_INTRON_COORDS, F_SMC_PSL, F_SQANTI_PROTEIN_CPM,
+              F_SMC_PROTEIN_FASTA, F_GENCODE_V38_GTF, F_APMS_BAIT_PAIRS)
+
+# Half-width of the protein window centred on each junction (±10 aa = 20 aa).
+WINDOW_AA <- 10
+```
+
+# 1. Load sQTL junctions and long-read transcript models
+
+The CAD set is every distinct junction in the integrated colocalization table; the
+non-CAD background is every VSMC sQTL junction whose cluster is not a CAD cluster,
+so that the two sets do not share junctions. Junction keys use the LeafCutter
+coordinate convention (`chr:start:end` of the excised intron) throughout, because
+every join in this and the downstream scripts is made on that key.
+
+```{r load_core_data}
+cad_sqtls <- read_tsv(OUT_LFC_INTEGRATED, show_col_types = FALSE) %>%
+  mutate(
+    junction_id  = paste(chr, intron_start, intron_end, strand, sep = ":"),
+    junction_key = paste(chr, intron_start, intron_end, sep = ":")
+  )
+
+cad_junctions <- cad_sqtls %>%
+  distinct(chr, intron_start, intron_end, strand, .keep_all = TRUE) %>%
+  select(junction_key, chr, intron_start, intron_end, strand, gene_name, effect_direction)
+cat("CAD sQTL distinct junctions:", nrow(cad_junctions), "\n")
+
+general_sqtls_raw <- read_tsv(F_GENERAL_SQTL_LR, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+
+# Exclude CAD clusters from the background.
+cad_cluster_ids <- unique(cad_sqtls$cluster)
+general_sqtls <- general_sqtls_raw %>% filter(!cluster_id %in% cad_cluster_ids)
+general_junctions <- general_sqtls %>%
+  distinct(chr, intron_start, intron_end, junction_id, junction_key, .keep_all = TRUE)
+cat("Non-CAD VSMC sQTL distinct junctions:", nrow(general_junctions), "\n")
+
+cad_junc_gr <- makeGRangesFromDataFrame(cad_junctions, seqnames.field = "chr",
+                                        start.field = "intron_start", end.field = "intron_end",
+                                        keep.extra.columns = TRUE)
+seqlevelsStyle(cad_junc_gr) <- "UCSC"
+general_junc_gr <- makeGRangesFromDataFrame(general_junctions, seqnames.field = "chr",
+                                            start.field = "intron_start", end.field = "intron_end",
+                                            keep.extra.columns = TRUE)
+seqlevelsStyle(general_junc_gr) <- "UCSC"
+
+# Long-read transcript models: CDS intervals (pooled and per transcript).
+smc_gtf    <- rtracklayer::import(F_SMC_GTF)
+smc_gtf_df <- as.data.frame(smc_gtf)
+smc_cds_gr <- smc_gtf_df %>% filter(type == "CDS") %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+seqlevelsStyle(smc_cds_gr) <- "UCSC"
+
+cds_by_transcript <- smc_gtf_df %>%
+  filter(type == "CDS") %>%
+  mutate(pb_id = str_extract(transcript_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id)) %>%
+  makeGRangesFromDataFrame(seqnames.field = "seqnames", start.field = "start",
+                           end.field = "end", strand.field = "strand",
+                           keep.extra.columns = TRUE)
+seqlevelsStyle(cds_by_transcript) <- "UCSC"
+cds_lookup <- split(cds_by_transcript, cds_by_transcript$pb_id)
+
+# SQANTI Protein table (CPM, NMD, structural category, ORF coordinates).
+sqanti_protein <- read_csv(F_SQANTI_PROTEIN_CPM, show_col_types = FALSE)
+colnames(sqanti_protein)[colnames(sqanti_protein) == "pb"] <- "pb_acc"
+
+# Junction -> isoform map: one row per (intron, transcript); the PB accession is
+# embedded in trans_id as GENE|PB.X.Y|N.
+smc_junc_isoform <- read_tsv(F_SMC_INTRON_COORDS, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"),
+         pb_id = str_extract(trans_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id))
+cat("Junction-isoform links in the long-read models:", nrow(smc_junc_isoform), "\n")
+
+cad_junction_keys     <- unique(cad_junctions$junction_key)
+general_junction_keys <- unique(general_junctions$junction_key)
+```
+
+# 2. Coding classification of junctions
+
+A junction is called coding when it overlaps a CDS interval of the long-read models
+and at least one isoform containing it carries a SQANTI structural category
+compatible with a predicted ORF; otherwise it is assigned to the UTR of a coding
+gene, to a lncRNA, or to another biotype from GENCODE v38. The full universe of
+CAD and non-CAD junctions is exported with this label so that the splice-event
+classification (script 04) can see noncoding junctions while every protein-level
+analysis restricts to the same coding subset.
+
+```{r junction_classification}
+# Gene biotype from GENCODE v38 (gene-level records only).
+gc_gtf <- rtracklayer::import(F_GENCODE_V38_GTF)
+gene_biotype <- as.data.frame(gc_gtf) %>%
+  filter(type == "gene") %>%
+  dplyr::select(gene_name, gene_type) %>%
+  distinct(gene_name, .keep_all = TRUE)
+rm(gc_gtf); invisible(gc(verbose = FALSE))
+
+coding_categories <- c("full-splice_match", "incomplete-splice_match",
+                       "novel_in_catalog", "novel_not_in_catalog")
+
+# CAD junctions
+cad_classification <- cad_junctions %>%
+  mutate(overlaps_cds = countOverlaps(cad_junc_gr, smc_cds_gr, type = "any") > 0) %>%
+  left_join(gene_biotype, by = "gene_name")
+
+junc_has_cds_isoform <- smc_junc_isoform %>%
+  filter(junction_key %in% cad_junction_keys) %>%
+  left_join(sqanti_protein %>% dplyr::select(pb_acc, tx_cat), by = c("pb_id" = "pb_acc")) %>%
+  group_by(junction_key) %>%
+  summarise(n_isoforms = n(),
+            n_coding_isoforms = sum(tx_cat %in% coding_categories, na.rm = TRUE),
+            any_coding = n_coding_isoforms > 0, .groups = "drop")
+
+cad_classification <- cad_classification %>%
+  left_join(junc_has_cds_isoform, by = "junction_key") %>%
+  mutate(coding_class = case_when(
+    overlaps_cds & any_coding ~ "CDS (at least partial)",
+    !overlaps_cds & any_coding ~ "UTR/noncoding region of coding gene",
+    !is.na(gene_type) & gene_type == "lncRNA" ~ "lncRNA",
+    !is.na(gene_type) & gene_type == "protein_coding" & !any_coding ~
+      "Protein-coding gene, no CDS isoform captured",
+    is.na(gene_type) ~ "Unknown biotype",
+    TRUE ~ paste0("Other (", gene_type, ")")
+  ))
+
+# Non-CAD junctions (the background table names the gene column `gene`)
+gen_classification <- general_junctions %>%
+  mutate(overlaps_cds = countOverlaps(general_junc_gr, smc_cds_gr, type = "any") > 0)
+if ("gene_name" %in% colnames(gen_classification)) {
+  gen_classification <- gen_classification %>% left_join(gene_biotype, by = "gene_name")
+} else if ("gene" %in% colnames(gen_classification)) {
+  gen_classification <- gen_classification %>% left_join(gene_biotype, by = c("gene" = "gene_name"))
+}
+
+noncad_junc_has_cds <- smc_junc_isoform %>%
+  filter(junction_key %in% general_junction_keys, !junction_key %in% cad_junction_keys) %>%
+  left_join(sqanti_protein %>% dplyr::select(pb_acc, tx_cat), by = c("pb_id" = "pb_acc")) %>%
+  group_by(junction_key) %>%
+  summarise(any_coding = any(tx_cat %in% coding_categories, na.rm = TRUE), .groups = "drop")
+
+gen_classification <- gen_classification %>%
+  left_join(noncad_junc_has_cds, by = "junction_key") %>%
+  mutate(coding_class = case_when(
+    overlaps_cds & any_coding ~ "CDS (at least partial)",
+    !overlaps_cds & any_coding ~ "UTR/noncoding region of coding gene",
+    !is.na(gene_type) & gene_type == "lncRNA" ~ "lncRNA",
+    TRUE ~ "Other/Unknown"
+  ))
+
+cat("CAD junctions in CDS:", sum(cad_classification$coding_class == "CDS (at least partial)"),
+    "of", nrow(cad_classification), "\n")
+
+write_csv(cad_classification %>%
+            dplyr::select(junction_key, gene_name, effect_direction, overlaps_cds,
+                          any_of("gene_type"), any_coding, coding_class),
+          OUT_CAD_JUNCTION_CODING)
+write_csv(gen_classification %>%
+            dplyr::select(junction_key, any_of(c("gene", "gene_name")), overlaps_cds,
+                          any_of("gene_type"), any_coding, coding_class),
+          OUT_NONCAD_JUNCTION_CODING)
+
+# Full splicing universe (coding and noncoding) with the coding label, and every
+# isoform carrying each junction, for the splice-event classification.
+full_junction_universe <- bind_rows(cad_classification %>% mutate(set = "CAD"),
+                                    gen_classification %>% mutate(set = "nonCAD"))
+if (!"gene_name" %in% names(full_junction_universe)) full_junction_universe$gene_name <- NA_character_
+if ("gene" %in% names(full_junction_universe)) {
+  full_junction_universe <- full_junction_universe %>% mutate(gene_name = coalesce(gene_name, gene))
+}
+full_junction_universe <- full_junction_universe %>%
+  dplyr::select(set, junction_key, gene_name, any_of("effect_direction"),
+                overlaps_cds, any_of("gene_type"), any_coding, coding_class) %>%
+  distinct()
+
+full_junction_isoform_map <- smc_junc_isoform %>%
+  filter(junction_key %in% c(cad_junction_keys, general_junction_keys)) %>%
+  distinct(junction_key, pb_id)
+
+write_csv(full_junction_universe,    OUT_JUNCTION_UNIVERSE)
+write_csv(full_junction_isoform_map, OUT_JUNCTION_ISOFORM_MAP)
+```
+
+# 3. LeafCutter clusters, sibling junctions and percent spliced in
+
+LeafCutter cluster identifiers are not stable between runs, so CAD junctions are
+matched to the cluster BED files by genomic coordinates. Every junction of a matched
+cluster (its "siblings") is retrieved, and the mean percent spliced in (PSI) of each
+junction is computed across donors from the LeafCutter numerator/denominator counts,
+because PSI is the criterion used below to pick a counterpart junction when a cluster
+contains only one CAD-colocalized junction.
+
+```{r load_bed}
+parse_bed_clusters <- function(bed_path, cond_label) {
+  bed <- fread(bed_path, select = 1:4, header = TRUE)
+  colnames(bed) <- c("chrom", "start", "end", "ID")
+  bed %>%
+    as_tibble() %>%
+    mutate(junction_key = paste0(chrom, ":", start, ":", end),
+           cluster_bed  = str_extract(ID, "clu_\\d+_[+-]"),
+           ensg         = str_extract(ID, "ENSG\\d+\\.\\d+"),
+           condition    = cond_label) %>%
+    select(junction_key, cluster_bed, chrom, start, end, ensg, condition)
+}
+
+bed_all <- bind_rows(parse_bed_clusters(F_LEAFCUTTER_BED_PROLIF, "Proliferative"),
+                     parse_bed_clusters(F_LEAFCUTTER_BED_QUIESC, "Quiescent")) %>%
+  distinct(junction_key, cluster_bed, .keep_all = TRUE)
+cat("LeafCutter junctions:", nrow(bed_all), "in", n_distinct(bed_all$cluster_bed), "clusters\n")
+```
+
+```{r match_cad}
+cad_info <- cad_sqtls %>%
+  as_tibble() %>%
+  select(junction_key, gene_name, cluster_sqtl = cluster, slope, effect_direction, Condition) %>%
+  distinct(junction_key, .keep_all = TRUE) %>%
+  filter(!is.na(junction_key))
+
+# Coordinate-based match; a junction present in both conditions is kept once.
+cad_matched <- cad_info %>%
+  inner_join(bed_all %>% select(junction_key, cluster_bed) %>% distinct(), by = "junction_key") %>%
+  as.data.frame() %>%
+  { .[!duplicated(.[, c("junction_key", "cluster_bed")]), ] } %>%
+  as_tibble()
+
+cad_dedup <- as.data.frame(cad_matched)
+cad_dedup <- as_tibble(cad_dedup[!duplicated(cad_dedup$junction_key), ])
+cat("CAD junctions matched to a LeafCutter cluster:", nrow(cad_dedup), "/", nrow(cad_info), "\n")
+```
+
+```{r extract_siblings}
+matched_clusters <- unique(cad_dedup$cluster_bed)
+
+siblings <- bed_all %>%
+  filter(cluster_bed %in% matched_clusters) %>%
+  left_join(cad_dedup %>% select(junction_key, gene_name, slope, effect_direction),
+            by = "junction_key") %>%
+  mutate(is_cad_sqtl = !is.na(gene_name))
+
+# Fill the gene name of non-sQTL siblings from the CAD junction of their cluster.
+gene_map <- as.data.frame(cad_dedup[, c("cluster_bed", "gene_name")])
+gene_map <- gene_map[!duplicated(gene_map$cluster_bed), ]
+colnames(gene_map) <- c("cluster_bed", "cluster_gene")
+siblings <- siblings %>%
+  left_join(as_tibble(gene_map), by = "cluster_bed") %>%
+  mutate(gene_name = coalesce(gene_name, cluster_gene)) %>%
+  select(-cluster_gene)
+```
+
+```{r load_counts}
+# Each cell of the cleaned counts is "numerator/denominator" per sample; PSI per
+# sample is their ratio and the mean is taken over samples with coverage.
+parse_cleaned_counts <- function(counts_path, cond_label) {
+  raw <- fread(counts_path, header = TRUE, nThread = 1)
+  id_col <- colnames(raw)[1]
+  sample_cols <- colnames(raw)[-1]
+  ids <- raw[[id_col]]
+
+  # Row identifier format: chr11:133778:134564:chr11:clu_1_-_ENSG00000230724.9
+  parsed <- tibble(
+    raw_id = ids,
+    chrom  = str_extract(ids, "^chr[^:]+"),
+    start  = as.integer(str_extract(ids, "(?<=:)\\d+(?=:\\d+:chr)")),
+    end    = as.integer(str_extract(ids, "(?<=:\\d{1,12}:)\\d+(?=:chr)")),
+    cluster_counts = str_extract(ids, "clu_\\d+_[+-]")
+  ) %>%
+    mutate(junction_key = paste0(chrom, ":", start, ":", end))
+
+  psi_list <- lapply(seq_len(nrow(raw)), function(i) {
+    vals   <- as.character(raw[i, ..sample_cols])
+    parts  <- str_split(vals, "/", simplify = TRUE)
+    nums   <- suppressWarnings(as.numeric(parts[, 1]))
+    denoms <- suppressWarnings(as.numeric(parts[, 2]))
+    valid  <- !is.na(nums) & !is.na(denoms) & denoms > 0
+    if (sum(valid) == 0) return(c(mean_psi = NA_real_, sd_psi = NA_real_,
+                                  mean_num = NA_real_, sd_num = NA_real_,
+                                  mean_denom = NA_real_, sd_denom = NA_real_,
+                                  n_expressed = 0L))
+    psi_vals <- nums[valid] / denoms[valid]
+    c(mean_psi = mean(psi_vals), sd_psi = sd(psi_vals),
+      mean_num = mean(nums[valid]), sd_num = sd(nums[valid]),
+      mean_denom = mean(denoms[valid]), sd_denom = sd(denoms[valid]),
+      n_expressed = sum(valid))
+  })
+
+  bind_rows(lapply(psi_list, as_tibble_row)) %>%
+    bind_cols(parsed) %>%
+    mutate(condition = cond_label)
+}
+
+counts_all <- bind_rows(parse_cleaned_counts(F_LEAFCUTTER_COUNTS_PROLIF, "Proliferative"),
+                        parse_cleaned_counts(F_LEAFCUTTER_COUNTS_QUIESC, "Quiescent"))
+```
+
+```{r annotate_psi}
+# One PSI record per (junction, cluster); the first non-missing record is used.
+siblings_psi <- siblings %>%
+  left_join(counts_all %>%
+              select(junction_key, condition, mean_psi, sd_psi, mean_num, sd_num,
+                     mean_denom, sd_denom, n_expressed, cluster_counts),
+            by = "junction_key")
+siblings_psi_dedup <- as.data.frame(siblings_psi)
+siblings_psi_dedup <- as_tibble(
+  siblings_psi_dedup[!duplicated(siblings_psi_dedup[, c("junction_key", "cluster_bed")]), ])
+```
+
+# 4. Risk- and nonrisk-associated junctions
+
+The direction of effect is taken from `effect_direction`, which script 01 expresses
+relative to the CAD risk allele (not the sQTL slope sign, whose reference is the
+alternative allele). A junction whose usage increases with the risk allele is the
+risk-associated junction; its nonrisk counterpart is another CAD-colocalized junction
+of the same cluster with the opposite direction or, when none exists, the
+highest-PSI non-colocalized sibling. Clusters where the CAD junction decreases with
+the risk allele are handled symmetrically.
+
+```{r assign_pairs}
+pair_results <- list()
+
+for (cl in unique(cad_dedup$cluster_bed)) {
+  cl_sibs    <- siblings_psi_dedup %>% filter(cluster_bed == cl)
+  cl_cad     <- cl_sibs %>% filter(is_cad_sqtl)
+  cl_non_cad <- cl_sibs %>% filter(!is_cad_sqtl)
+  if (nrow(cl_cad) == 0) next
+
+  for (i in seq_len(nrow(cl_cad))) {
+    cad_jnc   <- cl_cad$junction_key[i]
+    cad_slope <- cl_cad$slope[i]
+    cad_dir   <- cl_cad$effect_direction[i]
+    cad_gene  <- cl_cad$gene_name[i]
+    cad_psi   <- cl_cad$mean_psi[i]
+    if (is.na(cad_slope) || is.na(cad_dir)) next
+
+    if (cad_dir == "Increased") {
+      risk_junction <- cad_jnc
+      risk_psi      <- cad_psi
+      direction     <- "risk_used"
+      neg_sibs <- cl_cad %>% filter(effect_direction == "Decreased")
+      if (nrow(neg_sibs) > 0) {
+        complement <- neg_sibs$junction_key[1]; complement_psi <- neg_sibs$mean_psi[1]
+        complement_source <- "cad_opposite_direction"
+      } else if (nrow(cl_non_cad) > 0) {
+        best_idx <- which.max(cl_non_cad$mean_psi)
+        complement <- cl_non_cad$junction_key[best_idx]; complement_psi <- cl_non_cad$mean_psi[best_idx]
+        complement_source <- "sibling_highest_psi"
+      } else {
+        complement <- NA; complement_psi <- NA; complement_source <- "no_sibling"
+      }
+      nonrisk_junction <- complement
+      nonrisk_psi      <- complement_psi
+    } else if (cad_dir == "Decreased") {
+      nonrisk_junction <- cad_jnc
+      nonrisk_psi      <- cad_psi
+      direction        <- "risk_excluded"
+      pos_sibs <- cl_cad %>% filter(effect_direction == "Increased")
+      if (nrow(pos_sibs) > 0) {
+        complement <- pos_sibs$junction_key[1]; complement_psi <- pos_sibs$mean_psi[1]
+        complement_source <- "cad_opposite_direction"
+      } else if (nrow(cl_non_cad) > 0) {
+        best_idx <- which.max(cl_non_cad$mean_psi)
+        complement <- cl_non_cad$junction_key[best_idx]; complement_psi <- cl_non_cad$mean_psi[best_idx]
+        complement_source <- "sibling_highest_psi"
+      } else {
+        complement <- NA; complement_psi <- NA; complement_source <- "no_sibling"
+      }
+      risk_junction <- complement
+      risk_psi      <- complement_psi
+    } else {
+      next
+    }
+
+    pair_results[[length(pair_results) + 1]] <- tibble(
+      cluster_bed = cl, gene_name = cad_gene, cad_sqtl_junction = cad_jnc,
+      slope = cad_slope, effect_direction = cad_dir, direction = direction,
+      risk_junction = risk_junction, risk_psi = risk_psi,
+      nonrisk_junction = nonrisk_junction, nonrisk_psi = nonrisk_psi,
+      complement_source = complement_source,
+      n_junctions_in_cluster = nrow(cl_sibs),
+      mean_cluster_depth = mean(cl_sibs$mean_denom, na.rm = TRUE)
+    )
+  }
+}
+pairs_df <- bind_rows(pair_results)
+cat("Risk/nonrisk junction pairs:", nrow(pairs_df), "\n")
+```
+
+```{r export_cluster_tables}
+write_csv(pairs_df, OUT_CAD_JUNCTION_PAIRS)
+write_csv(siblings_psi_dedup, OUT_CAD_CLUSTER_SIBLINGS)
+write_csv(cad_dedup %>% select(junction_key, gene_name, cluster_bed, slope, effect_direction, Condition),
+          OUT_CAD_CLUSTER_MAP)
+```
+
+# 5. Candidate isoforms per junction
+
+Every long-read isoform that contains a risk or nonrisk junction is annotated with
+its CPM, NMD status, structural category and protein sequence; this annotated map is
+the candidate pool from which pairs are selected and is also exported in full for
+the peptide-evidence analysis, which needs the complete isoform pool on each side
+rather than only the chosen pair.
+
+```{r map_junctions_to_isoforms}
+smc_junc_iso <- smc_junc_isoform %>% rename(pb_acc = pb_id)
+
+smc_fasta_set <- readAAStringSet(F_SMC_PROTEIN_FASTA, format = "fasta")
+smc_fasta_df <- tibble(protein_id = names(smc_fasta_set), sequence = as.character(smc_fasta_set)) %>%
+  mutate(pb_acc = str_extract(protein_id, "PB\\.[0-9]+\\.[0-9]+"),
+         protein_length = nchar(sequence))
+rm(smc_fasta_set); invisible(gc(verbose = FALSE))
+
+all_junctions_needed <- unique(c(pairs_df$risk_junction[!is.na(pairs_df$risk_junction)],
+                                 pairs_df$nonrisk_junction[!is.na(pairs_df$nonrisk_junction)]))
+
+junc_iso_annotated <- smc_junc_iso %>%
+  filter(junction_key %in% all_junctions_needed) %>%
+  select(junction_key, pb_acc) %>%
+  distinct() %>%
+  left_join(sqanti_protein %>% select(pb_acc, CPM, is_nmd, tx_cat, gene), by = "pb_acc") %>%
+  left_join(smc_fasta_df %>% select(pb_acc, protein_length, sequence), by = "pb_acc") %>%
+  mutate(is_nmd = replace_na(is_nmd, FALSE), CPM = replace_na(CPM, 0))
+```
+
+# 6. Selection of the isoform pair for each junction pair
+
+On each side the candidate isoforms are ranked by a score that places every non-NMD
+isoform above every NMD-flagged isoform and orders within each tier by CPM
+(score = CPM + 1000 for non-NMD), so predicted-NMD isoforms are used only when no
+other isoform contains the junction. If the top choice is the same transcript on both
+sides, the nonrisk side is demoted to its next-best candidate, then the risk side,
+and finally a nonrisk isoform is taken from all isoforms of the gene lacking the
+risk junction. Percent identity between the two protein sequences is recorded as a
+position-wise match over the shorter sequence, normalised by the longer.
+
+```{r select_best_pairs}
+best_pairs_list <- list()
+full_pools_list <- list()
+
+# Gene-level pool: any isoform of the gene with a protein sequence.
+gene_iso_pool <- junc_iso_annotated %>%
+  filter(!is.na(sequence)) %>%
+  group_by(gene_name = gene, pb_acc) %>%
+  summarise(CPM = max(CPM, na.rm = TRUE), is_nmd = any(is_nmd, na.rm = TRUE),
+            tx_cat = dplyr::first(na.omit(tx_cat)),
+            protein_length = max(protein_length, na.rm = TRUE),
+            sequence = dplyr::first(na.omit(sequence)), .groups = "drop") %>%
+  mutate(score = CPM + ifelse(!is_nmd, 1000, 0))
+
+pick_top <- function(candidates, exclude_pbs = character()) {
+  ok <- candidates %>% filter(!pb_acc %in% exclude_pbs) %>% arrange(desc(score))
+  if (nrow(ok) == 0) return(NULL)
+  ok[1, ]
+}
+
+# Best isoform of the gene that does not contain target_junction.
+gene_pool_pick <- function(gene_target, target_junction, exclude_pbs = character()) {
+  pool <- gene_iso_pool %>% filter(gene_name == gene_target, !pb_acc %in% exclude_pbs)
+  if (nrow(pool) == 0) return(NULL)
+  iso_with_target <- junc_iso_annotated %>% filter(junction_key == target_junction) %>%
+    pull(pb_acc) %>% unique()
+  pool <- pool %>% filter(!pb_acc %in% iso_with_target)
+  if (nrow(pool) == 0) return(NULL)
+  pool %>% arrange(desc(score)) %>% slice(1)
+}
+
+for (i in seq_len(nrow(pairs_df))) {
+  row  <- pairs_df[i, ]
+  gene <- row$gene_name
+  if (is.na(row$risk_junction) || is.na(row$nonrisk_junction)) next
+  if (row$risk_junction == row$nonrisk_junction) next
+
+  risk_isos <- junc_iso_annotated %>%
+    filter(junction_key == row$risk_junction, !is.na(sequence)) %>%
+    mutate(score = CPM + ifelse(!is_nmd, 1000, 0)) %>% arrange(desc(score))
+  nonrisk_isos <- junc_iso_annotated %>%
+    filter(junction_key == row$nonrisk_junction, !is.na(sequence)) %>%
+    mutate(score = CPM + ifelse(!is_nmd, 1000, 0)) %>% arrange(desc(score))
+  if (nrow(risk_isos) == 0 || nrow(nonrisk_isos) == 0) next
+
+  full_pools_list[[length(full_pools_list) + 1]] <- bind_rows(
+    risk_isos %>% transmute(gene_name = gene, cluster_bed = row$cluster_bed,
+                            cad_sqtl_junction = row$cad_sqtl_junction, slope = row$slope,
+                            direction = row$direction, junction_key = row$risk_junction,
+                            side = "risk", pb_acc, CPM, is_nmd, tx_cat, protein_length, score),
+    nonrisk_isos %>% transmute(gene_name = gene, cluster_bed = row$cluster_bed,
+                               cad_sqtl_junction = row$cad_sqtl_junction, slope = row$slope,
+                               direction = row$direction, junction_key = row$nonrisk_junction,
+                               side = "nonrisk", pb_acc, CPM, is_nmd, tx_cat, protein_length, score))
+
+  best_risk    <- risk_isos[1, ]
+  best_nonrisk <- nonrisk_isos[1, ]
+  pair_method  <- "top_risk_top_nonrisk"
+
+  if (best_risk$pb_acc == best_nonrisk$pb_acc) {
+    deg_pb <- best_risk$pb_acc
+    alt_nonrisk <- pick_top(nonrisk_isos, exclude_pbs = deg_pb)
+    if (!is.null(alt_nonrisk)) {
+      best_nonrisk <- alt_nonrisk
+      pair_method  <- "top_risk_secondbest_nonrisk"
+    } else {
+      alt_risk <- pick_top(risk_isos, exclude_pbs = deg_pb)
+      if (!is.null(alt_risk)) {
+        best_risk   <- alt_risk
+        pair_method <- "secondbest_risk_top_nonrisk"
+      } else {
+        gp_nr <- gene_pool_pick(gene, target_junction = row$risk_junction, exclude_pbs = deg_pb)
+        if (!is.null(gp_nr)) {
+          best_nonrisk <- gp_nr %>% transmute(pb_acc, CPM, is_nmd, tx_cat, protein_length, sequence, score)
+          pair_method  <- "gene_pool_nonrisk"
+        } else {
+          next
+        }
+      }
+    }
+  }
+
+  r_seq  <- best_risk$sequence
+  nr_seq <- best_nonrisk$sequence
+  min_len <- min(nchar(r_seq), nchar(nr_seq))
+  max_len <- max(nchar(r_seq), nchar(nr_seq))
+  pct_identity <- if (min_len > 0) {
+    r_chars  <- strsplit(substr(r_seq,  1, min_len), "")[[1]]
+    nr_chars <- strsplit(substr(nr_seq, 1, min_len), "")[[1]]
+    round(sum(r_chars == nr_chars) / max_len * 100, 1)
+  } else 0
+
+  best_pairs_list[[length(best_pairs_list) + 1]] <- tibble(
+    gene_name = gene, cluster_bed = row$cluster_bed, cad_sqtl_junction = row$cad_sqtl_junction,
+    slope = row$slope, direction = row$direction,
+    risk_junction = row$risk_junction, risk_pb = best_risk$pb_acc, risk_cpm = best_risk$CPM,
+    risk_length_aa = best_risk$protein_length, risk_nmd = best_risk$is_nmd,
+    risk_tx_cat = ifelse("tx_cat" %in% colnames(best_risk), best_risk$tx_cat, NA),
+    risk_seq = r_seq,
+    nonrisk_junction = row$nonrisk_junction, nonrisk_pb = best_nonrisk$pb_acc,
+    nonrisk_cpm = best_nonrisk$CPM, nonrisk_length_aa = best_nonrisk$protein_length,
+    nonrisk_nmd = best_nonrisk$is_nmd,
+    nonrisk_tx_cat = ifelse("tx_cat" %in% colnames(best_nonrisk), best_nonrisk$tx_cat, NA),
+    nonrisk_seq = nr_seq,
+    percent_identity = pct_identity, combined_cpm = best_risk$CPM + best_nonrisk$CPM,
+    n_risk_candidates = nrow(risk_isos), n_nonrisk_candidates = nrow(nonrisk_isos),
+    complement_source = row$complement_source, pair_method = pair_method,
+    source = "leafcutter_cluster"
+  )
+}
+
+lc_pairs            <- bind_rows(best_pairs_list)
+lc_pairs_full_pools <- bind_rows(full_pools_list)
+stopifnot("degenerate pairs remain" = !any(lc_pairs$risk_pb == lc_pairs$nonrisk_pb))
+cat("Cluster-derived isoform pairs:", nrow(lc_pairs), "in", n_distinct(lc_pairs$gene_name), "genes\n")
+
+write_csv(lc_pairs,            OUT_PAIRS_ALL)
+write_csv(lc_pairs_full_pools, OUT_PAIRS_FULL_POOLS)
+```
+
+# 7. Protein-space coordinates of each junction
+
+For the junction-region property comparisons, the splice site must be located within
+the protein of every isoform that contains it. The exon block structure (PSL) gives
+the mRNA position of the exon–exon boundary, the SQANTI ORF coordinates convert it to
+a codon index, and the ±`WINDOW_AA` residues around that index are extracted from the
+predicted protein. The PSL stores exons as 0-based half-open intervals in genomic
+order on both strands, whereas LeafCutter introns are 1-based inclusive, so the
+boundary is matched with a one-base tolerance and the cumulative exon length is
+summed from the transcript 5′ end (reverse genomic order on the minus strand).
+
+```{r junction_aa_resources}
+psl <- read_tsv(F_SMC_PSL,
+                col_names = c("matches", "misMatches", "repMatches", "nCount",
+                              "qNumInsert", "qBaseInsert", "tNumInsert", "tBaseInsert",
+                              "strand", "qName", "qSize", "qStart", "qEnd",
+                              "tName", "tSize", "tStart", "tEnd",
+                              "blockCount", "blockSizes", "qStarts", "tStarts"),
+                col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(qName, "^PB\\.[0-9]+\\.[0-9]+"),
+         tStart = as.integer(tStart), tEnd = as.integer(tEnd),
+         blockCount = as.integer(blockCount)) %>%
+  filter(!is.na(pb_acc))
+
+parse_int_vec <- function(s) as.integer(str_split(str_remove(s, ",$"), ",")[[1]])
+psl_exons <- psl %>%
+  rowwise() %>%
+  mutate(block_sizes_v = list(parse_int_vec(blockSizes)),
+         t_starts_v    = list(parse_int_vec(tStarts))) %>%
+  ungroup() %>%
+  select(pb_acc, chr = tName, strand_psl = strand, tStart, tEnd, blockCount, block_sizes_v, t_starts_v)
+
+# ORF positions in mRNA coordinates.
+sqanti <- read_csv(F_SQANTI_PROTEIN_CPM, show_col_types = FALSE) %>%
+  select(pb_acc = pb, strand_sq = strand, seqname, orf_start, orf_end, orf_len, orf_frame, len) %>%
+  filter(!is.na(orf_start), !is.na(orf_end))
+
+fasta <- readAAStringSet(F_SMC_PROTEIN_FASTA)
+protein_lookup <- tibble(pb_acc = str_extract(names(fasta), "PB\\.[0-9]+\\.[0-9]+"),
+                         protein_seq = as.character(fasta)) %>%
+  filter(!is.na(pb_acc)) %>%
+  mutate(protein_seq = str_remove(protein_seq, "\\*$")) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+rm(fasta); invisible(gc(verbose = FALSE))
+
+# Amino-acid position and window of one intron in one isoform.
+compute_junction_aa <- function(pb_acc, intron_start, intron_end, strand,
+                                exons_tStarts, exons_blockSizes,
+                                orf_start_mrna, orf_end_mrna, protein_seq) {
+  exon_g_start <- exons_tStarts
+  exon_g_end   <- exons_tStarts + exons_blockSizes
+  n_exons <- length(exon_g_start)
+  if (n_exons < 2) return(tibble(status = "single_exon"))
+
+  # Intron i lies between exon i and exon i + 1 (genomic order); PSL exon ends are
+  # 0-based so exon_end == intron_start - 1 and exon_start == intron_end, ±1.
+  upstream_exon_idx <- NA_integer_
+  for (i in seq_len(n_exons - 1)) {
+    if (abs(exon_g_end[i] - (intron_start - 1)) <= 1 &&
+        abs(exon_g_start[i + 1] - intron_end) <= 1) { upstream_exon_idx <- i; break }
+  }
+  if (is.na(upstream_exon_idx)) return(tibble(status = "exon_not_found"))
+
+  # mRNA position of the last base before the junction: cumulative exon length from
+  # the transcript 5' end (genomic start on +, genomic end on -).
+  mrna_junction_pos <- if (strand == "+") {
+    sum(exons_blockSizes[1:upstream_exon_idx])
+  } else {
+    sum(exons_blockSizes[(upstream_exon_idx + 1):n_exons])
+  }
+
+  if (mrna_junction_pos < orf_start_mrna)
+    return(tibble(status = "junction_in_5utr", mrna_junction_pos = mrna_junction_pos))
+  if (mrna_junction_pos > orf_end_mrna)
+    return(tibble(status = "junction_in_3utr", mrna_junction_pos = mrna_junction_pos))
+
+  nt_into_orf <- mrna_junction_pos - orf_start_mrna
+  aa_pos <- nt_into_orf %/% 3 + 1
+
+  if (is.na(protein_seq) || nchar(protein_seq) == 0)
+    return(tibble(status = "no_protein_sequence", mrna_junction_pos = mrna_junction_pos,
+                  aa_junction_pos = aa_pos))
+  protein_len <- nchar(protein_seq)
+  if (aa_pos < 1 || aa_pos > protein_len)
+    return(tibble(status = "aa_pos_out_of_range", mrna_junction_pos = mrna_junction_pos,
+                  aa_junction_pos = aa_pos))
+
+  win_start <- max(1, aa_pos - WINDOW_AA)
+  win_end   <- min(protein_len, aa_pos + WINDOW_AA)
+  aa_window <- substr(protein_seq, win_start, win_end)
+
+  status <- if (win_start == 1 || win_end == protein_len) {
+    "ok_at_terminus"
+  } else if ((aa_pos - win_start) < WINDOW_AA || (win_end - aa_pos) < WINDOW_AA) {
+    "ok_clipped"
+  } else "ok"
+  # A junction that falls inside a codon is flagged, since the boundary residue is
+  # encoded by both exons.
+  if ((mrna_junction_pos - orf_start_mrna) %% 3 != 0) status <- paste0(status, ";phase_ambiguous")
+
+  tibble(status = status, mrna_junction_pos = mrna_junction_pos, aa_junction_pos = aa_pos,
+         aa_window_start = win_start, aa_window_end = win_end,
+         aa_window_length = win_end - win_start + 1, aa_sequence = aa_window)
+}
+
+# Apply compute_junction_aa() to a (junction × isoform) table.
+map_junctions_to_aa <- function(junctions_iso) {
+  work <- junctions_iso %>%
+    left_join(psl_exons, by = c("pb_acc", "chr")) %>%
+    left_join(sqanti %>% select(pb_acc, orf_start, orf_end), by = "pb_acc") %>%
+    left_join(protein_lookup, by = "pb_acc") %>%
+    filter(!is.na(block_sizes_v), !is.na(orf_start), !is.na(protein_seq))
+  results_list <- vector("list", nrow(work))
+  for (i in seq_len(nrow(work))) {
+    r <- work[i, ]
+    out <- compute_junction_aa(pb_acc = r$pb_acc, intron_start = r$intron_start,
+                               intron_end = r$intron_end, strand = r$strand,
+                               exons_tStarts = r$t_starts_v[[1]],
+                               exons_blockSizes = r$block_sizes_v[[1]],
+                               orf_start_mrna = r$orf_start, orf_end_mrna = r$orf_end,
+                               protein_seq = r$protein_seq)
+    results_list[[i]] <- bind_cols(
+      r %>% select(gene_name, junction_key, pb_acc, strand, intron_start, intron_end), out)
+  }
+  bind_rows(results_list)
+}
+```
+
+```{r junction_aa_mapping_strict}
+# Cluster-derived (strict) pairs: every isoform containing each CAD sQTL junction.
+lc_junctions <- lc_pairs %>%
+  distinct(gene_name, cad_sqtl_junction) %>%
+  dplyr::rename(junction_key = cad_sqtl_junction)
+
+junctions_iso <- smc_junc_isoform %>%
+  inner_join(lc_junctions, by = c("junction_key", "gene_id" = "gene_name")) %>%
+  bind_rows(smc_junc_isoform %>%
+              inner_join(lc_junctions, by = "junction_key") %>%
+              filter(!gene_id %in% lc_junctions$gene_name)) %>%
+  distinct(junction_key, pb_acc = pb_id, chr, intron_start, intron_end, strand, gene_name = gene_id)
+
+aa_mapping_strict <- map_junctions_to_aa(junctions_iso)
+```
+
+# 8. Salvage of one-sided junctions and the unified pair table
+
+Some CAD junctions are represented on only one side of their cluster in the long-read
+data (for example, no long-read transcript contains the counterpart junction). For
+these, the isoform with the highest read support that contains the mapped junction is
+the anchor, and its counterpart is the isoform of the same gene lacking that junction
+with the highest BLOSUM62 global-alignment identity to the anchor (ties broken by CPM,
+then length). These "salvaged" pairs are added to the strict cluster-derived pairs
+together with the 13 AP-MS bait pairs, which were fixed before proteomic detection and
+are never substituted.
+
+```{r salvage_one_sided}
+data("BLOSUM62", package = "pwalign")
+lfc_venn <- read_tsv(OUT_LFC_INTEGRATED, show_col_types = FALSE)
+
+# smc_isoforms lists "GENE|PB.X.Y|COUNT,..." per junction.
+parse_smc_isoforms <- function(s) {
+  if (is.na(s) || s == "") return(tibble(pb_acc = character(), count = integer()))
+  parts <- str_split(s, ",")[[1]]
+  m <- str_match(parts, "^[^|]+\\|(PB\\.[0-9]+\\.[0-9]+)\\|([0-9]+)$")
+  tibble(pb_acc = m[, 2], count = as.integer(m[, 3])) %>% filter(!is.na(pb_acc)) %>% arrange(desc(count))
+}
+
+# Global alignment identity (PID3: matches over the shorter sequence).
+compute_pct_identity <- function(seq_a, seq_b) {
+  if (is.na(seq_a) || is.na(seq_b) || nchar(seq_a) == 0 || nchar(seq_b) == 0) return(NA_real_)
+  aln <- tryCatch(pwalign::pairwiseAlignment(AAString(seq_a), AAString(seq_b),
+                                             substitutionMatrix = BLOSUM62,
+                                             gapOpening = 10, gapExtension = 1,
+                                             type = "global", scoreOnly = FALSE),
+                  error = function(e) NULL)
+  if (is.null(aln)) return(NA_real_)
+  pwalign::pid(aln, type = "PID3")
+}
+
+pb_info <- protein_lookup %>%
+  left_join(sqanti_protein %>% select(pb_acc, cpm = CPM), by = "pb_acc") %>%
+  mutate(seq_length = nchar(protein_seq))
+
+# One anchor per (gene, junction, direction): the top-count isoform containing it.
+lfc_junctions <- lfc_venn %>%
+  filter(!is.na(effect_direction), effect_direction %in% c("Increased", "Decreased")) %>%
+  distinct(gene_name, junction_key, effect_direction, smc_isoforms) %>%
+  mutate(side = case_when(effect_direction == "Increased" ~ "risk",
+                          effect_direction == "Decreased" ~ "nonrisk",
+                          TRUE ~ NA_character_)) %>%
+  rowwise() %>%
+  mutate(parsed = list(parse_smc_isoforms(smc_isoforms)),
+         anchor_pb = if (nrow(parsed) == 0) NA_character_ else parsed$pb_acc[1],
+         anchor_count = if (nrow(parsed) == 0) NA_integer_ else parsed$count[1],
+         n_isoforms_mapped = nrow(parsed)) %>%
+  ungroup() %>%
+  select(-parsed)
+
+gene_side_status <- lfc_junctions %>%
+  group_by(gene_name) %>%
+  summarise(n_risk_with_anchor    = sum(side == "risk"    & !is.na(anchor_pb)),
+            n_nonrisk_with_anchor = sum(side == "nonrisk" & !is.na(anchor_pb)), .groups = "drop") %>%
+  mutate(needs_salvage_nonrisk = n_risk_with_anchor > 0 & n_nonrisk_with_anchor == 0,
+         needs_salvage_risk    = n_nonrisk_with_anchor > 0 & n_risk_with_anchor == 0)
+
+junc_to_pbs <- smc_junc_isoform %>%
+  distinct(junction_key, pb_id) %>%
+  group_by(junction_key) %>%
+  summarise(pbs_with_junction = list(unique(pb_id)), .groups = "drop")
+gene_to_pbs <- smc_junc_isoform %>%
+  distinct(gene_id, pb_id) %>%
+  group_by(gene_id) %>%
+  summarise(pbs_in_gene = list(unique(pb_id)), .groups = "drop") %>%
+  dplyr::rename(gene_name = gene_id)
+
+salvage_for_junction <- function(gene_name, focal_junction_key, anchor_pb) {
+  anchor_seq <- pb_info$protein_seq[pb_info$pb_acc == anchor_pb]
+  if (length(anchor_seq) == 0 || is.na(anchor_seq) || nchar(anchor_seq) == 0) return(tibble())
+  pbs_in_gene <- gene_to_pbs$pbs_in_gene[gene_to_pbs$gene_name == gene_name]
+  if (length(pbs_in_gene) == 0) return(tibble())
+  pbs_in_gene <- pbs_in_gene[[1]]
+  pbs_with_j <- junc_to_pbs$pbs_with_junction[junc_to_pbs$junction_key == focal_junction_key]
+  pbs_with_j <- if (length(pbs_with_j) == 0) character() else pbs_with_j[[1]]
+  candidates <- setdiff(pbs_in_gene, c(anchor_pb, pbs_with_j))
+  if (length(candidates) == 0) return(tibble())
+  cand_info <- pb_info %>% filter(pb_acc %in% candidates, !is.na(protein_seq), nchar(protein_seq) > 0)
+  if (nrow(cand_info) == 0) return(tibble())
+  cand_info$pct_identity <- vapply(cand_info$protein_seq,
+                                   function(s) compute_pct_identity(anchor_seq, s), numeric(1))
+  best <- cand_info %>% arrange(desc(pct_identity), desc(cpm), desc(seq_length)) %>%
+    filter(row_number() == 1)
+  tibble(salvaged_pb = best$pb_acc, salvage_pct_identity = best$pct_identity,
+         salvage_cpm = best$cpm, n_candidates = nrow(cand_info))
+}
+
+# Junctions whose gene has an anchor on this side only, excluding junctions already
+# covered by a strict pair.
+strict_covered <- lc_pairs %>% distinct(gene_name, junction_key = cad_sqtl_junction)
+salvage_targets <- lfc_junctions %>%
+  filter(!is.na(anchor_pb)) %>%
+  left_join(gene_side_status %>% select(gene_name, needs_salvage_nonrisk, needs_salvage_risk),
+            by = "gene_name") %>%
+  filter((side == "risk" & needs_salvage_nonrisk) | (side == "nonrisk" & needs_salvage_risk)) %>%
+  anti_join(strict_covered, by = c("gene_name", "junction_key"))
+
+salvaged_rows <- vector("list", nrow(salvage_targets))
+for (i in seq_len(nrow(salvage_targets))) {
+  r  <- salvage_targets[i, ]
+  sv <- salvage_for_junction(r$gene_name, r$junction_key, r$anchor_pb)
+  if (nrow(sv) == 0) next
+  salvaged_rows[[i]] <- if (r$side == "risk") {
+    tibble(gene_name = r$gene_name, cad_sqtl_junction = r$junction_key,
+           risk_pb = r$anchor_pb, nonrisk_pb = sv$salvaged_pb, salvage_side = "nonrisk",
+           salvage_pct_identity = sv$salvage_pct_identity,
+           salvage_n_candidates = sv$n_candidates, pair_type = "salvaged")
+  } else {
+    tibble(gene_name = r$gene_name, cad_sqtl_junction = r$junction_key,
+           risk_pb = sv$salvaged_pb, nonrisk_pb = r$anchor_pb, salvage_side = "risk",
+           salvage_pct_identity = sv$salvage_pct_identity,
+           salvage_n_candidates = sv$n_candidates, pair_type = "salvaged")
+  }
+}
+salvaged <- bind_rows(salvaged_rows)
+cat("Salvaged pairs:", nrow(salvaged), "of", nrow(salvage_targets), "one-sided junctions\n")
+
+# AP-MS bait pairs (column names carry a byte-order mark).
+baits_raw <- read_csv(F_APMS_BAIT_PAIRS, show_col_types = FALSE)
+names(baits_raw)[1] <- "Gene Symbol"
+manual_pairs <- baits_raw %>%
+  dplyr::rename(gene_name = "Gene Symbol", risk_pb = "risk", nonrisk_pb = "non-risk") %>%
+  mutate(across(c(risk_pb, nonrisk_pb), str_trim),
+         cad_sqtl_junction = "manual_apms", salvage_side = NA_character_,
+         salvage_pct_identity = NA_real_, salvage_n_candidates = NA_integer_,
+         pair_type = "manual_apms") %>%
+  select(gene_name, cad_sqtl_junction, risk_pb, nonrisk_pb,
+         salvage_side, salvage_pct_identity, salvage_n_candidates, pair_type)
+
+strict <- lc_pairs %>%
+  mutate(salvage_side = NA_character_, salvage_pct_identity = NA_real_,
+         salvage_n_candidates = NA_integer_, pair_type = "strict") %>%
+  select(gene_name, cad_sqtl_junction, risk_pb, nonrisk_pb,
+         salvage_side, salvage_pct_identity, salvage_n_candidates, pair_type)
+
+unified <- bind_rows(strict, salvaged, manual_pairs)
+print(unified %>% count(pair_type))
+write_csv(unified, OUT_PAIRS_UNIFIED)
+```
+
+# 9. Inclusion flags
+
+Two analysis levels are used downstream. Junction-level comparisons use strict pairs
+only, because only there is the CAD junction itself present in both isoforms.
+Isoform-level comparisons use strict and salvaged pairs plus those AP-MS pairs that
+either add a CAD junction not already represented by a computed pair or map to no CAD
+junction at all; AP-MS pairs that duplicate an existing junction are kept in the
+table but excluded from the statistics, so no junction is counted twice.
+
+```{r inclusion_flags}
+covered_set <- unified %>%
+  filter(pair_type %in% c("strict", "salvaged"), !is.na(cad_sqtl_junction),
+         cad_sqtl_junction != "manual_apms") %>%
+  distinct(gene_name, junction_key = cad_sqtl_junction)
+
+# CAD junctions spanned by each AP-MS isoform, matched by PB accession so that gene
+# aliases do not matter.
+lfc_jp <- lfc_venn %>%
+  filter(!is.na(smc_isoforms), smc_isoforms != "") %>%
+  mutate(junction_key = sprintf("%s:%d:%d", chr, intron_start, intron_end)) %>%
+  select(junction_key, smc_isoforms) %>%
+  mutate(pb_acc = str_extract_all(smc_isoforms, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  unnest(pb_acc) %>%
+  distinct(junction_key, pb_acc)
+
+manual_flagged <- unified %>%
+  filter(pair_type == "manual_apms") %>%
+  mutate(
+    mapped_juncs_v = pmap(list(risk_pb, nonrisk_pb), function(r, nr) {
+      lfc_jp %>% filter(pb_acc %in% c(r, nr)) %>% pull(junction_key) %>% unique()
+    }),
+    mapped_cad_junctions = map_chr(mapped_juncs_v, ~ paste(.x, collapse = ";")),
+    n_mapped_juncs = lengths(mapped_juncs_v),
+    new_juncs_v = pmap(list(gene_name, mapped_juncs_v), function(g, juncs) {
+      setdiff(juncs, covered_set %>% filter(gene_name == g) %>% pull(junction_key))
+    }),
+    n_new_juncs = lengths(new_juncs_v),
+    include_in_isoform_stats  = (n_new_juncs > 0) | (n_mapped_juncs == 0),
+    include_in_junction_stats = FALSE
+  ) %>%
+  select(-mapped_juncs_v, -new_juncs_v)
+
+strict_flagged <- unified %>%
+  filter(pair_type == "strict") %>%
+  mutate(mapped_cad_junctions = cad_sqtl_junction, n_mapped_juncs = 1L, n_new_juncs = NA_integer_,
+         include_in_isoform_stats = TRUE, include_in_junction_stats = TRUE)
+salvaged_flagged <- unified %>%
+  filter(pair_type == "salvaged") %>%
+  mutate(mapped_cad_junctions = cad_sqtl_junction, n_mapped_juncs = 1L, n_new_juncs = NA_integer_,
+         include_in_isoform_stats = TRUE, include_in_junction_stats = FALSE)
+
+unified_flagged <- bind_rows(strict_flagged, salvaged_flagged, manual_flagged)
+print(unified_flagged %>% count(pair_type, include_in_isoform_stats, include_in_junction_stats))
+
+n_computed <- unified_flagged %>%
+  filter(include_in_isoform_stats, pair_type != "manual_apms") %>%
+  distinct(gene_name, risk_pb, nonrisk_pb) %>% nrow()
+cat("Computed (sQTL-derived) isoform pairs in the isoform-level set:", n_computed, "\n")
+stopifnot("expected 94 computed pairs" = n_computed == 94)
+
+write_csv(unified_flagged, OUT_PAIRS_UNIFIED_FLAGGED)
+```
+
+# 10. Amino-acid mapping for every pair junction
+
+The protein-space mapping of section 7 covered the strict pairs; it is extended here
+to the salvaged junctions so that `junction_aa_mapping.csv` holds every junction of
+the unified table in every isoform that contains it.
+
+```{r junction_aa_mapping_unified}
+unified_junctions <- unified %>%
+  filter(!is.na(cad_sqtl_junction), cad_sqtl_junction != "manual_apms") %>%
+  distinct(gene_name, junction_key = cad_sqtl_junction)
+
+missing_junctions <- unified_junctions %>%
+  anti_join(aa_mapping_strict %>% distinct(junction_key), by = "junction_key")
+
+aa_mapping <- aa_mapping_strict
+if (nrow(missing_junctions) > 0) {
+  missing_iso <- smc_junc_isoform %>%
+    inner_join(missing_junctions %>% select(junction_key), by = "junction_key") %>%
+    distinct(junction_key, pb_acc = pb_id, chr, intron_start, intron_end, strand, gene_name = gene_id)
+  aa_mapping <- bind_rows(aa_mapping_strict, map_junctions_to_aa(missing_iso)) %>%
+    distinct(gene_name, junction_key, pb_acc, .keep_all = TRUE)
+}
+
+print(aa_mapping %>% mutate(status_simple = str_extract(status, "^[^;]+")) %>% count(status_simple))
+write_csv(aa_mapping, OUT_JUNCTION_AA_MAPPING)
+```
+
+```{r session_info}
+sessionInfo()
+```

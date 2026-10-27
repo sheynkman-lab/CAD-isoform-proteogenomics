@@ -1,0 +1,354 @@
+---
+title: "Gene Ontology enrichment of isoform-specific AP-MS interactors"
+output: html_document
+---
+
+## Purpose
+
+Risk- and nonrisk-associated protein isoforms of the 13 CAD sQTL bait pairs were
+profiled by affinity-purification mass spectrometry, and every high-confidence
+interactor was labelled risk-specific, nonrisk-specific or shared according to
+which bait(s) it passed the CompPASS and SAINT thresholds with
+(`07_apms_scoring_and_network_annotation.Rmd`). This script asks whether the
+isoform-specific interactor sets of each bait pair are enriched for distinct
+biological functions, because divergent enrichment between the two isoforms of a
+pair is the functional read-out of interactome rewiring. For every bait and each of
+the three interactor categories, Gene Ontology Biological Process, Molecular
+Function and Cellular Component terms are tested with clusterProfiler (`enrichGO`;
+hypergeometric test against the default genome-wide background, Benjamini–Hochberg
+correction, *P* < 0.05 and *q* < 0.2; sets with fewer than three mappable genes are
+not tested).
+
+Two distinct products are written, because they serve different purposes:
+
+- `pair_by_pair/<BAIT>_pathway_details.csv` holds **all** terms passing the cutoffs
+  for every bait × interactor category × ontology. This is the source of
+  Supplementary Table 18 and of the per-bait term counts in Fig. 5f.
+- `MASTER_pathway_summary.csv` holds the **ten most significant** terms per
+  bait × category × ontology. It is used only to select the single GO term that
+  labels each bait in the Fig. 5g/h network views, so that labelling follows a
+  stated, reproducible rule rather than manual choice.
+
+## Manuscript outputs produced
+
+- Fig. 5f (number of enriched GO terms per bait by interactor category; plotted in
+  `10_figure_and_table_generation.Rmd` from the per-bait tables)
+- Fig. 5g, 5h (top isoform-specific GO term used to annotate each bait in the
+  Cytoscape network views; `figure5_GO_labels.csv`)
+- Supplementary Table 18 (assembled in `10_figure_and_table_generation.Rmd`)
+- Methods, "Gene Ontology enrichment of isoform-specific interactors"
+
+## Inputs
+
+- `OUT_MASTER_NETWORK_ANNOT` — high-confidence AP-MS network (one row per bait
+  isoform × prey) with the `specificity` label; written by
+  `07_apms_scoring_and_network_annotation.Rmd`.
+- Gene Ontology annotations from the `org.Hs.eg.db` Bioconductor package (the
+  installed version is recorded in the session information at the end).
+
+## Outputs
+
+- `D_GO_PAIR_TABLES/<BAIT>_pathway_details.csv` — all cutoff-passing terms per bait
+  (read by `10_figure_and_table_generation.Rmd` for Fig. 5f and Supplementary
+  Table 18). Bait names follow the network table (e.g. `NHERF2`, `CFDP1`); display
+  symbols are applied downstream.
+- `OUT_GO_MASTER_SUMMARY` — top-10 terms per bait × category × ontology.
+- `OUT_GO_NETWORK_LABELS` — one function term (BP or MF) and one compartment term
+  (CC) per bait per isoform for the Fig. 5g/h labels.
+
+## Run order
+
+Requires `07_apms_scoring_and_network_annotation.Rmd`. Feeds
+`10_figure_and_table_generation.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+source("config.R")
+library(tidyverse)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+filter <- dplyr::filter
+select <- dplyr::select
+
+require_files(OUT_MASTER_NETWORK_ANNOT)
+ensure_dir(RES_08, D_GO_PAIR_TABLES)
+```
+
+# 1. Load the annotated interaction network
+
+The network table carries one row per bait isoform and prey, with the bait gene in
+`source_harmonized`, the prey gene symbol in `target_harmonized` and the
+`specificity` label (risk-specific, nonrisk-specific, shared). Only these three
+columns are needed here, because enrichment is run on gene sets rather than on
+spectral counts.
+
+```{r load_network}
+network <- read_csv(OUT_MASTER_NETWORK_ANNOT, show_col_types = FALSE)
+stopifnot(all(c("source_harmonized", "target_harmonized", "specificity") %in% names(network)))
+cat(sprintf("%d interactions across %d baits\n",
+            nrow(network), n_distinct(network$source_harmonized)))
+```
+
+# 2. Interactor sets per bait pair
+
+For each bait gene, the risk-specific, nonrisk-specific and shared interactors are
+collected as three separate gene sets. The shared set is tested in its own right,
+because interactors recovered with both isoforms describe the functions the splice
+event leaves intact, which is different information from the intersection of the
+two isoform-specific term lists.
+
+```{r prepare_gene_pairs}
+all_baits <- network %>% pull(source_harmonized) %>% unique() %>% sort()
+
+gene_pair_data <- list()
+for (gene in all_baits) {
+  gene_network <- network %>% filter(source_harmonized == gene)
+  risk_interactors    <- gene_network %>% filter(specificity == "risk-specific")    %>%
+    pull(target_harmonized) %>% unique()
+  nonrisk_interactors <- gene_network %>% filter(specificity == "nonrisk-specific") %>%
+    pull(target_harmonized) %>% unique()
+  shared_interactors  <- gene_network %>% filter(specificity == "shared")           %>%
+    pull(target_harmonized) %>% unique()
+
+  gene_pair_data[[gene]] <- list(
+    risk = risk_interactors, nonrisk = nonrisk_interactors, shared = shared_interactors,
+    n_risk = length(risk_interactors), n_nonrisk = length(nonrisk_interactors),
+    n_shared = length(shared_interactors)
+  )
+}
+
+# Set sizes per bait; the Jaccard index is the shared fraction of all interactors.
+pair_summary <- tibble(
+  Gene      = names(gene_pair_data),
+  N_Risk    = sapply(gene_pair_data, function(x) x$n_risk),
+  N_NonRisk = sapply(gene_pair_data, function(x) x$n_nonrisk),
+  N_Shared  = sapply(gene_pair_data, function(x) x$n_shared),
+  Total     = N_Risk + N_NonRisk + N_Shared,
+  Jaccard   = round(N_Shared / (N_Risk + N_NonRisk + N_Shared), 3)
+) %>%
+  arrange(desc(Total))
+
+write_csv(pair_summary, file.path(D_GO_PAIR_TABLES, "pair_summary.csv"))
+pair_summary
+```
+
+# 3. Enrichment test
+
+Gene symbols are converted to Entrez identifiers with `org.Hs.eg.db`, and
+over-representation is tested with `enrichGO` against the default genome-wide
+background of the ontology. The thresholds (*P* < 0.05, Benjamini–Hochberg
+*q* < 0.2) and the minimum of three mappable genes per set are those stated in
+Methods; sets below the minimum return `NULL` so that the per-bait tables simply
+omit untestable categories rather than reporting spurious terms.
+
+```{r go_enrichment_function}
+run_go_enrichment <- function(genes, ont = "BP", pval = 0.05) {
+  if (length(genes) < 3) return(NULL)
+
+  gene_entrez <- tryCatch(
+    bitr(genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db, drop = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(gene_entrez) || nrow(gene_entrez) < 3) return(NULL)
+
+  enrich_result <- tryCatch(
+    enrichGO(
+      gene          = gene_entrez$ENTREZID,
+      OrgDb         = org.Hs.eg.db,
+      ont           = ont,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = pval,
+      qvalueCutoff  = 0.2,
+      readable      = TRUE
+    ),
+    error = function(e) NULL
+  )
+  if (is.null(enrich_result) || nrow(enrich_result@result) == 0) return(NULL)
+  enrich_result
+}
+```
+
+```{r perform_enrichment}
+enrichment_results <- list()
+
+for (gene in names(gene_pair_data)) {
+  risk_genes    <- gene_pair_data[[gene]]$risk
+  nonrisk_genes <- gene_pair_data[[gene]]$nonrisk
+  shared_genes  <- gene_pair_data[[gene]]$shared
+
+  # A bait is only entered if at least one of its three sets is testable.
+  if (length(risk_genes) < 3 && length(nonrisk_genes) < 3 && length(shared_genes) < 3) next
+
+  enrichment_results[[gene]] <- list()
+  for (ont in c("BP", "MF", "CC")) {
+    enrichment_results[[gene]][[ont]] <- list(
+      risk    = run_go_enrichment(risk_genes,    ont = ont),
+      nonrisk = run_go_enrichment(nonrisk_genes, ont = ont),
+      shared  = run_go_enrichment(shared_genes,  ont = ont)
+    )
+  }
+}
+
+cat(sprintf("Enrichment completed for %d bait pairs\n", length(enrichment_results)))
+```
+
+# 4. Per-bait term tables (Supplementary Table 18, Fig. 5f)
+
+Every term passing the cutoffs is written per bait, with its category and
+ontology, so that the term counts in Fig. 5f and the rows of Supplementary
+Table 18 are derived from the same file and cannot drift apart. Files are named by
+the bait symbol used in the network table; the figure script maps these to display
+symbols.
+
+```{r detailed_pathway_tables}
+for (gene in names(enrichment_results)) {
+  gene_pathway_details <- list()
+
+  for (ont in c("BP", "MF", "CC")) {
+    shared_result <- enrichment_results[[gene]][[ont]]$shared
+    if (!is.null(shared_result)) {
+      gene_pathway_details[[paste(ont, "shared", sep = "_")]] <-
+        as.data.frame(shared_result) %>%
+        select(ID, Description, GeneRatio, pvalue, p.adjust) %>%
+        mutate(Specificity = "Shared", Ontology = ont)
+    }
+
+    risk_result    <- enrichment_results[[gene]][[ont]]$risk
+    nonrisk_result <- enrichment_results[[gene]][[ont]]$nonrisk
+    if (is.null(risk_result) && is.null(nonrisk_result)) next
+
+    if (!is.null(risk_result)) {
+      gene_pathway_details[[paste(ont, "risk", sep = "_")]] <-
+        as.data.frame(risk_result) %>%
+        select(ID, Description, GeneRatio, pvalue, p.adjust) %>%
+        mutate(Specificity = "Risk", Ontology = ont)
+    }
+    if (!is.null(nonrisk_result)) {
+      gene_pathway_details[[paste(ont, "nonrisk", sep = "_")]] <-
+        as.data.frame(nonrisk_result) %>%
+        select(ID, Description, GeneRatio, pvalue, p.adjust) %>%
+        mutate(Specificity = "NonRisk", Ontology = ont)
+    }
+  }
+
+  if (length(gene_pathway_details) > 0) {
+    gene_pathway_table <- bind_rows(gene_pathway_details) %>% arrange(Ontology, pvalue)
+    write_csv(gene_pathway_table,
+              file.path(D_GO_PAIR_TABLES, sprintf("%s_pathway_details.csv", gene)))
+  }
+}
+
+cat(sprintf("%d per-bait term tables written to %s\n",
+            length(list.files(D_GO_PAIR_TABLES, pattern = "_pathway_details\\.csv$")),
+            D_GO_PAIR_TABLES))
+```
+
+# 5. Top-10 master table for network labelling
+
+The ten most significant terms per bait × category × ontology are collected into a
+single table with the gene and background ratios, because the label-selection rule
+below needs the number of supporting interactors and the size of the GO term, which
+the per-bait tables do not carry.
+
+```{r master_pathway_summary}
+master_pathway_table <- list()
+
+for (gene in names(enrichment_results)) {
+  for (ont in c("BP", "MF", "CC")) {
+    for (spec in c("risk", "nonrisk", "shared")) {
+      res <- enrichment_results[[gene]][[ont]][[spec]]
+      if (is.null(res)) next
+      spec_label <- c(risk = "Risk", nonrisk = "NonRisk", shared = "Shared")[[spec]]
+      master_pathway_table[[paste(gene, ont, spec, sep = "_")]] <-
+        as.data.frame(res) %>%
+        select(ID, Description, GeneRatio, BgRatio, pvalue, p.adjust, Count) %>%
+        mutate(Gene = gene, Ontology = ont, Specificity = spec_label,
+               NegLog10P = -log10(pvalue)) %>%
+        arrange(pvalue) %>%
+        head(10)
+    }
+  }
+}
+
+master_pathways <- bind_rows(master_pathway_table) %>%
+  select(Gene, Ontology, Specificity, Description, pvalue, p.adjust,
+         NegLog10P, GeneRatio, BgRatio, Count, ID) %>%
+  arrange(Gene, Ontology, Specificity, pvalue)
+
+write_csv(master_pathways, OUT_GO_MASTER_SUMMARY)
+cat(sprintf("Master table: %d term entries\n", nrow(master_pathways)))
+```
+
+# 6. GO-term labels for the Fig. 5g/h network views
+
+One term per bait per isoform is chosen by a fixed rule so that the network labels
+are reproducible. Only isoform-specific categories are labelled (shared terms are
+excluded because the networks show isoform-specific interactors); a term must be
+supported by at least `MIN_COUNT` interactors and belong to a GO category with at
+most `MAX_BG` background genes, which removes very broad terms; nested terms with an
+identical supporting set are collapsed (proxied by identical bait × category ×
+ontology × Count × background size, keeping the most significant); and the top
+`TOP_N` function term (BP or MF) and the top `TOP_N` compartment term (CC) are
+retained per bait per isoform, ranked by adjusted *P*. Fold enrichment is computed
+for inspection only and is not used for ranking, because at Count = 2 it is unstable.
+
+```{r go_label_selection}
+MIN_COUNT <- 2      # minimum interactors supporting the term
+MAX_BG    <- 450    # maximum background genes in the GO term
+TOP_N     <- 1      # labels per ontology group per bait per isoform
+
+stopifnot(all(c("Gene", "Ontology", "Specificity", "Description",
+                "p.adjust", "GeneRatio", "BgRatio", "Count") %in% names(master_pathways)))
+
+# Parse "k/n" gene ratios and "K/N" background ratios into integers.
+gr <- str_split_fixed(master_pathways$GeneRatio, "/", 2)
+bg <- str_split_fixed(master_pathways$BgRatio,   "/", 2)
+
+master <- master_pathways %>%
+  mutate(k = as.integer(gr[, 1]), n_set = as.integer(gr[, 2]),
+         K = as.integer(bg[, 1]), N_bg  = as.integer(bg[, 2]),
+         fold = (k / n_set) / (K / N_bg),
+         onto_group = ifelse(Ontology == "CC", "compartment", "function"))
+
+# Steps 1-3: isoform-specific, supported by >= MIN_COUNT interactors, term size <= MAX_BG.
+kept <- master %>%
+  filter(Specificity != "Shared", Count >= MIN_COUNT, K <= MAX_BG)
+
+# Step 4: collapse nested terms with identical supporting sets, keeping the most significant.
+collapsed <- kept %>%
+  arrange(p.adjust) %>%
+  group_by(Gene, Specificity, Ontology, Count, K) %>%
+  filter(row_number() == 1) %>%
+  ungroup()
+
+# Step 5: top function term and top compartment term per bait per isoform.
+go_labels <- collapsed %>%
+  arrange(p.adjust) %>%
+  group_by(Gene, Specificity, onto_group) %>%
+  filter(row_number() <= TOP_N) %>%
+  ungroup() %>%
+  arrange(Gene, Specificity, onto_group, p.adjust) %>%
+  select(Gene, Specificity, Ontology, onto_group, Description, p.adjust, Count, K, fold)
+
+write_excel_csv(go_labels, OUT_GO_NETWORK_LABELS)
+
+cat(sprintf("%d labels across %d baits\n", nrow(go_labels), n_distinct(go_labels$Gene)))
+
+# Baits without a label on one or both sides are reported so that the network
+# legend can state where no term met the criteria.
+coverage <- expand_grid(Gene = sort(unique(master$Gene)), Specificity = c("Risk", "NonRisk")) %>%
+  left_join(go_labels %>% count(Gene, Specificity, name = "n_labels"),
+            by = c("Gene", "Specificity")) %>%
+  mutate(n_labels = replace_na(n_labels, 0L))
+coverage %>% pivot_wider(names_from = Specificity, values_from = n_labels)
+```
+
+# Session information
+
+```{r session_info}
+sessionInfo()
+```

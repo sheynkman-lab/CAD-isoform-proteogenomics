@@ -1,0 +1,290 @@
+---
+title: "Prior interaction evidence for the AP-MS bait isoforms (BioGRID and IntAct)"
+output: html_document
+---
+
+## Purpose
+
+The 13 risk/nonrisk isoform pairs tested by AP-MS are encoded by genes that have, in
+most cases, been studied before, so the novelty of the isoform-resolved interactome
+depends on the resolution at which earlier interaction data were recorded. This script
+establishes, for every bait isoform, (1) whether the bait gene has any physical
+interaction recorded in BioGRID and how many of those records come from affinity-capture
+MS, (2) whether the bait isoform itself is structurally annotated (SQANTI full or
+incomplete splice match) or novel (novel in catalog / novel not in catalog), and (3)
+whether IntAct holds any isoform-specific record (`accession-N`) for the gene. The three
+signals are combined into one verdict per bait isoform. Because BioGRID files genes under
+official symbols that may differ from the symbols used in the bait list, gene names are
+resolved to Entrez identifiers through BioGRID's own symbol and synonym columns together
+with a small alias table.
+
+**Manuscript outputs produced**
+
+- Methods, "Interaction scoring and network annotation": prior evidence assessed against
+  BioGRID at the gene level (aliases and Entrez identifiers resolved) and against IntAct
+  for isoform-specific records.
+- Results, Fig. 5 text: all 13 bait genes carry gene-level BioGRID records and none has an
+  isoform-specific record, so earlier interactions either represent the canonical isoform
+  or do not specify the isoform tested.
+
+**Inputs**
+
+- `F_BIOGRID_TAB3` — BioGRID human release 5.0.252, TAB3 format (public).
+- `F_APMS_BAIT_PAIRS` — the 13 bait pairs with gene symbol and risk/nonrisk PacBio accessions.
+- `F_SQANTI_PROTEIN_CPM` — SQANTI Protein classification with transcript category and CPM.
+- `F_INTACT_RECORDS` — stored result of the IntAct PSICQUIC query (see Section 5). Read when
+  `QUERY_INTACT` is `FALSE` (default); regenerated when `TRUE`.
+
+**Outputs**
+
+- `OUT_BAIT_NOVELTY` (`bait_isoform_novelty_table.csv`) — one row per bait isoform with
+  the BioGRID metrics, structural novelty, IntAct status and verdict.
+- `F_INTACT_RECORDS` — rewritten only when the live IntAct query is run.
+
+**Run order** — independent of the other scripts; requires only the input files above.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(scipen = 999)
+```
+
+```{r config}
+source("config.R")
+library(tidyverse)
+library(data.table)
+
+# IntAct is a live web service, so the deposited query result is used by default. Setting
+# QUERY_INTACT to TRUE re-runs the PSICQUIC query and overwrites F_INTACT_RECORDS; the
+# stored table reflects IntAct content at the date it was generated.
+QUERY_INTACT <- FALSE
+
+require_files(F_BIOGRID_TAB3, F_APMS_BAIT_PAIRS, F_SQANTI_PROTEIN_CPM)
+if (!QUERY_INTACT) require_files(F_INTACT_RECORDS)
+ensure_dir(RES_09)
+```
+
+## 1. Gene aliases
+
+BioGRID records some bait genes under a different official symbol than the one used in the
+bait list (for example `NHERF2` is filed as `SLC9A3R2`, and `COA8` has several historical
+names), so each bait gene is expanded to the set of names under which its records may be
+filed. BioGRID's own synonym columns are searched in addition to this table.
+
+```{r aliases}
+ALIASES <- list(
+  "SLC9A3R2"     = c("NHERF2"),
+  "NHERF2"       = c("SLC9A3R2"),
+  "RP11-77K12.1" = c("CFDP1"),
+  "CFDP1"        = c("RP11-77K12.1"),
+  "COA8"         = c("C14orf153", "APOPT1", "APOP1", "APOP", "APOP-1", "MC4DN17", "MGC2562")
+)
+alias_set <- function(g) unique(toupper(str_trim(c(g, ALIASES[[g]]))))
+```
+
+## 2. Bait isoforms
+
+The bait list holds one row per gene with the risk and nonrisk PacBio accessions in
+separate columns; it is reshaped to one row per bait isoform so that every downstream
+annotation is isoform-level. The PacBio columns are identified by content (values matching
+`PB.x.y`) and the risk column is the one whose name does not contain "non".
+
+```{r baits_long}
+baits_raw <- read_csv(F_APMS_BAIT_PAIRS, show_col_types = FALSE, name_repair = "minimal") %>%
+  as_tibble()
+names(baits_raw) <- sub("^﻿", "", names(baits_raw))   # the file carries a UTF-8 BOM
+
+gene_col <- names(baits_raw)[grepl("gene", names(baits_raw), ignore.case = TRUE)][1]
+desc_col <- names(baits_raw)[grepl("desc", names(baits_raw), ignore.case = TRUE)][1]
+is_pb    <- vapply(baits_raw, function(c)
+  mean(grepl("^PB\\.[0-9]+\\.[0-9]+$", str_trim(as.character(c))), na.rm = TRUE) > 0.5,
+  logical(1))
+pb_cols     <- names(baits_raw)[is_pb]
+risk_col    <- pb_cols[!grepl("non", pb_cols, ignore.case = TRUE)][1]
+nonrisk_col <- pb_cols[ grepl("non", pb_cols, ignore.case = TRUE)][1]
+stopifnot(!is.na(gene_col), !is.na(risk_col), !is.na(nonrisk_col))
+
+baits <- baits_raw %>%
+  transmute(gene        = .data[[gene_col]],
+            description = if (!is.na(desc_col)) .data[[desc_col]] else NA_character_,
+            risk        = .data[[risk_col]],
+            nonrisk     = .data[[nonrisk_col]]) %>%
+  pivot_longer(c(risk, nonrisk), names_to = "side", values_to = "pb") %>%
+  mutate(pb = str_trim(pb)) %>%
+  filter(grepl("^PB\\.", pb))
+
+stopifnot(n_distinct(baits$gene) == 13)
+message(sprintf("Baits: %d genes, %d bait isoforms", n_distinct(baits$gene), nrow(baits)))
+```
+
+## 3. Structural novelty from SQANTI
+
+An isoform is "annotated" if its transcript is a full or incomplete splice match to
+GENCODE and "novel" if it is novel in catalog or novel not in catalog. Annotated here means
+that some reference transcript matches, not necessarily the canonical one.
+
+```{r sqanti_novelty}
+sq <- fread(F_SQANTI_PROTEIN_CPM) %>% as_tibble()
+pb_field <- if ("pb" %in% names(sq)) "pb" else "pb_acc"
+sq2 <- sq %>%
+  transmute(pb     = .data[[pb_field]],
+            cpm    = suppressWarnings(as.numeric(CPM)),
+            tx_cat = as.character(tx_cat))
+
+baits <- baits %>%
+  left_join(sq2, by = "pb") %>%
+  mutate(structural_novelty = case_when(
+    tx_cat %in% c("full-splice_match", "incomplete-splice_match",
+                  "full_splice_match", "incomplete_splice_match") ~ "annotated",
+    grepl("novel", tx_cat, ignore.case = TRUE)                    ~ "novel",
+    TRUE                                                          ~ NA_character_))
+```
+
+## 4. Gene-level BioGRID coverage
+
+Only physical interactions are considered. Each bait gene is mapped to Entrez identifiers
+by matching its alias set against BioGRID's official symbols and synonym lists, and every
+record in which a matched Entrez identifier appears as interactor A or B is counted. Per
+gene the number of interaction records, the number from affinity-capture MS, the number of
+distinct partners and the number of distinct publications are recorded. The first
+Swiss-Prot accession seen for the gene is retained for the IntAct query.
+
+```{r biogrid_coverage}
+message("Reading BioGRID TAB3 ...")
+bg <- fread(F_BIOGRID_TAB3, sep = "\t", quote = "", showProgress = FALSE) %>% as_tibble()
+
+symA <- "Official Symbol Interactor A"; symB <- "Official Symbol Interactor B"
+spA  <- "SWISS-PROT Accessions Interactor A"; spB <- "SWISS-PROT Accessions Interactor B"
+entA <- "Entrez Gene Interactor A"; entB <- "Entrez Gene Interactor B"
+synA <- "Synonyms Interactor A";    synB <- "Synonyms Interactor B"
+bg_phys <- bg %>% filter(.data[["Experimental System Type"]] == "physical")
+
+target_names <- unique(unlist(lapply(unique(baits$gene), alias_set)))
+
+# name -> Entrez index built from BioGRID's own official symbols and synonyms
+name2entrez <- bind_rows(
+  bg %>% transmute(entrez = .data[[entA]], sym = .data[[symA]], syn = .data[[synA]]),
+  bg %>% transmute(entrez = .data[[entB]], sym = .data[[symB]], syn = .data[[synB]])
+) %>%
+  mutate(allnames = paste(sym, syn, sep = "|")) %>%
+  separate_rows(allnames, sep = "\\|") %>%
+  mutate(allnames = toupper(str_trim(allnames))) %>%
+  filter(allnames %in% target_names) %>%
+  distinct(allnames, entrez)
+
+resolve_entrez <- function(g) unique(name2entrez$entrez[name2entrez$allnames %in% alias_set(g)])
+
+gene_metrics <- map_dfr(unique(baits$gene), function(g) {
+  ent  <- resolve_entrez(g)
+  hits <- if (length(ent)) {
+    bg_phys %>% filter(.data[[entA]] %in% ent | .data[[entB]] %in% ent)
+  } else bg_phys[0, ]
+  if (nrow(hits) == 0)
+    return(tibble(gene = g, matched_entrez = paste(ent, collapse = ";"), uniprot_acc = NA_character_,
+                  biogrid_n_interactions = 0L, biogrid_n_apms = 0L,
+                  biogrid_n_partners = 0L, biogrid_n_pubs = 0L))
+  is_a    <- hits[[entA]] %in% ent
+  partner <- ifelse(is_a, hits[[symB]], hits[[symA]])
+  acc_col <- ifelse(is_a, hits[[spA]],  hits[[spB]])
+  acc_col <- acc_col[!is.na(acc_col) & acc_col != "-"]
+  acc1    <- if (length(acc_col)) strsplit(acc_col[1], "\\|")[[1]][1] else NA_character_
+  tibble(gene = g, matched_entrez = paste(ent, collapse = ";"), uniprot_acc = acc1,
+         biogrid_n_interactions = nrow(hits),
+         biogrid_n_apms         = sum(hits[["Experimental System"]] == "Affinity Capture-MS"),
+         biogrid_n_partners     = n_distinct(partner),
+         biogrid_n_pubs         = n_distinct(hits[["Publication Source"]]))
+})
+```
+
+## 5. Isoform-specific records in IntAct
+
+IntAct is the database that records interactions at isoform resolution, using UniProt
+isoform accessions of the form `P12345-2`. Each gene is queried through the PSICQUIC REST
+interface by its Swiss-Prot accession (more precise than a symbol that may be
+non-standard), and any isoform accession among the interactor identifiers is recorded.
+By default the stored query result is read; the live query runs only when `QUERY_INTACT`
+is `TRUE`, and then rewrites the stored file.
+
+```{r intact_query}
+query_intact <- function(gene, acc) {
+  q <- if (!is.na(acc)) acc else gene
+  url <- sprintf(
+    "https://www.ebi.ac.uk/Tools/webservices/psicquic/intact/webservices/current/search/query/%s?format=tab27",
+    utils::URLencode(q))
+  txt <- tryCatch(readLines(url, warn = FALSE), error = function(e) character(0))
+  if (!length(txt) || is.na(acc))
+    return(tibble(intact_isoform_record = NA, intact_isoforms_seen = NA_character_))
+  ids <- unlist(lapply(strsplit(txt, "\t"), function(x) x[1:2]))
+  pat <- paste0("uniprotkb:", acc, "-([0-9]+)")
+  hit <- regmatches(ids, regexpr(pat, ids)); iso <- unique(hit[nchar(hit) > 0])
+  tibble(intact_isoform_record = length(iso) > 0,
+         intact_isoforms_seen  = if (length(iso)) paste(iso, collapse = ";") else "")
+}
+
+if (QUERY_INTACT) {
+  message("Querying IntAct (online) ...")
+  intact <- map_dfr(seq_len(nrow(gene_metrics)), function(i) {
+    Sys.sleep(0.3)   # polite pacing of the web service
+    cbind(gene = gene_metrics$gene[i],
+          query_intact(gene_metrics$gene[i], gene_metrics$uniprot_acc[i]))
+  }) %>% as_tibble()
+  ensure_dir(dirname(F_INTACT_RECORDS))
+  write_csv(intact, F_INTACT_RECORDS)
+} else {
+  intact <- read_csv(F_INTACT_RECORDS, show_col_types = FALSE) %>%
+    mutate(intact_isoform_record = as.logical(intact_isoform_record),
+           intact_isoforms_seen  = as.character(intact_isoforms_seen))
+  stopifnot(all(gene_metrics$gene %in% intact$gene))
+}
+```
+
+## 6. Verdict per bait isoform
+
+The three signals are ordered from least to most prior characterization: a gene absent
+from BioGRID is uncharacterized; a structurally novel isoform of a studied gene has no
+prior interaction data that could refer to it; an isoform-specific IntAct record is the
+only case in which the isoform itself was previously characterized; otherwise the gene was
+assayed (by AP-MS or another method) without resolving the isoform.
+
+```{r assemble_verdict}
+tbl <- baits %>%
+  left_join(gene_metrics, by = "gene") %>%
+  left_join(intact,       by = "gene") %>%
+  mutate(gene_studied = biogrid_n_interactions > 0,
+         verdict = case_when(
+           !gene_studied & structural_novelty == "novel" ~ "Gene & isoform both uncharacterized",
+           !gene_studied                                  ~ "Gene absent from BioGRID",
+           structural_novelty == "novel"                  ~ "Gene studied; isoform NOVEL - no prior interaction data",
+           intact_isoform_record %in% TRUE                ~ "Isoform-specific interactions reported (IntAct)",
+           biogrid_n_apms > 0                             ~ "Gene assayed by AP-MS at canonical level; this isoform not resolved",
+           TRUE                                           ~ "Gene studied (non-AP-MS); isoform not specifically assayed")) %>%
+  select(gene, description, side, pb, cpm, tx_cat, structural_novelty,
+         matched_entrez, uniprot_acc, gene_studied, biogrid_n_interactions, biogrid_n_apms,
+         biogrid_n_partners, biogrid_n_pubs, intact_isoform_record, intact_isoforms_seen, verdict) %>%
+  arrange(gene, side)
+
+write_csv(tbl, OUT_BAIT_NOVELTY)
+```
+
+## 7. Summary
+
+The counts below support the statement that prior interaction records for the bait genes
+exist only at the gene level.
+
+```{r novelty_summary}
+cat(sprintf("Bait genes: %d | bait isoforms: %d\n", n_distinct(tbl$gene), nrow(tbl)))
+cat(sprintf("Genes with any BioGRID physical interaction: %d / %d\n",
+            sum(tapply(tbl$gene_studied,       tbl$gene, any)), n_distinct(tbl$gene)))
+cat(sprintf("Genes with BioGRID affinity-capture MS records: %d / %d\n",
+            sum(tapply(tbl$biogrid_n_apms > 0, tbl$gene, any)), n_distinct(tbl$gene)))
+cat(sprintf("Bait isoforms structurally novel (NIC/NNC): %d / %d\n",
+            sum(tbl$structural_novelty == "novel", na.rm = TRUE), nrow(tbl)))
+cat(sprintf("Bait isoforms with an isoform-specific IntAct record: %d\n",
+            sum(tbl$intact_isoform_record %in% TRUE)))
+print(count(tbl, verdict))
+```
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```

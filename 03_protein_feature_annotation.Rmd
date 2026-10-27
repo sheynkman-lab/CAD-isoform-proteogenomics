@@ -1,0 +1,1674 @@
+---
+title: "Protein feature annotation and property statistics for risk/nonrisk isoforms"
+output: html_document
+---
+
+## Purpose
+
+Resolving a CAD sQTL to a pair of full-length protein isoforms makes it possible to
+ask what the risk-associated splice change does to the protein. This script
+annotates every isoform of the unified pair table from script 02 with predicted
+protein properties (length, amino-acid physicochemical indices, intrinsic disorder,
+relative solvent accessibility and secondary structure, post-translational
+modification sites, subcellular localization, Pfam domains, UniProt feature overlap
+and AlphaFold3 metrics), computes the risk-minus-nonrisk difference of each property
+for every pair, and assembles the differences into one wide property table per
+analysis level, which script 06 profiles. The same properties are then compared
+between CAD-associated and non-CAD VSMC sQTL junctions, because the manuscript asks
+whether CAD-associated splice events preferentially affect particular protein
+regions; the comparison is made on one representative isoform per junction, at the
+whole-isoform level, at the junction position in genomic space (±30 bp) and in a
+10-residue window around the junction in protein space, and once more with the
+non-CAD set restricted to junctions sharing the risk allele's direction of effect.
+Every statistical test is collected into `master_results_summary.csv`, which is
+Supplementary Table 15. Finally, the predicted NMD status of each junction
+(majority vote across the isoforms that contain it) and the named Pfam domains
+gained or lost between the members of each pair are exported for Extended Data
+Fig. 5 and the Results text.
+
+## Manuscript outputs produced
+
+- Supplementary Table 15 — all property comparisons (paired risk versus nonrisk at
+  the isoform and junction level; CAD versus non-CAD at the isoform, junction,
+  ±30 bp and ±10 aa levels; direction-matched and sub-property tests), with BH
+  correction within each comparison family.
+- Fig. 4f — junction overlap with UniProt protein features within 30 bp, CAD versus
+  non-CAD coding junctions (n = 103 and 2,672; data table; the panel is drawn by
+  `10_figure_and_table_generation.Rmd`).
+- Fig. 4h, Extended Data Fig. 5d, Extended Data Fig. 7a and Supplementary Table 16 —
+  the per-pair property tables that script 06 profiles.
+- Extended Data Fig. 5b and Supplementary Table 13 — predicted NMD status per
+  junction (majority vote), CAD versus non-CAD.
+- Results, "CAD-associated splicing produces bidirectional domain loss" — named
+  domain gains and losses per pair (domains differed within 43 of 94 pairs).
+- Methods, "Protein feature annotation", "Overlap of sQTL junctions with protein
+  features" and "Per-pair property profiling".
+
+## Inputs
+
+- `OUT_PAIRS_UNIFIED`, `OUT_PAIRS_UNIFIED_FLAGGED`, `OUT_JUNCTION_AA_MAPPING` — the
+  unified pair table, its inclusion flags and the junction protein-space windows
+  (script 02).
+- `OUT_LFC_INTEGRATED` (script 01) and `F_GENERAL_SQTL_LR` — CAD and non-CAD VSMC
+  sQTL junctions with their long-read isoforms.
+- `F_SMC_GTF`, `F_SMC_INTRON_COORDS`, `F_SQANTI_PROTEIN_CPM`, `F_SMC_PROTEIN_FASTA` —
+  long-read transcript models with CDS, junction–isoform map, SQANTI Protein table
+  (CPM, NMD, ORF) and predicted protein sequences.
+- `F_UNIPROT_ANNOT` — UniProt feature intervals (domains, secondary structure,
+  disordered regions, topological domains) on hg38.
+- `F_AAINDEX`, `F_IUPRED_SUMMARY`, `F_IUPRED_RESIDUES`, `F_NETSURFP_FEATURES`,
+  `F_NETSURFP_RESIDUES`, `F_PTM_EXONS`, `F_PTM_SUMMARY`, `F_DEEPLOC_SMC`,
+  `F_HMMSCAN_DOMTBLOUT` — per-isoform (and per-residue) property predictions from
+  AAindex, IUPred3, NetSurfP-3.0, PTM-POSE, DeepLoc 2.0 and hmmscan/Pfam-A v35.0.
+- `F_AF3_METRICS_ISO`, `F_AF3_METRICS_PAIR` — AlphaFold3 per-isoform and per-pair
+  metrics produced by `python/compute_af3_metrics.py` from the AlphaFold3 models.
+
+## Outputs (in `RES_03`)
+
+- `property_table_isoform_wide.csv`, `property_table_junction_wide.csv` — per-pair
+  risk, nonrisk and difference values for every property (script 06).
+- `master_results_summary.csv` — all statistical comparisons (Supplementary
+  Table 15; copied by script 10).
+- `aggregate_cad_vs_noncad_junction_results.csv` — junction-level CAD versus non-CAD
+  tests (Fig. 4f; script 10).
+- `nmd_cad_junction_majority_vote.csv`, `nmd_noncad_junction_majority_vote.csv` —
+  NMD majority vote per junction (Extended Data Fig. 5b, Supplementary Table 13;
+  script 10).
+- `junction_aa_mapping_NONCAD.csv` — protein-space windows of the non-CAD junctions.
+- `domain_changes_named.csv`, `domain_changes_at_junction.csv` — Pfam domains gained
+  or lost in the risk isoform, whole protein and within ±10 aa of the junction.
+- Per-property value tables (`property_length_diff_unified.csv` … `property_junction_region_properties.csv`),
+  `unified_property_stats.csv`, `direction_matched_*.csv` and the per-level
+  `aggregate_cad_vs_noncad_*_results.csv` tables are intermediates of the above.
+
+## Run order
+
+Scripts 01 and 02, then `python/compute_af3_metrics.py`, must have been run.
+
+```{r setup, message=FALSE, warning=FALSE}
+source("config.R")
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(Biostrings)
+library(data.table)
+
+# Bind the dplyr verbs and the GenomicRanges reduce() explicitly, because the S4
+# generics attached with GenomicRanges mask them.
+reduce <- GenomicRanges::reduce
+filter <- dplyr::filter
+select <- dplyr::select
+rename <- dplyr::rename
+slice  <- dplyr::slice
+count  <- dplyr::count
+
+set.seed(42)
+ensure_dir(RES_03)
+
+require_files(OUT_PAIRS_UNIFIED, OUT_PAIRS_UNIFIED_FLAGGED, OUT_JUNCTION_AA_MAPPING,
+              OUT_LFC_INTEGRATED, F_GENERAL_SQTL_LR,
+              F_SMC_GTF, F_SMC_INTRON_COORDS, F_SQANTI_PROTEIN_CPM, F_SMC_PROTEIN_FASTA,
+              F_UNIPROT_ANNOT, F_AAINDEX, F_IUPRED_SUMMARY, F_IUPRED_RESIDUES,
+              F_NETSURFP_FEATURES, F_NETSURFP_RESIDUES, F_PTM_EXONS, F_PTM_SUMMARY,
+              F_DEEPLOC_SMC, F_HMMSCAN_DOMTBLOUT, F_AF3_METRICS_ISO, F_AF3_METRICS_PAIR)
+
+# Intermediate tables of this script.
+res03 <- function(...) file.path(RES_03, ...)
+OUT_UNIFIED_STATS   <- res03("unified_property_stats.csv")
+OUT_DM_REPS_ALL     <- res03("direction_matched_isoforms_all.csv")
+OUT_DM_REPS_CDS     <- res03("direction_matched_isoforms_cds.csv")
+OUT_DM_RESULTS      <- res03("direction_matched_results.csv")
+OUT_AGGREGATE_ISO   <- res03("aggregate_cad_vs_noncad_isoform_results.csv")
+OUT_AGGREGATE_AA10  <- res03("aggregate_cad_vs_noncad_junction_aa10_results.csv")
+OUT_AGGREGATE_SUB   <- res03("aggregate_cad_vs_noncad_subprop_results.csv")
+OUT_AA10_TABLE      <- res03("junction_aa10_property_table.csv")
+OUT_DOMAIN_CHANGES_LOCAL <- res03("domain_changes_at_junction.csv")
+
+# Half-width (residues) of the protein window around each junction.
+WINDOW_AA <- 10L
+```
+
+# 1. Shared resources
+
+Everything the analyses below need is loaded once here: the CAD and non-CAD sQTL
+junction sets, the long-read transcript models (CDS intervals per isoform and the
+junction–isoform map), the SQANTI Protein table, the predicted proteins, the UniProt
+feature intervals and the hmmscan Pfam table. The hmmscan `domtblout` is parsed once
+because four analyses use it with different summaries.
+
+```{r load_sqtl_and_models}
+cad_sqtls <- read_tsv(OUT_LFC_INTEGRATED, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+cad_junction_keys_all <- cad_sqtls %>%
+  distinct(chr, intron_start, intron_end, strand) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":")) %>%
+  pull(junction_key) %>% unique()
+
+general_sqtls <- read_tsv(F_GENERAL_SQTL_LR, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":")) %>%
+  filter(!cluster_id %in% unique(cad_sqtls$cluster))
+general_junction_keys_all <- general_sqtls %>%
+  distinct(chr, intron_start, intron_end, junction_id, junction_key) %>%
+  pull(junction_key) %>% unique()
+
+# CDS intervals per long-read transcript.
+smc_gtf_df <- as.data.frame(rtracklayer::import(F_SMC_GTF))
+cds_by_transcript <- smc_gtf_df %>%
+  filter(type == "CDS") %>%
+  mutate(pb_id = str_extract(transcript_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id)) %>%
+  makeGRangesFromDataFrame(seqnames.field = "seqnames", start.field = "start",
+                           end.field = "end", strand.field = "strand",
+                           keep.extra.columns = TRUE)
+seqlevelsStyle(cds_by_transcript) <- "UCSC"
+cds_lookup <- split(cds_by_transcript, cds_by_transcript$pb_id)
+rm(smc_gtf_df); invisible(gc(verbose = FALSE))
+
+sqanti_protein <- read_csv(F_SQANTI_PROTEIN_CPM, show_col_types = FALSE)
+colnames(sqanti_protein)[colnames(sqanti_protein) == "pb"] <- "pb_acc"
+
+smc_junc_isoform <- read_tsv(F_SMC_INTRON_COORDS, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"),
+         pb_id = str_extract(trans_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id))
+
+# Predicted proteins: `protein_lookup` strips the terminal stop; `prot_seqs_full`
+# keeps the raw record and its width for the whole-isoform length comparison.
+smc_fasta <- readAAStringSet(F_SMC_PROTEIN_FASTA)
+fasta_pbs <- str_extract(names(smc_fasta), "PB\\.[0-9]+\\.[0-9]+")
+protein_lookup <- tibble(pb_acc = fasta_pbs, protein_seq = as.character(smc_fasta)) %>%
+  filter(!is.na(pb_acc)) %>%
+  mutate(protein_seq = str_remove(protein_seq, "\\*$")) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+prot_seqs_full <- tibble(pb_acc = fasta_pbs, sequence = as.character(smc_fasta),
+                         aa_length = width(smc_fasta)) %>%
+  filter(!is.na(pb_acc)) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+rm(smc_fasta); invisible(gc(verbose = FALSE))
+
+uniprot <- read_tsv(F_UNIPROT_ANNOT, show_col_types = FALSE)
+```
+
+```{r helpers}
+# ---- hmmscan domtblout -------------------------------------------------------
+# Space-delimited with a free-text description from field 23; fields 18-19 are the
+# alignment coordinates in the query protein.
+hmm_lines <- read_lines(F_HMMSCAN_DOMTBLOUT)
+hmm_lines <- hmm_lines[!str_starts(hmm_lines, "#") & nchar(hmm_lines) > 0]
+hmm_df <- bind_rows(lapply(hmm_lines, function(line) {
+  parts <- strsplit(line, "\\s+")[[1]]
+  parts <- parts[parts != ""]
+  if (length(parts) < 19) return(NULL)
+  data.frame(domain_name = parts[1], domain_acc = parts[2], query_name = parts[4],
+             seq_from = as.integer(parts[18]), seq_to = as.integer(parts[19]),
+             description = if (length(parts) >= 23) paste(parts[23:length(parts)], collapse = " ") else "",
+             stringsAsFactors = FALSE)
+})) %>%
+  mutate(pb_id = str_extract(query_name, "PB\\.[0-9]+\\.[0-9]+"),
+         domain_acc_clean = sub("\\..*", "", domain_acc)) %>%
+  filter(!is.na(pb_id))
+rm(hmm_lines)
+
+# ---- AAindex ---------------------------------------------------------------------
+aa_idx <- read_csv(F_AAINDEX, show_col_types = FALSE)
+make_aa_vec <- function(col) setNames(aa_idx[[col]], aa_idx$aa)
+aa_vecs <- list(hydropathy = make_aa_vec("hydropathy"), polarity = make_aa_vec("polarity"),
+                volume = make_aa_vec("volume"), flexibility = make_aa_vec("flexibility"))
+# Mean of a per-residue index over a sequence (residues absent from the index are skipped).
+aa_mean_for_seq <- function(seq_str, vec) {
+  if (is.na(seq_str) || nchar(seq_str) == 0) return(NA_real_)
+  aas <- strsplit(seq_str, "")[[1]]
+  aas <- aas[aas %in% names(vec)]
+  if (length(aas) == 0) return(NA_real_)
+  mean(vec[aas])
+}
+
+# ---- Genomic helpers -------------------------------------------------------------
+# UniProt feature intervals (0-based BED starts) as reduced GRanges.
+build_uniprot_gr <- function(uniprot_df, category_filter, name_filter = NULL) {
+  df <- uniprot_df %>% filter(category %in% category_filter)
+  if (!is.null(name_filter)) df <- df %>% filter(name == name_filter)
+  df <- df %>% mutate(start_1based = chromStart + 1, end_1based = chromEnd)
+  if (nrow(df) == 0) return(GRanges())
+  gr <- makeGRangesFromDataFrame(df, seqnames.field = "chrom", start.field = "start_1based",
+                                 end.field = "end_1based", keep.extra.columns = TRUE)
+  seqlevelsStyle(gr) <- "UCSC"
+  GenomicRanges::reduce(gr)
+}
+# "chr:start:end" keys to GRanges.
+jk_to_gr <- function(jks) {
+  parts <- str_split(jks, ":", simplify = TRUE)
+  gr <- GRanges(parts[, 1], IRanges(as.integer(parts[, 2]), as.integer(parts[, 3])))
+  seqlevelsStyle(gr) <- "UCSC"
+  gr
+}
+# Does the junction overlap the CDS of the given isoform?
+junc_in_cds <- function(jk, pb) {
+  if (is.na(pb) || !pb %in% names(cds_lookup)) return(NA)
+  length(findOverlaps(cds_lookup[[pb]], jk_to_gr(jk))) > 0
+}
+
+# ---- Group tests (CAD versus non-CAD) --------------------------------------------
+test_continuous <- function(data, value_col, property_label, level_label, direction_val = NULL) {
+  d <- data %>% filter(!is.na(.data[[value_col]]))
+  if (!is.null(direction_val)) d <- d %>% filter(direction == direction_val)
+  cad_v <- d %>% filter(group == "CAD")    %>% pull(value_col)
+  non_v <- d %>% filter(group == "nonCAD") %>% pull(value_col)
+  if (length(cad_v) < 3 || length(non_v) < 3) return(NULL)
+  wt <- tryCatch(wilcox.test(cad_v, non_v), error = function(e) NULL)
+  p_val <- if (!is.null(wt)) wt$p.value else NA_real_
+  out <- tibble(property = value_col, property_label = property_label, level = level_label)
+  if (!is.null(direction_val)) out$direction <- direction_val
+  bind_cols(out, tibble(n_cad = length(cad_v), n_noncad = length(non_v),
+                        median_cad = median(cad_v), median_noncad = median(non_v),
+                        test = "Wilcoxon rank-sum",
+                        statistic = if (!is.null(wt)) unname(wt$statistic) else NA_real_,
+                        p_value = p_val, sig = sig_label(p_val)))
+}
+test_binary <- function(data, value_col, property_label, level_label, direction_val = NULL) {
+  d <- data %>% filter(!is.na(.data[[value_col]]))
+  if (!is.null(direction_val)) d <- d %>% filter(direction == direction_val)
+  if (nrow(d) < 5) return(NULL)
+  tab <- table(d$group, d[[value_col]])
+  if (any(dim(tab) < 2)) return(NULL)
+  ft <- tryCatch(fisher.test(tab), error = function(e) NULL)
+  if (is.null(ft)) return(NULL)
+  cad_yes <- sum(d$group == "CAD"    & as.logical(d[[value_col]]))
+  cad_tot <- sum(d$group == "CAD")
+  non_yes <- sum(d$group == "nonCAD" & as.logical(d[[value_col]]))
+  non_tot <- sum(d$group == "nonCAD")
+  out <- tibble(property = value_col, property_label = property_label, level = level_label)
+  if (!is.null(direction_val)) out$direction <- direction_val
+  bind_cols(out, tibble(n_cad = cad_tot, n_noncad = non_tot,
+                        pct_cad = round(100 * cad_yes / cad_tot, 1),
+                        pct_noncad = round(100 * non_yes / non_tot, 1),
+                        test = "Fisher's exact", statistic = round(unname(ft$estimate), 2),
+                        p_value = ft$p.value, sig = sig_label(ft$p.value)))
+}
+
+# ---- Supplementary Table 15 -----------------------------------------------------
+# Rows of one comparison class replace any earlier rows of the same class, so the
+# table is rebuilt deterministically from the start of this script.
+MASTER_COLS <- c("comparison", "analysis", "metric", "group1", "group1_value", "group1_n",
+                 "group1_total", "group2", "group2_value", "group2_n", "group2_total",
+                 "test", "statistic", "p_value", "p_adj", "sig")
+append_master <- function(master_new, class_regex) {
+  master_new <- master_new %>% select(all_of(MASTER_COLS))
+  if (file.exists(OUT_PROPERTY_STATS_MASTER)) {
+    master_existing <- read_csv(OUT_PROPERTY_STATS_MASTER, show_col_types = FALSE) %>%
+      filter(!str_detect(comparison, class_regex))
+    master_new <- bind_rows(master_existing, master_new)
+  }
+  write_csv(master_new, OUT_PROPERTY_STATS_MASTER)
+  invisible(master_new)
+}
+```
+
+# 2. The pair analysis set
+
+Salvaged pairs are kept only when the CAD junction overlaps the CDS of the anchor
+isoform, because the property comparison is meaningful only when the splice change
+lies within the protein; strict and AP-MS pairs are kept as they are. The inclusion
+flags from script 02 decide which pairs enter the junction-level (strict pairs) and
+isoform-level (strict, salvaged and non-redundant AP-MS pairs) statistics.
+
+```{r pair_analysis_set}
+unified_pairs <- read_csv(OUT_PAIRS_UNIFIED, show_col_types = FALSE)
+flags_full    <- read_csv(OUT_PAIRS_UNIFIED_FLAGGED, show_col_types = FALSE)
+flags <- flags_full %>%
+  select(gene_name, risk_pb, nonrisk_pb, include_in_isoform_stats, include_in_junction_stats)
+
+salvaged_only <- unified_pairs %>%
+  filter(pair_type == "salvaged") %>%
+  mutate(anchor_pb = ifelse(salvage_side == "risk", nonrisk_pb, risk_pb))
+salvaged_only$junction_in_anchor_cds <- vapply(seq_len(nrow(salvaged_only)), function(i) {
+  junc_in_cds(salvaged_only$cad_sqtl_junction[i], salvaged_only$anchor_pb[i])
+}, logical(1))
+salvaged_valid <- salvaged_only %>%
+  filter(isTRUE(junction_in_anchor_cds) | junction_in_anchor_cds == TRUE)
+
+unified_for_analysis <- bind_rows(
+  unified_pairs %>% filter(pair_type == "strict"),
+  salvaged_valid %>% select(-anchor_pb, -junction_in_anchor_cds),
+  unified_pairs %>% filter(pair_type == "manual_apms")
+)
+print(unified_for_analysis %>% count(pair_type))
+
+# Accumulator for the long property table (one entry per property).
+unified_property_results <- list()
+stash_property <- function(df, prop_name, risk_col, nonrisk_col, delta_col) {
+  unified_property_results[[prop_name]] <<- df %>%
+    transmute(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = .data[[risk_col]], nonrisk_value = .data[[nonrisk_col]],
+              delta = .data[[delta_col]], property = prop_name)
+}
+```
+
+# 3. UniProt feature intervals
+
+UniProt domain, secondary-structure, disordered-region and topological-domain
+annotations of the canonical protein, projected onto hg38, are converted to reduced
+genomic intervals once; they serve the paired CDS-overlap comparison (section 11) and
+the junction-anchored CAD versus non-CAD tests (sections 16 and 17).
+
+```{r annotation_granges}
+domain_gr      <- build_uniprot_gr(uniprot, "domain")
+disordered_gr  <- build_uniprot_gr(uniprot, "region of interest", "Disordered")
+secondary_gr   <- build_uniprot_gr(uniprot, c("beta strand", "turn", "helix", "coiled-coil region"))
+topological_gr <- build_uniprot_gr(uniprot, "topological domain")
+```
+
+# 4. Protein length
+
+```{r prop_length}
+prot_lookup <- protein_lookup %>% mutate(aa_len = nchar(protein_seq)) %>% select(pb_acc, aa_len)
+
+length_table <- unified_for_analysis %>%
+  left_join(prot_lookup %>% dplyr::rename(risk_aa_len    = aa_len), by = c("risk_pb" = "pb_acc")) %>%
+  left_join(prot_lookup %>% dplyr::rename(nonrisk_aa_len = aa_len), by = c("nonrisk_pb" = "pb_acc")) %>%
+  mutate(delta_aa_len = risk_aa_len - nonrisk_aa_len,
+         abs_delta = abs(delta_aa_len),
+         direction = case_when(delta_aa_len > 0 ~ "risk_longer", delta_aa_len < 0 ~ "risk_shorter",
+                               delta_aa_len == 0 ~ "equal", TRUE ~ NA_character_)) %>%
+  select(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb,
+         risk_aa_len, nonrisk_aa_len, delta_aa_len, abs_delta, direction,
+         salvage_side, salvage_pct_identity)
+
+write_csv(length_table, res03("property_length_diff_unified.csv"))
+stash_property(length_table, "aa_length", "risk_aa_len", "nonrisk_aa_len", "delta_aa_len")
+```
+
+# 5. AAindex amino-acid properties
+
+Mean Kyte–Doolittle hydropathy, Zimmerman polarity, Grantham volume and flexibility
+per isoform, from the AAindex scales.
+
+```{r prop_aaindex}
+needed_pbs <- unique(c(unified_for_analysis$risk_pb, unified_for_analysis$nonrisk_pb))
+aa_props <- protein_lookup %>%
+  filter(pb_acc %in% needed_pbs) %>%
+  rowwise() %>%
+  mutate(mean_hydropathy  = aa_mean_for_seq(protein_seq, aa_vecs$hydropathy),
+         mean_polarity    = aa_mean_for_seq(protein_seq, aa_vecs$polarity),
+         mean_volume      = aa_mean_for_seq(protein_seq, aa_vecs$volume),
+         mean_flexibility = aa_mean_for_seq(protein_seq, aa_vecs$flexibility)) %>%
+  ungroup() %>%
+  select(pb_acc, mean_hydropathy, mean_polarity, mean_volume, mean_flexibility)
+
+aa_table <- unified_for_analysis %>%
+  left_join(aa_props %>% dplyr::rename(risk_hydropathy = mean_hydropathy, risk_polarity = mean_polarity,
+                                       risk_volume = mean_volume, risk_flexibility = mean_flexibility),
+            by = c("risk_pb" = "pb_acc")) %>%
+  left_join(aa_props %>% dplyr::rename(nonrisk_hydropathy = mean_hydropathy, nonrisk_polarity = mean_polarity,
+                                       nonrisk_volume = mean_volume, nonrisk_flexibility = mean_flexibility),
+            by = c("nonrisk_pb" = "pb_acc")) %>%
+  mutate(delta_hydropathy  = risk_hydropathy  - nonrisk_hydropathy,
+         delta_polarity    = risk_polarity    - nonrisk_polarity,
+         delta_volume      = risk_volume      - nonrisk_volume,
+         delta_flexibility = risk_flexibility - nonrisk_flexibility)
+
+out_cols <- c("gene_name", "cad_sqtl_junction", "pair_type", "risk_pb", "nonrisk_pb",
+              "risk_hydropathy", "nonrisk_hydropathy", "delta_hydropathy",
+              "risk_polarity", "nonrisk_polarity", "delta_polarity",
+              "risk_volume", "nonrisk_volume", "delta_volume",
+              "risk_flexibility", "nonrisk_flexibility", "delta_flexibility")
+write_csv(aa_table %>% select(any_of(out_cols)), res03("property_aaindex_unified.csv"))
+for (m in c("hydropathy", "polarity", "volume", "flexibility")) {
+  stash_property(aa_table, m, paste0("risk_", m), paste0("nonrisk_", m), paste0("delta_", m))
+}
+```
+
+# 6. Intrinsic disorder (IUPred3)
+
+```{r prop_idr}
+idr_data <- read_csv(F_IUPRED_SUMMARY, show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(sequence_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc)) %>%
+  select(pb_acc, percent_idr) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+
+idr_table <- unified_for_analysis %>%
+  left_join(idr_data %>% dplyr::rename(risk_idr    = percent_idr), by = c("risk_pb" = "pb_acc")) %>%
+  left_join(idr_data %>% dplyr::rename(nonrisk_idr = percent_idr), by = c("nonrisk_pb" = "pb_acc")) %>%
+  mutate(delta_idr = risk_idr - nonrisk_idr)
+
+write_csv(idr_table, res03("property_idr_unified.csv"))
+stash_property(idr_table, "idr_percent", "risk_idr", "nonrisk_idr", "delta_idr")
+```
+
+# 7. NetSurfP-3.0 structure
+
+Per-isoform secondary-structure fractions, mean relative solvent accessibility (RSA)
+and mean disorder. The helix/strand fractions are carried in the tables but the
+manuscript uses RSA as the structural metric.
+
+```{r prop_netsurfp}
+nsp <- read_csv(F_NETSURFP_FEATURES, show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(protein_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc))
+nsp_cols <- intersect(c("pct_helix", "pct_sheet", "pct_coil", "mean_rsa", "mean_disorder"), names(nsp))
+nsp_subset <- nsp %>% select(pb_acc, all_of(nsp_cols)) %>% distinct(pb_acc, .keep_all = TRUE)
+
+nsp_table <- unified_for_analysis %>%
+  left_join(nsp_subset %>% rename_with(~ paste0("risk_", .x), all_of(nsp_cols)),
+            by = c("risk_pb" = "pb_acc")) %>%
+  left_join(nsp_subset %>% rename_with(~ paste0("nonrisk_", .x), all_of(nsp_cols)),
+            by = c("nonrisk_pb" = "pb_acc"))
+for (col in nsp_cols) {
+  nsp_table[[paste0("delta_", col)]] <- nsp_table[[paste0("risk_", col)]] - nsp_table[[paste0("nonrisk_", col)]]
+}
+
+write_csv(nsp_table, res03("property_netsurfp_unified.csv"))
+for (col in nsp_cols) {
+  stash_property(nsp_table, paste0("nsp_", col), paste0("risk_", col), paste0("nonrisk_", col),
+                 paste0("delta_", col))
+}
+```
+
+# 8. Post-translational modification content (PTM-POSE)
+
+PhosphoSitePlus sites projected onto each isoform; the per-isoform summary counts
+PTMs and the fraction of exons carrying at least one PTM.
+
+```{r prop_ptm}
+ptm_exons <- fread(F_PTM_EXONS) %>% as_tibble() %>%
+  mutate(pb_acc  = str_extract(event_id, "PB\\.[0-9]+\\.[0-9]+"),
+         has_ptm = `Number of PTMs Affected` > 0) %>%
+  filter(!is.na(pb_acc))
+ptm_per_isoform <- ptm_exons %>%
+  group_by(pb_acc) %>%
+  summarise(total_ptm_exons = sum(has_ptm), total_exons = n(),
+            total_ptms = sum(`Number of PTMs Affected`),
+            pct_exons_with_ptm = total_ptm_exons / total_exons * 100, .groups = "drop")
+ptm_metrics <- c("total_ptms", "pct_exons_with_ptm")
+
+ptm_table <- unified_for_analysis %>%
+  left_join(ptm_per_isoform %>% select(pb_acc, all_of(ptm_metrics)) %>%
+              rename_with(~ paste0("risk_", .x), all_of(ptm_metrics)), by = c("risk_pb" = "pb_acc")) %>%
+  left_join(ptm_per_isoform %>% select(pb_acc, all_of(ptm_metrics)) %>%
+              rename_with(~ paste0("nonrisk_", .x), all_of(ptm_metrics)), by = c("nonrisk_pb" = "pb_acc"))
+for (m in ptm_metrics) {
+  ptm_table[[paste0("delta_", m)]] <- ptm_table[[paste0("risk_", m)]] - ptm_table[[paste0("nonrisk_", m)]]
+}
+
+write_csv(ptm_table, res03("property_ptm_unified.csv"))
+for (m in ptm_metrics) {
+  stash_property(ptm_table, paste0("ptm_", m), paste0("risk_", m), paste0("nonrisk_", m), paste0("delta_", m))
+}
+```
+
+# 9. Subcellular localization (DeepLoc 2.0)
+
+Compartment probabilities enter the property table as continuous values; the
+categorical calls (localization, signal peptides, membrane type) are carried for the
+concordance checks of script 06.
+
+```{r prop_deeploc}
+deeploc <- read_csv(F_DEEPLOC_SMC, show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(Protein_ID, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc)) %>%
+  distinct(pb_acc, .keep_all = TRUE)
+dl_cat_cols  <- intersect(c("Localizations", "Signals", "Membrane types"), names(deeploc))
+dl_prob_cols <- intersect(c("Cytoplasm", "Nucleus", "Extracellular", "Cell membrane", "Mitochondrion",
+                            "Endoplasmic reticulum", "Golgi apparatus", "Lysosome/Vacuole", "Peroxisome"),
+                          names(deeploc))
+deeploc_select <- deeploc %>% select(pb_acc, all_of(c(dl_cat_cols, dl_prob_cols)))
+
+dl_table <- unified_for_analysis %>%
+  left_join(deeploc_select %>% rename_with(~ paste0("risk_", .x), all_of(c(dl_cat_cols, dl_prob_cols))),
+            by = c("risk_pb" = "pb_acc")) %>%
+  left_join(deeploc_select %>% rename_with(~ paste0("nonrisk_", .x), all_of(c(dl_cat_cols, dl_prob_cols))),
+            by = c("nonrisk_pb" = "pb_acc"))
+for (cc in dl_cat_cols) {
+  dl_table[[paste0(cc, "_same")]] <- dl_table[[paste0("risk_", cc)]] == dl_table[[paste0("nonrisk_", cc)]]
+}
+for (pc in dl_prob_cols) {
+  dl_table[[paste0("delta_", pc)]] <- dl_table[[paste0("risk_", pc)]] - dl_table[[paste0("nonrisk_", pc)]]
+}
+
+write_csv(dl_table, res03("property_deeploc_unified.csv"))
+for (pc in dl_prob_cols) {
+  stash_property(dl_table, paste0("deeploc_", gsub("[/ ]", "_", tolower(pc))),
+                 paste0("risk_", pc), paste0("nonrisk_", pc), paste0("delta_", pc))
+}
+```
+
+# 10. Pfam domains (hmmscan)
+
+```{r prop_pfam}
+domain_per_isoform <- hmm_df %>%
+  group_by(pb_acc = pb_id) %>%
+  summarise(n_domains = n(), n_unique_domains = n_distinct(domain_acc_clean),
+            domain_names = paste(unique(domain_name), collapse = ";"), .groups = "drop")
+
+# Isoforms without any hit have zero domains.
+all_pair_pbs <- unique(c(unified_for_analysis$risk_pb, unified_for_analysis$nonrisk_pb))
+all_pair_pbs <- all_pair_pbs[!is.na(all_pair_pbs)]
+domain_full <- tibble(pb_acc = all_pair_pbs) %>%
+  left_join(domain_per_isoform, by = "pb_acc") %>%
+  mutate(n_domains = replace_na(n_domains, 0), n_unique_domains = replace_na(n_unique_domains, 0),
+         has_domain = n_domains > 0)
+pfam_metrics <- c("n_domains", "n_unique_domains")
+
+pfam_table <- unified_for_analysis %>%
+  left_join(domain_full %>% select(pb_acc, all_of(pfam_metrics)) %>%
+              rename_with(~ paste0("risk_", .x), all_of(pfam_metrics)), by = c("risk_pb" = "pb_acc")) %>%
+  left_join(domain_full %>% select(pb_acc, all_of(pfam_metrics)) %>%
+              rename_with(~ paste0("nonrisk_", .x), all_of(pfam_metrics)), by = c("nonrisk_pb" = "pb_acc"))
+for (m in pfam_metrics) {
+  pfam_table[[paste0("delta_", m)]] <- pfam_table[[paste0("risk_", m)]] - pfam_table[[paste0("nonrisk_", m)]]
+}
+
+write_csv(pfam_table, res03("property_pfam_unified.csv"))
+for (m in pfam_metrics) {
+  stash_property(pfam_table, paste0("pfam_", m), paste0("risk_", m), paste0("nonrisk_", m), paste0("delta_", m))
+}
+```
+
+# 11. Overlap of the coding sequence with UniProt features
+
+For each isoform the fraction of its CDS (in genomic coordinates) that overlaps
+UniProt domains, disordered regions and secondary-structure elements is computed;
+the paired comparison at the junction level asks whether risk isoforms lose or gain
+annotated regions relative to their nonrisk partners.
+
+```{r prop_annotation_overlap}
+get_overlap_prop <- function(pb, ann_gr) {
+  cds <- cds_lookup[[pb]]
+  if (is.null(cds) || length(cds) == 0) return(NA_real_)
+  total_bp <- sum(width(cds))
+  if (total_bp == 0) return(NA_real_)
+  sum(width(GenomicRanges::intersect(cds, ann_gr, ignore.strand = TRUE))) / total_bp
+}
+calc_pair_overlap <- function(risk_pb, nonrisk_pb, ann_gr) {
+  tibble(risk_overlap = get_overlap_prop(risk_pb, ann_gr), nonrisk_overlap = get_overlap_prop(nonrisk_pb, ann_gr))
+}
+
+annot_specs <- list(list(gr = domain_gr,     name = "domain"),
+                    list(gr = disordered_gr, name = "disordered"),
+                    list(gr = secondary_gr,  name = "secondary"))
+for (a in annot_specs) {
+  pair_results <- unified_for_analysis %>%
+    rowwise() %>%
+    mutate(o = list(calc_pair_overlap(risk_pb, nonrisk_pb, a$gr))) %>%
+    unnest(o) %>%
+    ungroup() %>%
+    mutate(delta_overlap = risk_overlap - nonrisk_overlap, annotation = a$name,
+           risk_has = risk_overlap > 0, nonrisk_has = nonrisk_overlap > 0,
+           change = case_when(risk_has & !nonrisk_has ~ "Gained in Risk",
+                              !risk_has & nonrisk_has ~ "Lost in Risk",
+                              risk_has & nonrisk_has  ~ "Both Overlap",
+                              TRUE ~ "Neither"))
+  write_csv(pair_results, res03(sprintf("property_%s_unified.csv", a$name)))
+  stash_property(pair_results, paste0("annot_overlap_", a$name), "risk_overlap", "nonrisk_overlap", "delta_overlap")
+}
+```
+
+# 12. AlphaFold3 metrics
+
+Whole-isoform metrics (confidence, radius of gyration, surface charge, disorder and
+secondary-structure fractions, PTM exposure) are joined per side; pair-level metrics
+(TM-score, alignment identity and gap statistics between the two models) have no
+per-side value and enter as the pair value only; junction-region metrics are the
+same quantities restricted to the residues around the junction.
+
+```{r prop_af3}
+af3     <- read_csv(F_AF3_METRICS_PAIR, show_col_types = FALSE)
+af3_iso <- read_csv(F_AF3_METRICS_ISO,  show_col_types = FALSE)
+
+af3_base <- af3 %>% select(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb)
+af3_iso_metrics  <- c("mean_plddt", "radius_of_gyration", "surface_charge", "idr_fraction_pct",
+                      "pct_helix", "pct_sheet", "pct_loop", "ptm_pct_exposed", "ptm", "iptm", "mean_pae")
+af3_pair_metrics <- c("tm_score", "pct_identity", "aligned_length", "n_gap_openings",
+                      "total_gap_length", "query_coverage_pct", "length_ratio")
+af3_junc_metrics <- c("pct_helix", "pct_sheet", "surface_charge", "idr_pct", "mean_plddt")
+
+for (m in af3_iso_metrics) {
+  if (!m %in% names(af3_iso)) next
+  iso_lookup <- af3_iso %>% select(pb_acc, !!m)
+  unified_property_results[[paste0("af3_iso_", m)]] <- af3_base %>%
+    left_join(iso_lookup %>% dplyr::rename(risk_value    = !!m), by = c("risk_pb"    = "pb_acc")) %>%
+    left_join(iso_lookup %>% dplyr::rename(nonrisk_value = !!m), by = c("nonrisk_pb" = "pb_acc")) %>%
+    mutate(delta = risk_value - nonrisk_value, property = paste0("af3_iso_", m))
+}
+for (m in af3_pair_metrics) {
+  if (!m %in% names(af3)) next
+  unified_property_results[[paste0("af3_pair_", m)]] <- af3 %>%
+    transmute(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = NA_real_, nonrisk_value = NA_real_, delta = .data[[m]],
+              property = paste0("af3_pair_", m))
+}
+for (m in af3_junc_metrics) {
+  risk_col <- paste0("junc_risk_junc_", m); nonrisk_col <- paste0("junc_nonrisk_junc_", m)
+  if (!risk_col %in% names(af3) || !nonrisk_col %in% names(af3)) next
+  unified_property_results[[paste0("af3_junc_", m)]] <- af3 %>%
+    transmute(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = .data[[risk_col]], nonrisk_value = .data[[nonrisk_col]],
+              delta = .data[[risk_col]] - .data[[nonrisk_col]], property = paste0("af3_junc_", m))
+}
+```
+
+# 13. Properties of the junction region (±10 residues)
+
+Using the protein-space windows from script 02, each sequence-based property is
+recomputed for the 20-residue window around the junction on both isoforms of a pair.
+The window summaries use their own per-residue vectors (Kyte–Doolittle hydropathy,
+residue mass and side-chain charge), per-residue IUPred and NetSurfP-3 predictions,
+PTM-POSE site positions and Pfam domain coordinates.
+
+```{r prop_junction_region}
+aa_map <- read_csv(OUT_JUNCTION_AA_MAPPING, show_col_types = FALSE) %>%
+  filter(str_starts(status, "ok")) %>%
+  select(pb_acc, junction_key, aa_window_start, aa_window_end)
+
+get_window <- function(pb, jk) {
+  if (is.na(pb) || is.na(jk) || jk == "manual_apms") return(c(NA_integer_, NA_integer_))
+  hit <- aa_map %>% filter(pb_acc == pb, junction_key == jk)
+  if (nrow(hit) == 0) return(c(NA_integer_, NA_integer_))
+  c(hit$aa_window_start[1], hit$aa_window_end[1])
+}
+
+windows <- unified_for_analysis %>%
+  mutate(risk_window    = map2(risk_pb,    cad_sqtl_junction, get_window),
+         nonrisk_window = map2(nonrisk_pb, cad_sqtl_junction, get_window),
+         risk_ws    = map_int(risk_window,    ~ as.integer(.x[1])),
+         risk_we    = map_int(risk_window,    ~ as.integer(.x[2])),
+         nonrisk_ws = map_int(nonrisk_window, ~ as.integer(.x[1])),
+         nonrisk_we = map_int(nonrisk_window, ~ as.integer(.x[2]))) %>%
+  select(-risk_window, -nonrisk_window)
+
+stash_window <- function(prop_name, risk_vec, nonrisk_vec) {
+  unified_property_results[[prop_name]] <<- tibble(
+    gene_name = windows$gene_name, cad_sqtl_junction = windows$cad_sqtl_junction,
+    pair_type = windows$pair_type, risk_pb = windows$risk_pb, nonrisk_pb = windows$nonrisk_pb,
+    risk_value = risk_vec, nonrisk_value = nonrisk_vec, delta = risk_vec - nonrisk_vec,
+    property = prop_name)
+}
+
+# Per-residue vectors for the window summaries: Kyte-Doolittle hydropathy, residue
+# molecular weight (Da) and side-chain charge at neutral pH (His = +0.5).
+aa_hydro <- c(A=1.8, R=-4.5, N=-3.5, D=-3.5, C=2.5, Q=-3.5, E=-3.5, G=-0.4, H=-3.2, I=4.5, L=3.8,
+              K=-3.9, M=1.9, F=2.8, P=-1.6, S=-0.8, T=-0.7, W=-0.9, Y=-1.3, V=4.2, U=2.5, X=0)
+aa_mw <- c(A=89.1, R=174.2, N=132.1, D=133.1, C=121.2, Q=146.2, E=147.1, G=75.0, H=155.2, I=131.2,
+           L=131.2, K=146.2, M=149.2, F=165.2, P=115.1, S=105.1, T=119.1, W=204.2, Y=181.2, V=117.2,
+           U=121.2, X=128.2)
+aa_charge <- c(A=0, R=1, N=0, D=-1, C=0, Q=0, E=-1, G=0, H=0.5, I=0, L=0, K=1, M=0, F=0, P=0, S=0,
+               T=0, W=0, Y=0, V=0, U=0, X=0)
+
+prot_seq_lookup <- protein_lookup %>% select(pb_acc, protein_seq) %>% deframe()
+extract_window_seq <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(NA_character_)
+  full <- prot_seq_lookup[[pb]]
+  if (is.null(full) || is.na(full)) return(NA_character_)
+  ws <- max(1, ws); we <- min(nchar(full), we)
+  if (we < ws) return(NA_character_)
+  substr(full, ws, we)
+}
+
+windows <- windows %>%
+  mutate(risk_seq    = pmap_chr(list(risk_pb,    risk_ws,    risk_we),    extract_window_seq),
+         nonrisk_seq = pmap_chr(list(nonrisk_pb, nonrisk_ws, nonrisk_we), extract_window_seq),
+         risk_aa_hydro     = map_dbl(risk_seq,    ~ aa_mean_for_seq(.x, aa_hydro)),
+         nonrisk_aa_hydro  = map_dbl(nonrisk_seq, ~ aa_mean_for_seq(.x, aa_hydro)),
+         risk_aa_mw        = map_dbl(risk_seq,    ~ aa_mean_for_seq(.x, aa_mw)),
+         nonrisk_aa_mw     = map_dbl(nonrisk_seq, ~ aa_mean_for_seq(.x, aa_mw)),
+         risk_aa_charge    = map_dbl(risk_seq,    ~ aa_mean_for_seq(.x, aa_charge)),
+         nonrisk_aa_charge = map_dbl(nonrisk_seq, ~ aa_mean_for_seq(.x, aa_charge)))
+stash_window("aa_junc_hydro",  windows$risk_aa_hydro,  windows$nonrisk_aa_hydro)
+stash_window("aa_junc_mw",     windows$risk_aa_mw,     windows$nonrisk_aa_mw)
+stash_window("aa_junc_charge", windows$risk_aa_charge, windows$nonrisk_aa_charge)
+
+# IUPred per residue: percent of window residues with score > 0.5.
+iupred_dt <- fread(F_IUPRED_RESIDUES) %>% as_tibble() %>% filter(!is.na(iupred_score)) %>% as.data.table()
+setkey(iupred_dt, pb_id, position)
+idr_pct_in_window <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(NA_real_)
+  sub <- iupred_dt[pb_id == pb & position >= ws & position <= we]
+  if (nrow(sub) == 0) return(NA_real_)
+  100 * mean(sub$iupred_score > 0.5)
+}
+windows <- windows %>%
+  mutate(risk_idr_junc    = pmap_dbl(list(risk_pb,    risk_ws,    risk_we),    idr_pct_in_window),
+         nonrisk_idr_junc = pmap_dbl(list(nonrisk_pb, nonrisk_ws, nonrisk_we), idr_pct_in_window))
+stash_window("idr_junc_pct", windows$risk_idr_junc, windows$nonrisk_idr_junc)
+
+# NetSurfP-3 per residue: secondary structure (q3), RSA and disorder in the window.
+nsp_dt <- fread(F_NETSURFP_RESIDUES) %>% as_tibble() %>%
+  select(pb_id, position, rsa, q3, disorder) %>% as.data.table()
+setkey(nsp_dt, pb_id, position)
+nsp_window_metrics <- function(pb, ws, we) {
+  empty <- list(pct_helix = NA_real_, pct_sheet = NA_real_, pct_coil = NA_real_,
+                mean_rsa = NA_real_, mean_disorder = NA_real_)
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(empty)
+  sub <- nsp_dt[pb_id == pb & position >= ws & position <= we]
+  if (nrow(sub) == 0) return(empty)
+  list(pct_helix = 100 * mean(sub$q3 == "H", na.rm = TRUE),
+       pct_sheet = 100 * mean(sub$q3 == "E", na.rm = TRUE),
+       pct_coil  = 100 * mean(sub$q3 == "C", na.rm = TRUE),
+       mean_rsa  = mean(sub$rsa, na.rm = TRUE),
+       mean_disorder = mean(sub$disorder, na.rm = TRUE))
+}
+risk_nsp    <- pmap(list(windows$risk_pb,    windows$risk_ws,    windows$risk_we),    nsp_window_metrics)
+nonrisk_nsp <- pmap(list(windows$nonrisk_pb, windows$nonrisk_ws, windows$nonrisk_we), nsp_window_metrics)
+for (metric in c("pct_helix", "pct_sheet", "pct_coil", "mean_rsa", "mean_disorder")) {
+  stash_window(paste0("nsp_junc_", metric), map_dbl(risk_nsp, metric), map_dbl(nonrisk_nsp, metric))
+}
+
+# PTM sites in the window.
+ptm_dt <- fread(F_PTM_SUMMARY) %>% as_tibble() %>%
+  mutate(pb_id = str_extract(`Region ID`, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  rename(position = `PTM Position in Isoform`) %>%
+  filter(!is.na(pb_id), !is.na(position)) %>%
+  select(pb_id, position) %>% as.data.table()
+setkey(ptm_dt, pb_id, position)
+ptm_count_in_window <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(NA_integer_)
+  as.integer(nrow(ptm_dt[pb_id == pb & position >= ws & position <= we]))
+}
+windows <- windows %>%
+  mutate(risk_ptm_junc    = pmap_int(list(risk_pb,    risk_ws,    risk_we),    ptm_count_in_window),
+         nonrisk_ptm_junc = pmap_int(list(nonrisk_pb, nonrisk_ws, nonrisk_we), ptm_count_in_window))
+stash_window("ptm_junc_count", as.numeric(windows$risk_ptm_junc), as.numeric(windows$nonrisk_ptm_junc))
+
+# Pfam domains overlapping the window.
+hmm_dt <- as.data.table(hmm_df %>% select(pb_id, seq_from, seq_to))
+setkey(hmm_dt, pb_id)
+pfam_count_in_window <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(NA_integer_)
+  sub <- hmm_dt[pb_id == pb]
+  if (nrow(sub) == 0) return(0L)
+  as.integer(sum(sub$seq_from <= we & sub$seq_to >= ws))
+}
+windows <- windows %>%
+  mutate(risk_pfam_junc    = pmap_int(list(risk_pb,    risk_ws,    risk_we),    pfam_count_in_window),
+         nonrisk_pfam_junc = pmap_int(list(nonrisk_pb, nonrisk_ws, nonrisk_we), pfam_count_in_window))
+stash_window("pfam_junc_n_domains", as.numeric(windows$risk_pfam_junc), as.numeric(windows$nonrisk_pfam_junc))
+
+junc_table <- windows %>%
+  select(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb,
+         risk_ws, risk_we, nonrisk_ws, nonrisk_we,
+         starts_with("risk_aa_"), starts_with("nonrisk_aa_"),
+         risk_idr_junc, nonrisk_idr_junc, risk_ptm_junc, nonrisk_ptm_junc,
+         risk_pfam_junc, nonrisk_pfam_junc)
+write_csv(junc_table, res03("property_junction_region_properties.csv"))
+```
+
+# 14. Property tables
+
+All stashed properties are assembled into one long table, split into junction-region
+and whole-isoform properties, and pivoted to one row per pair with risk, nonrisk and
+difference columns for every property. The AlphaFold3 metrics are added a second time
+here directly from the metric files (the whole-isoform entries therefore appear both
+under the `af3_iso_` prefix from section 12 and under the `af3_` prefix); the pair
+and junction entries coincide and collapse to one. The two wide tables are the input
+of script 06.
+
+```{r property_tables}
+seq_long <- bind_rows(unified_property_results) %>% mutate(source = "sequence_based")
+
+af3_long_parts <- list()
+for (m in af3_iso_metrics) {
+  if (!m %in% names(af3_iso)) next
+  iso_lookup <- af3_iso %>% select(pb_acc, !!m)
+  af3_long_parts[[paste0("iso_", m)]] <- af3 %>%
+    select(gene_name, junction, pair_type, risk_pb, nonrisk_pb) %>%
+    dplyr::rename(cad_sqtl_junction = junction) %>%
+    left_join(iso_lookup %>% dplyr::rename(risk_value    = !!m), by = c("risk_pb"    = "pb_acc")) %>%
+    left_join(iso_lookup %>% dplyr::rename(nonrisk_value = !!m), by = c("nonrisk_pb" = "pb_acc")) %>%
+    mutate(delta = risk_value - nonrisk_value, property = paste0("af3_", m), source = "af3_whole_isoform")
+}
+for (m in af3_pair_metrics) {
+  if (!m %in% names(af3)) next
+  af3_long_parts[[paste0("pair_", m)]] <- af3 %>%
+    transmute(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = NA_real_, nonrisk_value = NA_real_, delta = .data[[m]],
+              property = paste0("af3_pair_", m), source = "af3_pair_level")
+}
+# The gap position class is categorical and is carried as its own column.
+if ("gap_position_class" %in% names(af3)) {
+  af3_long_parts[["pair_gap_class"]] <- af3 %>%
+    transmute(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = NA_real_, nonrisk_value = NA_real_, delta = NA_real_,
+              gap_position_class = gap_position_class,
+              property = "af3_pair_gap_position_class", source = "af3_pair_level_categorical")
+}
+for (m in af3_junc_metrics) {
+  risk_col <- paste0("junc_risk_junc_", m); nonrisk_col <- paste0("junc_nonrisk_junc_", m)
+  if (!risk_col %in% names(af3) || !nonrisk_col %in% names(af3)) next
+  af3_long_parts[[paste0("junc_", m)]] <- af3 %>%
+    transmute(gene_name, cad_sqtl_junction = junction, pair_type, risk_pb, nonrisk_pb,
+              risk_value = .data[[risk_col]], nonrisk_value = .data[[nonrisk_col]],
+              delta = .data[[risk_col]] - .data[[nonrisk_col]],
+              property = paste0("af3_junc_", m), source = "af3_junction_region")
+}
+af3_long <- bind_rows(af3_long_parts)
+
+mega_long <- bind_rows(seq_long, af3_long) %>% arrange(gene_name, pair_type, property)
+
+JUNCTION_LEVEL_PROPS <- c(
+  "af3_junc_pct_helix", "af3_junc_pct_sheet", "af3_junc_surface_charge",
+  "af3_junc_idr_pct", "af3_junc_mean_plddt",
+  "aa_hydropathy", "aa_polarity", "aa_volume", "aa_flexibility",
+  "aa_hydro", "aa_mw", "aa_charge", "idr_junc_pct",
+  "nsp_junc_pct_helix", "nsp_junc_pct_sheet", "nsp_junc_pct_coil",
+  "nsp_junc_mean_rsa", "nsp_junc_mean_disorder", "ptm_junc_count", "pfam_junc_n_domains"
+)
+mega_long_junction <- mega_long %>% filter(property %in% JUNCTION_LEVEL_PROPS)
+mega_long_isoform  <- mega_long %>% filter(!property %in% JUNCTION_LEVEL_PROPS)
+
+mega_wide_junction <- mega_long_junction %>%
+  filter(property != "af3_pair_gap_position_class") %>%
+  distinct(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb, property, .keep_all = TRUE) %>%
+  pivot_wider(id_cols = c(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb),
+              names_from = property, values_from = c(risk_value, nonrisk_value, delta),
+              names_glue = "{property}__{.value}")
+
+gap_class_wide <- mega_long_isoform %>%
+  filter(property == "af3_pair_gap_position_class") %>%
+  distinct(gene_name, pair_type, risk_pb, nonrisk_pb, gap_position_class) %>%
+  dplyr::rename(af3_pair_gap_position_class = gap_position_class)
+mega_wide_isoform <- mega_long_isoform %>%
+  filter(property != "af3_pair_gap_position_class") %>%
+  distinct(gene_name, pair_type, risk_pb, nonrisk_pb, property, .keep_all = TRUE) %>%
+  select(-cad_sqtl_junction, -any_of("gap_position_class")) %>%
+  pivot_wider(id_cols = c(gene_name, pair_type, risk_pb, nonrisk_pb),
+              names_from = property, values_from = c(risk_value, nonrisk_value, delta),
+              names_glue = "{property}__{.value}") %>%
+  left_join(gap_class_wide, by = c("gene_name", "pair_type", "risk_pb", "nonrisk_pb"))
+
+cat(sprintf("Junction-level table: %d pairs x %d columns; isoform-level table: %d pairs x %d columns\n",
+            nrow(mega_wide_junction), ncol(mega_wide_junction), nrow(mega_wide_isoform), ncol(mega_wide_isoform)))
+write_csv(mega_wide_junction, OUT_PROPERTY_JUNCTION_WIDE)
+write_csv(mega_wide_isoform,  OUT_PROPERTY_ISOFORM_WIDE)
+```
+
+# 15. Paired risk-versus-nonrisk statistics
+
+Each property is compared between the risk and nonrisk members of each pair by paired
+Wilcoxon signed-rank test, once on the junction-level set (strict pairs, one row per
+junction) and once on the isoform-level set (one row per distinct isoform pair), with
+BH correction within each level. These rows initialise Supplementary Table 15.
+
+```{r paired_stats}
+compute_stats <- function(data, value_col, level_flag_col, level_label, property_label) {
+  risk_col <- paste0("risk_", value_col); nr_col <- paste0("nonrisk_", value_col)
+  if (!risk_col %in% names(data) || !nr_col %in% names(data)) return(NULL)
+  flags_filtered <- flags %>% filter(.data[[level_flag_col]] == TRUE) %>% distinct(gene_name, risk_pb, nonrisk_pb)
+  d <- data %>%
+    semi_join(flags_filtered, by = c("gene_name", "risk_pb", "nonrisk_pb")) %>%
+    filter(!is.na(.data[[risk_col]]), !is.na(.data[[nr_col]]))
+  if (level_flag_col == "include_in_isoform_stats") d <- d %>% distinct(gene_name, risk_pb, nonrisk_pb, .keep_all = TRUE)
+  if (nrow(d) < 3) return(NULL)
+  wt <- tryCatch(wilcox.test(d[[risk_col]], d[[nr_col]], paired = TRUE), error = function(e) NULL)
+  p_val <- if (!is.null(wt)) wt$p.value else NA_real_
+  tibble(property = value_col, property_label = property_label, analysis_level = level_label,
+         n_pairs = nrow(d), median_risk = median(d[[risk_col]], na.rm = TRUE),
+         median_nonrisk = median(d[[nr_col]], na.rm = TRUE),
+         median_delta = median(d[[risk_col]] - d[[nr_col]], na.rm = TRUE),
+         wilcox_statistic = if (!is.null(wt)) unname(wt$statistic) else NA_real_,
+         wilcox_p = p_val, sig = sig_label(p_val))
+}
+
+PROP_SPECS <- list(
+  list(file = "property_length_diff_unified.csv", value_col = "aa_len",             label = "Protein length",                levels = "both"),
+  list(file = "property_aaindex_unified.csv",     value_col = "hydropathy",         label = "Mean hydropathy",               levels = "both"),
+  list(file = "property_aaindex_unified.csv",     value_col = "polarity",           label = "Mean polarity",                 levels = "both"),
+  list(file = "property_aaindex_unified.csv",     value_col = "volume",             label = "Mean volume",                   levels = "both"),
+  list(file = "property_aaindex_unified.csv",     value_col = "flexibility",        label = "Mean flexibility",              levels = "both"),
+  list(file = "property_idr_unified.csv",         value_col = "idr",                label = "Percent IDR",                   levels = "both"),
+  list(file = "property_netsurfp_unified.csv",    value_col = "pct_helix",          label = "Percent helix",                 levels = "both"),
+  list(file = "property_netsurfp_unified.csv",    value_col = "pct_sheet",          label = "Percent sheet",                 levels = "both"),
+  list(file = "property_netsurfp_unified.csv",    value_col = "pct_coil",           label = "Percent coil",                  levels = "both"),
+  list(file = "property_netsurfp_unified.csv",    value_col = "mean_rsa",           label = "Mean RSA",                      levels = "both"),
+  list(file = "property_netsurfp_unified.csv",    value_col = "mean_disorder",      label = "Mean disorder",                 levels = "both"),
+  list(file = "property_ptm_unified.csv",         value_col = "total_ptms",         label = "Total PTMs",                    levels = "both"),
+  list(file = "property_ptm_unified.csv",         value_col = "pct_exons_with_ptm", label = "Percent exons with PTM",        levels = "both"),
+  list(file = "property_deeploc_unified.csv",     value_col = "Cytoplasm",          label = "DeepLoc Cytoplasm probability", levels = "both"),
+  list(file = "property_deeploc_unified.csv",     value_col = "Nucleus",            label = "DeepLoc Nucleus probability",   levels = "both"),
+  list(file = "property_deeploc_unified.csv",     value_col = "Extracellular",      label = "DeepLoc Extracellular probability", levels = "both"),
+  list(file = "property_deeploc_unified.csv",     value_col = "Cell membrane",      label = "DeepLoc Cell membrane probability", levels = "both"),
+  list(file = "property_pfam_unified.csv",        value_col = "n_domains",          label = "Pfam domain count",             levels = "both"),
+  list(file = "property_pfam_unified.csv",        value_col = "n_unique_domains",   label = "Unique Pfam domains",           levels = "both"),
+  list(file = "property_domain_unified.csv",      value_col = "overlap",            label = "Domain CDS overlap",            levels = "junction"),
+  list(file = "property_disordered_unified.csv",  value_col = "overlap",            label = "Disordered CDS overlap",        levels = "junction"),
+  list(file = "property_secondary_unified.csv",   value_col = "overlap",            label = "Secondary structure CDS overlap", levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "aa_hydro",  label = "Junction-region hydrophobicity", levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "aa_mw",     label = "Junction-region molecular weight", levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "aa_charge", label = "Junction-region charge",        levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "idr_junc",  label = "Junction-region percent IDR",   levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "ptm_junc",  label = "Junction-region PTM count",     levels = "junction"),
+  list(file = "property_junction_region_properties.csv", value_col = "pfam_junc", label = "Junction-region Pfam count",    levels = "junction")
+)
+
+all_results <- list()
+for (spec in PROP_SPECS) {
+  d <- read_csv(res03(spec$file), show_col_types = FALSE)
+  levels_to_run <- switch(spec$levels,
+    "both"     = list(c("include_in_junction_stats", "Junction-Level"),
+                      c("include_in_isoform_stats",  "Isoform-Level")),
+    "junction" = list(c("include_in_junction_stats", "Junction-Level")))
+  for (lvl in levels_to_run) {
+    r <- compute_stats(d, spec$value_col, lvl[1], lvl[2], spec$label)
+    if (!is.null(r)) all_results[[length(all_results) + 1]] <- r
+  }
+}
+stats_df <- bind_rows(all_results) %>%
+  group_by(analysis_level) %>%
+  mutate(p_adj_bh = p.adjust(wilcox_p, method = "BH")) %>%
+  ungroup() %>%
+  arrange(analysis_level, wilcox_p)
+write_csv(stats_df, OUT_UNIFIED_STATS)
+
+master_new <- stats_df %>%
+  mutate(comparison = paste0("Risk vs NonRisk (", analysis_level, ")"),
+         analysis = property_label, metric = property,
+         group1 = "Risk isoform", group1_value = round(median_risk, 3), group1_n = n_pairs, group1_total = n_pairs,
+         group2 = "NonRisk isoform", group2_value = round(median_nonrisk, 3), group2_n = n_pairs, group2_total = n_pairs,
+         test = "Wilcoxon paired", statistic = round(wilcox_statistic, 2),
+         p_value = wilcox_p, p_adj = p_adj_bh, sig = sig)
+if (file.exists(OUT_PROPERTY_STATS_MASTER)) file.remove(OUT_PROPERTY_STATS_MASTER)
+append_master(master_new, "Risk vs NonRisk \\((Junction|Isoform)-Level\\)")
+cat("Paired comparisons written:", nrow(master_new), "\n")
+```
+
+# 16. CAD versus non-CAD, direction-matched
+
+Risk-associated and nonrisk-associated junctions change usage in opposite directions,
+so a fair background for each must share its direction of effect. One representative
+isoform is chosen per junction (the risk isoform of an existing pair where one exists,
+otherwise the highest-CPM isoform containing the junction), kept when the junction
+lies within that isoform's CDS, and compared between CAD and non-CAD junctions
+separately for junctions whose usage increases and decreases with the associated
+allele, by Wilcoxon rank-sum (continuous) or Fisher's exact test (binary) with BH
+correction within each level and direction.
+
+```{r direction_matched_reps}
+cad_dir_lookup <- cad_sqtls %>%
+  filter(!is.na(effect_direction)) %>%
+  distinct(junction_key, effect_direction) %>%
+  group_by(junction_key) %>%
+  mutate(n_directions = n_distinct(effect_direction)) %>%
+  ungroup() %>%
+  filter(n_directions == 1) %>%
+  distinct(junction_key, direction = effect_direction)
+
+gen_dir_lookup <- general_sqtls %>%
+  distinct(junction_key, slope) %>%
+  group_by(junction_key) %>%
+  summarise(slope = mean(slope), .groups = "drop") %>%
+  mutate(direction = ifelse(slope > 0, "Increased", "Decreased")) %>%
+  filter(!is.na(direction)) %>%
+  select(junction_key, direction)
+
+iso_lookup_from <- function(sqtl_tbl) {
+  sqtl_tbl %>%
+    filter(!is.na(smc_isoforms), smc_isoforms != "") %>%
+    select(junction_key, gene_name, smc_isoforms) %>%
+    distinct() %>%
+    mutate(pb_list = str_extract_all(smc_isoforms, "PB\\.[0-9]+\\.[0-9]+")) %>%
+    unnest(pb_list) %>%
+    distinct(junction_key, gene_name, pb_acc = pb_list)
+}
+cad_iso_lookup <- iso_lookup_from(cad_sqtls)
+gen_iso_lookup <- iso_lookup_from(general_sqtls)
+
+existing_reps <- flags_full %>%
+  filter(pair_type %in% c("strict", "salvaged"), cad_sqtl_junction != "manual_apms") %>%
+  select(junction_key = cad_sqtl_junction, rep_pb_existing = risk_pb) %>%
+  distinct(junction_key, .keep_all = TRUE)
+cpm_lookup <- sqanti_protein %>% select(pb_acc, CPM) %>% distinct(pb_acc, .keep_all = TRUE)
+
+pick_cad_rep <- function(jk) {
+  hit <- existing_reps %>% filter(junction_key == jk)
+  if (nrow(hit) > 0) return(list(rep_pb = hit$rep_pb_existing[1], rep_source = "existing_pair"))
+  pool <- cad_iso_lookup %>% filter(junction_key == jk) %>% inner_join(cpm_lookup, by = "pb_acc") %>% arrange(desc(CPM))
+  if (nrow(pool) > 0) return(list(rep_pb = pool$pb_acc[1], rep_source = "highest_cpm"))
+  list(rep_pb = NA_character_, rep_source = "no_isoforms")
+}
+pick_gen_rep <- function(jk) {
+  pool <- gen_iso_lookup %>% filter(junction_key == jk) %>% inner_join(cpm_lookup, by = "pb_acc") %>% arrange(desc(CPM))
+  if (nrow(pool) > 0) return(list(rep_pb = pool$pb_acc[1], rep_source = "highest_cpm"))
+  list(rep_pb = NA_character_, rep_source = "no_isoforms")
+}
+
+cad_reps <- cad_dir_lookup %>%
+  mutate(picks = map(junction_key, pick_cad_rep),
+         rep_pb = map_chr(picks, "rep_pb"), rep_source = map_chr(picks, "rep_source")) %>%
+  select(-picks) %>%
+  left_join(cad_iso_lookup %>% distinct(junction_key, gene_name), by = "junction_key") %>%
+  mutate(group = "CAD")
+gen_reps <- gen_dir_lookup %>%
+  mutate(picks = map(junction_key, pick_gen_rep),
+         rep_pb = map_chr(picks, "rep_pb"), rep_source = map_chr(picks, "rep_source")) %>%
+  select(-picks) %>%
+  left_join(gen_iso_lookup %>% distinct(junction_key, gene_name), by = "junction_key") %>%
+  mutate(group = "nonCAD")
+
+all_reps <- bind_rows(cad_reps, gen_reps) %>%
+  filter(!is.na(rep_pb)) %>%
+  mutate(junction_in_cds = map2_lgl(junction_key, rep_pb, junc_in_cds))
+cds_reps <- all_reps %>% filter(junction_in_cds == TRUE)
+cat("Representative isoforms:", nrow(all_reps), "; junction within CDS:", nrow(cds_reps), "\n")
+print(cds_reps %>% count(group))
+write_csv(all_reps %>% select(-junction_in_cds), OUT_DM_REPS_ALL)
+write_csv(cds_reps, OUT_DM_REPS_CDS)
+```
+
+```{r direction_matched_tests}
+# Whole-isoform AAindex means for every predicted protein.
+prot_aa <- prot_seqs_full %>%
+  mutate(mean_hydropathy  = map_dbl(sequence, ~ aa_mean_for_seq(.x, aa_vecs$hydropathy)),
+         mean_polarity    = map_dbl(sequence, ~ aa_mean_for_seq(.x, aa_vecs$polarity)),
+         mean_volume      = map_dbl(sequence, ~ aa_mean_for_seq(.x, aa_vecs$volume)),
+         mean_flexibility = map_dbl(sequence, ~ aa_mean_for_seq(.x, aa_vecs$flexibility))) %>%
+  select(pb_acc, mean_hydropathy, mean_polarity, mean_volume, mean_flexibility)
+aa_labels <- c(mean_hydropathy = "Mean hydropathy", mean_polarity = "Mean polarity",
+               mean_volume = "Mean volume", mean_flexibility = "Mean flexibility")
+
+idr <- read_csv(F_IUPRED_SUMMARY, show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(sequence_id, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_acc)) %>% distinct(pb_acc, .keep_all = TRUE) %>%
+  select(pb_acc, percent_idr, mean_disorder_score)
+idr_labels <- c(percent_idr = "Percent IDR", mean_disorder_score = "Mean disorder")
+
+dl_smc <- read_csv(F_DEEPLOC_SMC, show_col_types = FALSE) %>%
+  mutate(pb_id = str_extract(Protein_ID, "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id)) %>% distinct(pb_id, .keep_all = TRUE)
+loc_cols <- intersect(c("Cytoplasm", "Nucleus", "Extracellular", "Cell membrane", "Mitochondrion",
+                        "Endoplasmic reticulum", "Golgi apparatus", "Lysosome/Vacuole", "Peroxisome",
+                        "Plastid"), names(dl_smc))
+
+nsp_iso <- read_csv(F_NETSURFP_FEATURES, show_col_types = FALSE)
+nsp_pb_col <- intersect(c("pb_id", "pb_acc", "Protein_ID", "sequence_id"), names(nsp_iso))[1]
+stopifnot("no isoform identifier column in the NetSurfP-3 feature table" = !is.na(nsp_pb_col))
+nsp_iso <- nsp_iso %>%
+  mutate(pb_extract = str_extract(.data[[nsp_pb_col]], "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_extract)) %>% distinct(pb_extract, .keep_all = TRUE)
+nsp_iso_cols <- intersect(c("pct_helix", "pct_sheet", "pct_coil", "mean_rsa", "mean_disorder"), names(nsp_iso))
+
+annotation_tracks <- list("Protein Domain" = domain_gr, "Disordered Region" = disordered_gr,
+                          "Secondary Structure" = secondary_gr, "Topological Domain" = topological_gr)
+
+d_aa  <- cds_reps %>% left_join(prot_aa, by = c("rep_pb" = "pb_acc"))
+d_idr <- cds_reps %>% left_join(idr, by = c("rep_pb" = "pb_acc"))
+d_dl  <- cds_reps %>% left_join(dl_smc %>% select(pb_id, all_of(loc_cols)), by = c("rep_pb" = "pb_id"))
+d_nsp <- cds_reps %>% left_join(nsp_iso %>% select(pb_extract, all_of(nsp_iso_cols)), by = c("rep_pb" = "pb_extract"))
+cds_reps_anno <- cds_reps
+junc_gr_reps <- jk_to_gr(cds_reps$junction_key)
+for (annot_name in names(annotation_tracks)) {
+  col_name <- paste0("overlaps_", str_replace_all(tolower(annot_name), " ", "_"))
+  cds_reps_anno[[col_name]] <- countOverlaps(junc_gr_reps, annotation_tracks[[annot_name]], type = "any") > 0
+}
+
+dm_results <- list()
+for (dir in c("Increased", "Decreased")) {
+  for (m in names(aa_labels))  dm_results[[length(dm_results) + 1]] <- test_continuous(d_aa,  m,  aa_labels[m],  "isoform", dir)
+  for (m in names(idr_labels)) dm_results[[length(dm_results) + 1]] <- test_continuous(d_idr, m,  idr_labels[m], "isoform", dir)
+  for (lc in loc_cols)         dm_results[[length(dm_results) + 1]] <- test_continuous(d_dl,  lc, paste("DeepLoc", lc), "isoform", dir)
+  for (m in nsp_iso_cols)      dm_results[[length(dm_results) + 1]] <- test_continuous(d_nsp, m,  paste("NetSurfP3", m), "isoform", dir)
+  for (annot_name in names(annotation_tracks)) {
+    col_name <- paste0("overlaps_", str_replace_all(tolower(annot_name), " ", "_"))
+    dm_results[[length(dm_results) + 1]] <- test_binary(cds_reps_anno, col_name, annot_name, "junction", dir)
+  }
+}
+dm_results_df <- bind_rows(dm_results) %>%
+  group_by(level, direction) %>%
+  mutate(p_adj_bh = p.adjust(p_value, method = "BH")) %>%
+  ungroup() %>%
+  arrange(level, direction, p_value)
+write_csv(dm_results_df, OUT_DM_RESULTS)
+
+master_new <- dm_results_df %>%
+  mutate(comparison = sprintf("CAD vs nonCAD (%s, %s)", level, direction),
+         analysis = property_label, metric = property,
+         group1 = "CAD sQTL",
+         group1_value = if ("median_cad" %in% names(.)) round(median_cad, 3) else round(pct_cad, 1),
+         group1_n = n_cad, group1_total = n_cad,
+         group2 = "nonCAD sQTL",
+         group2_value = if ("median_noncad" %in% names(.)) round(median_noncad, 3) else round(pct_noncad, 1),
+         group2_n = n_noncad, group2_total = n_noncad,
+         test = test, statistic = round(statistic, 2), p_value = p_value, p_adj = p_adj_bh, sig = sig)
+append_master(master_new, "CAD vs nonCAD \\((isoform|junction), (Increased|Decreased)\\)")
+cat("Direction-matched tests:", nrow(dm_results_df), "\n")
+```
+
+# 17. Protein-space windows of the non-CAD junctions
+
+The ±10-residue window of each non-CAD junction in its representative isoform is
+derived from the CDS exon structure: the donor-side genomic position of the intron is
+located within the CDS exons in transcription order, converted to a codon index and
+expanded to the window, so that the non-CAD background can be compared with the CAD
+junctions at the same protein-space resolution.
+
+```{r noncad_aa_mapping}
+noncad_reps <- cds_reps %>%
+  filter(group == "nonCAD", !is.na(rep_pb)) %>%
+  select(gene_name, junction_key, rep_pb)
+
+map_junction_to_aa <- function(gene_name, junction_key, pb_acc) {
+  parts <- str_split(junction_key, ":", simplify = TRUE)
+  intron_start <- as.integer(parts[2]); intron_end <- as.integer(parts[3])
+  out <- tibble(gene_name = gene_name, junction_key = junction_key, pb_acc = pb_acc,
+                strand = NA_character_, intron_start = intron_start, intron_end = intron_end,
+                status = "no_cds", mrna_junction_pos = NA_integer_, aa_junction_pos = NA_integer_,
+                aa_window_start = NA_integer_, aa_window_end = NA_integer_,
+                aa_window_length = NA_integer_, aa_sequence = NA_character_)
+  if (!pb_acc %in% names(cds_lookup)) return(out)
+  cds_gr <- cds_lookup[[pb_acc]]
+  if (length(cds_gr) == 0) return(out)
+  pb_strand <- as.character(strand(cds_gr)[1])
+  out$strand <- pb_strand
+
+  # CDS exons in transcription order; the donor is the last exonic base before the intron.
+  cds_df <- as.data.frame(cds_gr)
+  cds_df <- if (pb_strand == "+") cds_df[order(cds_df$start), ] else cds_df[order(-cds_df$start), ]
+  donor_pos <- if (pb_strand == "+") intron_start - 1L else intron_end + 1L
+  cds_min <- min(cds_df$start); cds_max <- max(cds_df$end)
+  in_5utr <- if (pb_strand == "+") donor_pos < cds_min else donor_pos > cds_max
+  in_3utr <- if (pb_strand == "+") donor_pos > cds_max else donor_pos < cds_min
+  if (in_5utr) { out$status <- "junction_in_5utr"; return(out) }
+  if (in_3utr) { out$status <- "junction_in_3utr"; return(out) }
+
+  mrna_pos_cumul <- 0L; mrna_donor_pos <- NA_integer_
+  for (i in seq_len(nrow(cds_df))) {
+    ex_start <- cds_df$start[i]; ex_end <- cds_df$end[i]
+    if (donor_pos >= ex_start && donor_pos <= ex_end) {
+      mrna_donor_pos <- if (pb_strand == "+") mrna_pos_cumul + (donor_pos - ex_start + 1L)
+                        else mrna_pos_cumul + (ex_end - donor_pos + 1L)
+      break
+    }
+    mrna_pos_cumul <- mrna_pos_cumul + (ex_end - ex_start + 1L)
+  }
+  if (is.na(mrna_donor_pos)) { out$status <- "donor_not_in_cds"; return(out) }
+  out$mrna_junction_pos <- mrna_donor_pos
+
+  aa_pos <- ceiling(mrna_donor_pos / 3)
+  out$aa_junction_pos <- as.integer(aa_pos)
+  out$status <- if ((mrna_donor_pos %% 3) != 0) "ok;phase_ambiguous" else "ok"
+
+  seq_row <- protein_lookup %>% filter(pb_acc == !!pb_acc)
+  if (nrow(seq_row) == 0) { out$status <- paste0(out$status, ";no_protein_seq"); return(out) }
+  prot_seq <- seq_row$protein_seq[1]; prot_len <- nchar(prot_seq)
+  win_start <- max(1L, aa_pos - WINDOW_AA); win_end <- min(prot_len, aa_pos + WINDOW_AA)
+  out$aa_window_start  <- as.integer(win_start)
+  out$aa_window_end    <- as.integer(win_end)
+  out$aa_window_length <- as.integer(win_end - win_start + 1L)
+  out$aa_sequence      <- substr(prot_seq, win_start, win_end)
+  out
+}
+
+aa_map_noncad <- pmap_dfr(list(noncad_reps$gene_name, noncad_reps$junction_key, noncad_reps$rep_pb),
+                          map_junction_to_aa)
+print(aa_map_noncad %>% count(status))
+write_csv(aa_map_noncad, OUT_JUNCTION_AA_MAPPING_NONCAD)
+```
+
+# 18. CAD versus non-CAD, aggregate: whole isoform
+
+All CAD junctions are compared with all non-CAD junctions irrespective of direction,
+on the representative isoforms whose junction lies within the CDS (n = 103 and 2,672).
+NMD status is a majority vote across every isoform that contains the junction, because
+a single representative does not describe whether the junction usually produces an
+NMD-targeted transcript.
+
+```{r aggregate_isoform}
+agg_iso <- list()
+
+sqanti_nmd <- sqanti_protein %>%
+  select(pb_acc, is_nmd) %>% filter(!is.na(is_nmd)) %>%
+  distinct(pb_acc, .keep_all = TRUE) %>% mutate(is_nmd = as.logical(is_nmd))
+compute_majority_nmd <- function(junction_keys) {
+  smc_junc_isoform %>%
+    filter(junction_key %in% junction_keys) %>%
+    left_join(sqanti_nmd, by = c("pb_id" = "pb_acc")) %>%
+    filter(!is.na(is_nmd)) %>%
+    group_by(junction_key) %>%
+    summarise(n_isoforms = n(), n_nmd = sum(is_nmd), majority_nmd = (n_nmd / n_isoforms) > 0.5, .groups = "drop")
+}
+nmd_majority <- bind_rows(
+  compute_majority_nmd(cds_reps$junction_key[cds_reps$group == "CAD"])    %>% mutate(group = "CAD"),
+  compute_majority_nmd(cds_reps$junction_key[cds_reps$group == "nonCAD"]) %>% mutate(group = "nonCAD")
+) %>% mutate(group = factor(group, levels = c("CAD", "nonCAD")))
+agg_iso[[length(agg_iso) + 1]] <- test_binary(nmd_majority, "majority_nmd", "NMD status (majority vote)", "isoform")
+
+d_len <- cds_reps %>% left_join(prot_seqs_full %>% select(pb_acc, aa_length), by = c("rep_pb" = "pb_acc"))
+agg_iso[[length(agg_iso) + 1]] <- test_continuous(d_len, "aa_length", "Protein length", "isoform")
+for (m in names(aa_labels))  agg_iso[[length(agg_iso) + 1]] <- test_continuous(d_aa,  m,  aa_labels[m],  "isoform")
+for (m in names(idr_labels)) agg_iso[[length(agg_iso) + 1]] <- test_continuous(d_idr, m,  idr_labels[m], "isoform")
+for (m in nsp_iso_cols)      agg_iso[[length(agg_iso) + 1]] <- test_continuous(d_nsp, m,  paste("NetSurfP3", m), "isoform")
+for (lc in loc_cols)         agg_iso[[length(agg_iso) + 1]] <- test_continuous(d_dl,  lc, paste("DeepLoc", lc), "isoform")
+
+pfam_summary <- hmm_df %>%
+  group_by(pb_acc = pb_id) %>%
+  summarise(n_domains = n(), n_unique_domains = n_distinct(domain_name), .groups = "drop")
+d_pfam <- cds_reps %>%
+  left_join(pfam_summary, by = c("rep_pb" = "pb_acc")) %>%
+  mutate(n_domains = replace_na(n_domains, 0L), n_unique_domains = replace_na(n_unique_domains, 0L))
+for (m in c("n_domains", "n_unique_domains")) {
+  agg_iso[[length(agg_iso) + 1]] <- test_continuous(
+    d_pfam, m, c(n_domains = "Pfam domain count", n_unique_domains = "Unique Pfam domains")[m], "isoform")
+}
+
+agg_iso_df <- bind_rows(agg_iso) %>% mutate(p_adj_bh = p.adjust(p_value, method = "BH")) %>% arrange(p_value)
+write_csv(agg_iso_df, OUT_AGGREGATE_ISO)
+
+master_new <- agg_iso_df %>%
+  mutate(comparison = "CAD vs nonCAD (isoform, aggregate)", analysis = property_label, metric = property,
+         group1 = "CAD sQTL",
+         group1_value = if ("median_cad" %in% names(.)) round(median_cad, 3) else round(pct_cad, 1),
+         group1_n = n_cad, group1_total = n_cad,
+         group2 = "nonCAD sQTL",
+         group2_value = if ("median_noncad" %in% names(.)) round(median_noncad, 3) else round(pct_noncad, 1),
+         group2_n = n_noncad, group2_total = n_noncad,
+         test = test, statistic = round(statistic, 2), p_value = p_value, p_adj = p_adj_bh, sig = sig)
+append_master(master_new, "^CAD vs nonCAD \\(isoform, aggregate\\)$")
+```
+
+# 19. CAD versus non-CAD, aggregate: junction in genomic space
+
+Each junction is tested for overlap with UniProt features at its exact position and
+within ±30 bp (the comparison reported in Fig. 4f), for CDS overlap across all
+representatives, for topological-domain subtypes and for Pfam domain categories at the
+junction window; proportions are compared by Fisher's exact test with BH correction.
+
+```{r aggregate_junction}
+agg_jnc <- list()
+
+d_cds <- all_reps %>% filter(!is.na(junction_in_cds)) %>% mutate(group = factor(group, levels = c("CAD", "nonCAD")))
+agg_jnc[[length(agg_jnc) + 1]] <- test_binary(d_cds, "junction_in_cds", "CDS overlap", "junction")
+
+cds_reps_g <- cds_reps %>% mutate(group = factor(group, levels = c("CAD", "nonCAD")))
+junc_gr_all     <- jk_to_gr(cds_reps_g$junction_key)
+junc_gr_widened <- junc_gr_all + 30L
+for (annot_name in names(annotation_tracks)) {
+  col_name <- paste0("overlaps_", str_replace_all(tolower(annot_name), " ", "_"))
+  cds_reps_g[[col_name]] <- countOverlaps(junc_gr_all, annotation_tracks[[annot_name]], type = "any") > 0
+  agg_jnc[[length(agg_jnc) + 1]] <- test_binary(cds_reps_g, col_name, annot_name, "junction")
+}
+for (annot_name in names(annotation_tracks)) {
+  col_name <- paste0("overlaps_30bp_", str_replace_all(tolower(annot_name), " ", "_"))
+  cds_reps_g[[col_name]] <- countOverlaps(junc_gr_widened, annotation_tracks[[annot_name]], type = "any") > 0
+  agg_jnc[[length(agg_jnc) + 1]] <- test_binary(cds_reps_g, col_name, paste(annot_name, "(\u00b130bp)"), "junction")
+}
+
+# Topological-domain subtypes (UniProt "topological domain" names collapsed).
+collapse_topo <- function(name) {
+  case_when(name == "Cytoplasmic" ~ "Cytoplasmic",
+            name == "Extracellular" ~ "Extracellular",
+            str_detect(name, "^Lumenal") ~ "Lumenal",
+            str_detect(name, "Mitochondrial") ~ "Mitochondrial",
+            name == "Nuclear" | name == "Perinuclear space" ~ "Nuclear/Perinuclear",
+            name == "Vesicular" | name == "Exoplasmic loop" ~ "Vesicular/Exoplasmic",
+            TRUE ~ "Other")
+}
+topo_entries <- uniprot %>%
+  filter(category == "topological domain") %>%
+  mutate(topo_type = collapse_topo(name), start_1based = chromStart + 1, end_1based = chromEnd)
+for (tt in unique(topo_entries$topo_type[topo_entries$topo_type != "Other"])) {
+  tt_df <- topo_entries %>% filter(topo_type == tt)
+  if (nrow(tt_df) < 5) next
+  tt_gr <- makeGRangesFromDataFrame(tt_df, seqnames.field = "chrom", start.field = "start_1based",
+                                    end.field = "end_1based", keep.extra.columns = TRUE)
+  seqlevelsStyle(tt_gr) <- "UCSC"
+  tt_gr <- GenomicRanges::reduce(tt_gr)
+  col_name <- paste0("topo_", str_replace_all(tolower(tt), "[ /]", "_"))
+  cds_reps_g[[col_name]] <- countOverlaps(junc_gr_all, tt_gr, type = "any") > 0
+  agg_jnc[[length(agg_jnc) + 1]] <- test_binary(cds_reps_g, col_name, paste("Topological:", tt), "junction")
+}
+
+# Pfam domain categories (keyword classes of domain name and description) at the
+# junction window of the representative isoforms.
+classify_domain <- function(dname, desc) {
+  combined <- tolower(paste(dname, desc))
+  case_when(
+    str_detect(combined, "rrm|rna|rnp|helicase|dead|kh_|lsm|puf") ~ "RNA Binding/Processing",
+    str_detect(combined, "kinase|phosphatase|atpase|catalytic|protease|hydrolase|transferase|synthase") ~ "Catalytic/Enzymatic",
+    str_detect(combined, "wd40|tpr|ank|lrr|sh2|sh3|pdz|14-3-3|arm|heat|protein.?protein|coiled.?coil") ~ "Protein-Protein Interaction",
+    str_detect(combined, "membrane|transmem|7tm|gpcr|transport|vesic|clathrin|snare") ~ "Membrane/Vesicle Traffic",
+    str_detect(combined, "extracellular|integrin|cadherin|collagen|fibronectin|ecm|laminin|egf|fn3|ig_|cell.?adhes") ~ "Extracellular/Adhesion",
+    str_detect(combined, "cytoskelet|actin|myosin|tubulin|tropomyosin|filamin") ~ "Cytoskeleton",
+    str_detect(combined, "ubiquit|uba|ubc|proteasom|e3|sumo") ~ "Ubiquitin/Degradation",
+    str_detect(combined, "lipid|pleckstrin|ph_|c1_|c2_|start|acyl|sterol") ~ "Lipid Metabolism/Binding",
+    str_detect(combined, "ras|rho|rab|arf|ran|small.?gtp|gap|gef|signal") ~ "Signaling/Receptor",
+    str_detect(combined, "mitochond|cox|nadh|cytochrome") ~ "Mitochondrial",
+    TRUE ~ "Other")
+}
+hmm_domains <- hmm_df %>% mutate(unified_category = classify_domain(domain_name, description))
+
+# Windows of the representative isoforms, CAD from script 02 and non-CAD from section 17.
+window_cols <- function(df) {
+  df %>% filter(str_detect(status, "^ok"), !is.na(aa_window_start)) %>%
+    transmute(junction_key, pb_id = pb_acc, window_start_aa = aa_window_start, window_end_aa = aa_window_end)
+}
+aa_cad <- read_csv(OUT_JUNCTION_AA_MAPPING, show_col_types = FALSE) %>% window_cols() %>%
+  inner_join(cds_reps %>% filter(group == "CAD") %>% select(junction_key, rep_pb),
+             by = c("junction_key", "pb_id" = "rep_pb")) %>% mutate(group = "CAD")
+aa_noncad <- aa_map_noncad %>% window_cols() %>%
+  inner_join(cds_reps %>% filter(group == "nonCAD") %>% select(junction_key, rep_pb),
+             by = c("junction_key", "pb_id" = "rep_pb")) %>% mutate(group = "nonCAD")
+aa_combined <- bind_rows(aa_cad, aa_noncad)
+
+jnc_dom <- aa_combined %>%
+  inner_join(hmm_domains %>% select(pb_id, seq_from, seq_to, unified_category), by = "pb_id",
+             relationship = "many-to-many") %>%
+  filter(window_start_aa <= seq_to & window_end_aa >= seq_from, unified_category != "Other")
+cad_n_j <- n_distinct(aa_cad$junction_key)
+gen_n_j <- n_distinct(aa_noncad$junction_key)
+for (cat_name in unique(jnc_dom$unified_category)) {
+  cad_n <- jnc_dom %>% filter(group == "CAD",    unified_category == cat_name) %>% pull(junction_key) %>% n_distinct()
+  gen_n <- jnc_dom %>% filter(group == "nonCAD", unified_category == cat_name) %>% pull(junction_key) %>% n_distinct()
+  if ((cad_n + gen_n) < 5) next
+  ft <- tryCatch(fisher.test(matrix(c(cad_n, cad_n_j - cad_n, gen_n, gen_n_j - gen_n), nrow = 2, byrow = TRUE)),
+                 error = function(e) NULL)
+  if (is.null(ft)) next
+  agg_jnc[[length(agg_jnc) + 1]] <- tibble(
+    property = paste0("domcat_", str_replace_all(tolower(cat_name), "[ /]", "_")),
+    property_label = paste("Domain category:", cat_name), level = "junction",
+    n_cad = cad_n_j, n_noncad = gen_n_j,
+    pct_cad = round(100 * cad_n / cad_n_j, 1), pct_noncad = round(100 * gen_n / gen_n_j, 1),
+    test = "Fisher's exact", statistic = round(unname(ft$estimate), 2),
+    p_value = ft$p.value, sig = sig_label(ft$p.value))
+}
+
+agg_jnc_df <- bind_rows(agg_jnc) %>% mutate(p_adj_bh = p.adjust(p_value, method = "BH")) %>% arrange(p_value)
+write_csv(agg_jnc_df, OUT_AGGREGATE_JUNCTION)
+
+master_new <- agg_jnc_df %>%
+  mutate(comparison = "CAD vs nonCAD (junction, aggregate)", analysis = property_label, metric = property,
+         group1 = "CAD sQTL", group1_value = round(pct_cad, 1), group1_n = n_cad, group1_total = n_cad,
+         group2 = "nonCAD sQTL", group2_value = round(pct_noncad, 1), group2_n = n_noncad, group2_total = n_noncad,
+         test = test, statistic = round(statistic, 2), p_value = p_value, p_adj = p_adj_bh, sig = sig)
+append_master(master_new, "^CAD vs nonCAD \\(junction, aggregate\\)$")
+cat("Fig. 4f source rows (\u00b130 bp):\n")
+print(agg_jnc_df %>% filter(str_detect(property, "^overlaps_30bp")) %>%
+        select(property_label, n_cad, n_noncad, pct_cad, pct_noncad, p_value))
+```
+
+# 20. CAD versus non-CAD, aggregate: junction window (±10 residues)
+
+```{r aggregate_window}
+aa_cad_full <- read_csv(OUT_JUNCTION_AA_MAPPING, show_col_types = FALSE) %>%
+  filter(str_detect(status, "^ok"), !is.na(aa_window_start)) %>%
+  inner_join(cds_reps %>% filter(group == "CAD") %>% select(junction_key, rep_pb),
+             by = c("junction_key", "pb_acc" = "rep_pb")) %>% mutate(group = "CAD")
+aa_noncad_full <- aa_map_noncad %>%
+  filter(str_detect(status, "^ok"), !is.na(aa_window_start)) %>%
+  inner_join(cds_reps %>% filter(group == "nonCAD") %>% select(junction_key, rep_pb),
+             by = c("junction_key", "pb_acc" = "rep_pb")) %>% mutate(group = "nonCAD")
+aa_all <- bind_rows(aa_cad_full, aa_noncad_full) %>% mutate(group = factor(group, levels = c("CAD", "nonCAD")))
+cat("Windowed junctions: CAD", sum(aa_all$group == "CAD"), "; non-CAD", sum(aa_all$group == "nonCAD"), "\n")
+
+agg_win <- list()
+
+aa_all <- aa_all %>%
+  mutate(win_hydropathy  = map_dbl(aa_sequence, ~ aa_mean_for_seq(.x, aa_vecs$hydropathy)),
+         win_polarity    = map_dbl(aa_sequence, ~ aa_mean_for_seq(.x, aa_vecs$polarity)),
+         win_volume      = map_dbl(aa_sequence, ~ aa_mean_for_seq(.x, aa_vecs$volume)),
+         win_flexibility = map_dbl(aa_sequence, ~ aa_mean_for_seq(.x, aa_vecs$flexibility)))
+win_aa_labels <- c(win_hydropathy = "Junction window: hydropathy", win_polarity = "Junction window: polarity",
+                   win_volume = "Junction window: volume", win_flexibility = "Junction window: flexibility")
+for (m in names(win_aa_labels)) agg_win[[length(agg_win) + 1]] <- test_continuous(aa_all, m, win_aa_labels[m], "junction_aa10")
+
+# IUPred per window (the per-residue table is keyed by pb_id only here).
+iupred_res <- fread(F_IUPRED_RESIDUES)
+setkey(iupred_res, pb_id)
+compute_window_idr <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(c(NA_real_, NA_real_))
+  sub <- iupred_res[pb_id == pb & position >= ws & position <= we]
+  if (nrow(sub) == 0) return(c(NA_real_, NA_real_))
+  c(100 * mean(sub$iupred_score > 0.5, na.rm = TRUE), mean(sub$iupred_score, na.rm = TRUE))
+}
+idr_results <- pmap_dfr(list(aa_all$pb_acc, aa_all$aa_window_start, aa_all$aa_window_end),
+                        function(pb, ws, we) { v <- compute_window_idr(pb, ws, we); tibble(win_idr_pct = v[1], win_disorder = v[2]) })
+aa_all <- bind_cols(aa_all, idr_results)
+for (m in c("win_idr_pct", "win_disorder")) {
+  agg_win[[length(agg_win) + 1]] <- test_continuous(
+    aa_all, m, c(win_idr_pct = "Junction window: IDR %", win_disorder = "Junction window: disorder score")[m], "junction_aa10")
+}
+
+# NetSurfP-3 per window.
+nsp_res <- fread(F_NETSURFP_RESIDUES)
+setkey(nsp_res, pb_id)
+compute_window_nsp <- function(pb, ws, we) {
+  empty <- tibble(win_nsp_helix = NA_real_, win_nsp_sheet = NA_real_, win_nsp_coil = NA_real_,
+                  win_nsp_rsa = NA_real_, win_nsp_disorder = NA_real_)
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(empty)
+  sub <- nsp_res[pb_id == pb & position >= ws & position <= we]
+  if (nrow(sub) == 0) return(empty)
+  tibble(win_nsp_helix = 100 * mean(sub$q3 == "H", na.rm = TRUE),
+         win_nsp_sheet = 100 * mean(sub$q3 == "E", na.rm = TRUE),
+         win_nsp_coil  = 100 * mean(sub$q3 == "C", na.rm = TRUE),
+         win_nsp_rsa   = mean(sub$rsa, na.rm = TRUE),
+         win_nsp_disorder = 100 * mean(sub$disorder, na.rm = TRUE))
+}
+aa_all <- bind_cols(aa_all, pmap_dfr(list(aa_all$pb_acc, aa_all$aa_window_start, aa_all$aa_window_end), compute_window_nsp))
+win_nsp_labels <- c(win_nsp_helix = "Junction window: NSP % helix", win_nsp_sheet = "Junction window: NSP % sheet",
+                    win_nsp_coil = "Junction window: NSP % coil", win_nsp_rsa = "Junction window: NSP RSA",
+                    win_nsp_disorder = "Junction window: NSP disorder")
+for (m in names(win_nsp_labels)) agg_win[[length(agg_win) + 1]] <- test_continuous(aa_all, m, win_nsp_labels[m], "junction_aa10")
+
+# PTM sites per window.
+ptm_data <- read_tsv(F_PTM_SUMMARY, show_col_types = FALSE) %>%
+  mutate(pb_extract = str_extract(`Region ID`, "PB\\.[0-9]+\\.[0-9]+"), ptm_pos = `PTM Position in Isoform`) %>%
+  filter(!is.na(pb_extract), !is.na(ptm_pos))
+setDT(ptm_data); setkey(ptm_data, pb_extract)
+compute_window_ptm <- function(pb, ws, we) {
+  if (is.na(pb) || is.na(ws) || is.na(we)) return(0L)
+  sub <- ptm_data[pb_extract == pb]
+  if (nrow(sub) == 0) return(0L)
+  sum(sub$ptm_pos >= ws & sub$ptm_pos <= we, na.rm = TRUE)
+}
+aa_all$win_ptm_count <- pmap_int(list(aa_all$pb_acc, aa_all$aa_window_start, aa_all$aa_window_end),
+                                 function(pb, ws, we) as.integer(compute_window_ptm(pb, ws, we)))
+agg_win[[length(agg_win) + 1]] <- test_continuous(aa_all, "win_ptm_count", "Junction window: PTM count", "junction_aa10")
+
+# Pfam domains per window.
+hmm_win_dt <- as.data.table(hmm_df %>% select(pb_id, seq_from, seq_to))
+compute_window_pfam <- function(pb, ws, we) {
+  sum(hmm_win_dt[pb_id == pb, seq_from] <= we & hmm_win_dt[pb_id == pb, seq_to] >= ws, na.rm = TRUE)
+}
+aa_all$win_pfam_count <- pmap_int(list(aa_all$pb_acc, aa_all$aa_window_start, aa_all$aa_window_end),
+                                  function(pb, ws, we) {
+                                    if (is.na(pb) || is.na(ws) || is.na(we)) return(0L)
+                                    as.integer(compute_window_pfam(pb, ws, we))
+                                  })
+agg_win[[length(agg_win) + 1]] <- test_continuous(aa_all, "win_pfam_count", "Junction window: Pfam count", "junction_aa10")
+
+write_csv(aa_all, OUT_AA10_TABLE)
+agg_win_df <- bind_rows(agg_win) %>% mutate(p_adj_bh = p.adjust(p_value, method = "BH")) %>% arrange(p_value)
+write_csv(agg_win_df, OUT_AGGREGATE_AA10)
+
+master_new <- agg_win_df %>%
+  mutate(comparison = "CAD vs nonCAD (junction_aa10, aggregate)", analysis = property_label, metric = property,
+         group1 = "CAD sQTL", group1_value = round(median_cad, 3), group1_n = n_cad, group1_total = n_cad,
+         group2 = "nonCAD sQTL", group2_value = round(median_noncad, 3), group2_n = n_noncad, group2_total = n_noncad,
+         test = test, statistic = round(statistic, 2), p_value = p_value, p_adj = p_adj_bh, sig = sig)
+append_master(master_new, "^CAD vs nonCAD \\(junction_aa10, aggregate\\)$")
+```
+
+# 21. CAD versus non-CAD, sub-property classes
+
+The categorical components of the PTM and localization predictions are tested as
+binary presence/absence: each PTM class with at least 50 sites in the proteome, on the
+whole representative isoform and within the junction window; and DeepLoc compartment
+assignments, multi-compartment calls and membrane types on the whole isoform.
+
+```{r aggregate_subproperties}
+agg_sub <- list()
+
+ptm_class_data <- read_tsv(F_PTM_SUMMARY, show_col_types = FALSE) %>%
+  mutate(pb_acc = str_extract(`Region ID`, "PB\\.[0-9]+\\.[0-9]+"),
+         ptm_pos = `PTM Position in Isoform`, mod_class = `Modification Class`) %>%
+  filter(!is.na(pb_acc), !is.na(ptm_pos), !is.na(mod_class))
+top_ptm_classes <- ptm_class_data %>% count(mod_class) %>% filter(n >= 50) %>% pull(mod_class)
+
+for (ptm_class in top_ptm_classes) {
+  pbs_with_class <- ptm_class_data %>% filter(mod_class == ptm_class) %>% pull(pb_acc) %>% unique()
+  d <- cds_reps_g %>% mutate(has_class_ptm = rep_pb %in% pbs_with_class)
+  r <- test_binary(d, "has_class_ptm", paste("Whole-isoform has", ptm_class), "isoform")
+  if (!is.null(r)) {
+    r$property <- paste0("ptm_iso_has_", str_replace_all(tolower(ptm_class), "[ /-]", "_"))
+    agg_sub[[length(agg_sub) + 1]] <- r
+  }
+}
+
+setDT(ptm_class_data); setkey(ptm_class_data, pb_acc)
+for (ptm_class in top_ptm_classes) {
+  ptm_sub <- ptm_class_data[mod_class == ptm_class]
+  has_class_in_window <- function(pb, ws, we) {
+    if (is.na(pb) || is.na(ws) || is.na(we)) return(NA)
+    sub <- ptm_sub[pb_acc == pb]
+    if (nrow(sub) == 0) return(FALSE)
+    any(sub$ptm_pos >= ws & sub$ptm_pos <= we, na.rm = TRUE)
+  }
+  aa_with_flag <- aa_all %>%
+    mutate(has_class_ptm_window = pmap_lgl(list(pb_acc, aa_window_start, aa_window_end), has_class_in_window))
+  r <- test_binary(aa_with_flag, "has_class_ptm_window", paste("Junction window has", ptm_class), "junction_aa10")
+  if (!is.null(r)) {
+    r$property <- paste0("ptm_win_has_", str_replace_all(tolower(ptm_class), "[ /-]", "_"))
+    agg_sub[[length(agg_sub) + 1]] <- r
+  }
+}
+
+loc_components <- c("Cytoplasm", "Nucleus", "Extracellular", "Cell membrane", "Mitochondrion",
+                    "Endoplasmic reticulum", "Golgi apparatus", "Lysosome/Vacuole", "Peroxisome")
+d_loc <- cds_reps_g %>% left_join(dl_smc %>% select(pb_id, Localizations), by = c("rep_pb" = "pb_id"))
+for (lc in loc_components) {
+  col_name <- paste0("loc_assigned_", str_replace_all(tolower(lc), "[ /]", "_"))
+  d_loc[[col_name]] <- str_detect(replace_na(d_loc$Localizations, ""), fixed(lc))
+  agg_sub[[length(agg_sub) + 1]] <- test_binary(d_loc, col_name, paste("DeepLoc assigned:", lc), "isoform")
+}
+d_loc$is_multi_compartment <- str_count(replace_na(d_loc$Localizations, ""), "\\|") > 0
+agg_sub[[length(agg_sub) + 1]] <- test_binary(d_loc, "is_multi_compartment", "DeepLoc: multi-compartment", "isoform")
+
+if ("Membrane types" %in% names(dl_smc)) {
+  d_mem <- cds_reps_g %>% left_join(dl_smc %>% select(pb_id, `Membrane types`), by = c("rep_pb" = "pb_id"))
+  for (mt in c("Soluble", "Peripheral", "Transmembrane", "Lipid anchor")) {
+    col_name <- paste0("mem_", str_replace_all(tolower(mt), "[ /]", "_"))
+    d_mem[[col_name]] <- str_detect(replace_na(d_mem[["Membrane types"]], ""), fixed(mt))
+    agg_sub[[length(agg_sub) + 1]] <- test_binary(d_mem, col_name, paste("DeepLoc membrane:", mt), "isoform")
+  }
+}
+
+agg_sub_df <- bind_rows(agg_sub) %>%
+  group_by(level) %>% mutate(p_adj_bh = p.adjust(p_value, method = "BH")) %>% ungroup() %>%
+  arrange(p_value)
+write_csv(agg_sub_df, OUT_AGGREGATE_SUB)
+
+master_new <- agg_sub_df %>%
+  mutate(comparison = sprintf("CAD vs nonCAD (%s, subprop)", level), analysis = property_label, metric = property,
+         group1 = "CAD sQTL", group1_value = round(pct_cad, 1), group1_n = n_cad, group1_total = n_cad,
+         group2 = "nonCAD sQTL", group2_value = round(pct_noncad, 1), group2_n = n_noncad, group2_total = n_noncad,
+         test = test, statistic = round(statistic, 2), p_value = p_value, p_adj = p_adj_bh, sig = sig)
+append_master(master_new, "CAD vs nonCAD \\(.*, subprop\\)")
+
+master <- read_csv(OUT_PROPERTY_STATS_MASTER, show_col_types = FALSE)
+cat("Supplementary Table 15:", nrow(master), "rows in", n_distinct(master$comparison), "comparison classes\n")
+print(master %>% count(comparison))
+stopifnot("expected 11 comparison classes" = n_distinct(master$comparison) == 11)
+```
+
+# 22. Predicted NMD status per junction
+
+For every CAD and non-CAD junction, the fraction of long-read isoforms containing it
+that are flagged NMD by SQANTI Protein is summarised as a majority vote; these tables
+are compared and plotted in script 10 (Extended Data Fig. 5b) and annotate
+Supplementary Table 13.
+
+```{r nmd_majority_vote}
+sqanti_nmd_all <- sqanti_protein %>% select(pb_acc, is_nmd) %>% distinct()
+majority_vote <- function(keys) {
+  smc_junc_isoform %>%
+    filter(junction_key %in% keys) %>%
+    left_join(sqanti_nmd_all, by = c("pb_id" = "pb_acc")) %>%
+    filter(!is.na(is_nmd)) %>%
+    group_by(junction_key) %>%
+    summarise(n_isoforms = n(), n_nmd = sum(is_nmd == TRUE), majority_nmd = n_nmd / n_isoforms > 0.5, .groups = "drop")
+}
+cad_jnc_nmd    <- majority_vote(cad_junction_keys_all)
+noncad_jnc_nmd <- majority_vote(setdiff(general_junction_keys_all, cad_junction_keys_all))
+cat("CAD junctions with NMD majority:", sum(cad_jnc_nmd$majority_nmd), "of", nrow(cad_jnc_nmd),
+    "; non-CAD:", sum(noncad_jnc_nmd$majority_nmd), "of", nrow(noncad_jnc_nmd), "\n")
+write_csv(cad_jnc_nmd,    OUT_NMD_CAD_MAJORITY)
+write_csv(noncad_jnc_nmd, OUT_NMD_NONCAD_MAJORITY)
+```
+
+# 23. Named domain changes within pairs
+
+Pfam domain content is compared by name between the members of each of the 94
+computed pairs, over the whole protein and within ±10 residues of the junction, to
+list which domains the risk isoform gains or loses; this is the basis of the Results
+statement that domain content differed within 43 of 94 pairs.
+
+```{r domain_changes}
+pairs_sqtl <- flags_full %>%
+  filter(include_in_isoform_stats, pair_type != "manual_apms") %>%
+  distinct(gene_name, risk_pb, nonrisk_pb, .keep_all = TRUE)
+stopifnot("expected 94 computed pairs" = nrow(pairs_sqtl) == 94)
+
+dom_by_iso <- hmm_df %>%
+  distinct(pb_id, domain_acc_clean, domain_name) %>%
+  group_by(pb_id) %>%
+  summarise(doms = list(setNames(domain_name, domain_acc_clean)), .groups = "drop")
+
+domain_changes <- pairs_sqtl %>%
+  select(gene_name, cad_sqtl_junction, pair_type, risk_pb, nonrisk_pb) %>%
+  left_join(dom_by_iso %>% rename(risk_doms = doms),    by = c("risk_pb" = "pb_id")) %>%
+  left_join(dom_by_iso %>% rename(nonrisk_doms = doms), by = c("nonrisk_pb" = "pb_id")) %>%
+  rowwise() %>%
+  mutate(risk_doms    = list(if (is.null(risk_doms))    character(0) else risk_doms),
+         nonrisk_doms = list(if (is.null(nonrisk_doms)) character(0) else nonrisk_doms),
+         lost_in_risk   = paste(sort(unique(setdiff(nonrisk_doms, risk_doms))), collapse = "; "),
+         gained_in_risk = paste(sort(unique(setdiff(risk_doms, nonrisk_doms))), collapse = "; "),
+         shared_doms    = paste(sort(unique(intersect(risk_doms, nonrisk_doms))), collapse = "; "),
+         n_lost   = length(setdiff(nonrisk_doms, risk_doms)),
+         n_gained = length(setdiff(risk_doms, nonrisk_doms)),
+         change = case_when(n_gained > 0 & n_lost > 0 ~ "Both gain and loss",
+                            n_gained > 0 ~ "Risk gains domain",
+                            n_lost   > 0 ~ "Risk loses domain",
+                            TRUE ~ "Same domain content")) %>%
+  ungroup() %>%
+  select(-risk_doms, -nonrisk_doms) %>%
+  distinct(gene_name, risk_pb, nonrisk_pb, .keep_all = TRUE)
+
+print(count(domain_changes, change) %>% mutate(pct = round(100 * n / sum(n), 1)))
+write_csv(domain_changes, OUT_DOMAIN_CHANGES_NAMED)
+
+# Domains within WINDOW_AA residues of the junction in each isoform.
+jaa_ok <- read_csv(OUT_JUNCTION_AA_MAPPING, show_col_types = FALSE) %>% filter(str_starts(status, "ok"))
+doms_near <- function(pb, aa) {
+  if (is.na(pb) || is.na(aa)) return(character(0))
+  d <- hmm_df %>% filter(pb_id == pb, seq_from <= aa + WINDOW_AA, seq_to >= aa - WINDOW_AA)
+  unique(d$domain_name)
+}
+domain_changes_local <- pairs_sqtl %>%
+  select(gene_name, cad_sqtl_junction, risk_pb, nonrisk_pb) %>%
+  left_join(jaa_ok %>% select(junction_key, pb_acc, aa_junction_pos),
+            by = c("cad_sqtl_junction" = "junction_key", "risk_pb" = "pb_acc")) %>%
+  rename(aa_risk = aa_junction_pos) %>%
+  left_join(jaa_ok %>% select(junction_key, pb_acc, aa_junction_pos),
+            by = c("cad_sqtl_junction" = "junction_key", "nonrisk_pb" = "pb_acc")) %>%
+  rename(aa_nonrisk = aa_junction_pos) %>%
+  rowwise() %>%
+  mutate(risk_local    = list(doms_near(risk_pb,    aa_risk)),
+         nonrisk_local = list(doms_near(nonrisk_pb, aa_nonrisk)),
+         lost_at_junction   = paste(sort(setdiff(nonrisk_local, risk_local)), collapse = "; "),
+         gained_at_junction = paste(sort(setdiff(risk_local, nonrisk_local)), collapse = "; "),
+         shared_at_junction = paste(sort(intersect(risk_local, nonrisk_local)), collapse = "; "),
+         change_local = case_when(
+           is.na(aa_risk) & is.na(aa_nonrisk) ~ "Not mappable",
+           lost_at_junction != "" & gained_at_junction != "" ~ "Both gain and loss",
+           gained_at_junction != "" ~ "Risk gains domain",
+           lost_at_junction != "" ~ "Risk loses domain",
+           length(risk_local) + length(nonrisk_local) == 0 ~ "No domain at junction",
+           TRUE ~ "Same domain at junction")) %>%
+  ungroup() %>%
+  select(-risk_local, -nonrisk_local)
+
+print(count(domain_changes_local, change_local) %>% mutate(pct = round(100 * n / sum(n), 1)))
+write_csv(domain_changes_local, OUT_DOMAIN_CHANGES_LOCAL)
+```
+
+```{r session_info}
+sessionInfo()
+```

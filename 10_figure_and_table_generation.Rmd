@@ -1,0 +1,2652 @@
+---
+title: "Figure panels and Supplementary Tables for the CAD isoform manuscript"
+output: html_document
+---
+
+## Purpose
+
+This script turns the exported results of scripts 01–09 into the figure panels and
+Supplementary Tables of the manuscript. It performs no new analysis: every number it
+plots or tabulates is read from a results file written upstream, from a deposited
+experimental source-data workbook, or from the long-read catalog itself, so that
+re-knitting the figures can never silently change an analysis result. Figures are
+written as vector SVG and 400-dpi PNG at their final size, one file per panel and
+named for the panel it feeds, so that the published figure files and this script can
+be cross-checked by name. A single junction master table (one row per distinct CAD
+sQTL junction, n = 355) is assembled first because every Fig. 4 panel and
+Supplementary Table 13 report different facets of the same 355 junctions and must
+agree with one another.
+
+Panels not made here: schematics (Fig. 1a, 1f, 3a, 4b, 5a, 6p; illustration
+software), LocusCompare plots (Fig. 1c, 2a; LocusCompareR on the colocalization
+summary statistics, not part of this repository),
+genome-browser tracks (Fig. 1e, 2c, 2f, 4i, 4k, 6a, 6f, 6k; Extended Data Fig. 1b,
+2d, 2f, 2h, 4b, 4d, 6a, 6c, 6e, 6g; `05_peptide_evidence_and_browser_panels.Rmd`),
+AlphaFold3 models (ChimeraX), gel images, interaction networks (Fig. 5e, 5g, 5h;
+Extended Data Fig. 7; Cytoscape from the script 07/08 exports) and microscopy images.
+
+## Manuscript outputs produced
+
+- Fig. 1b, 1d, 1g; Fig. 2b, 2d, 2e, 2g (bottom), 2h, 2i, 2j, 2k; Fig. 3b–f;
+  Fig. 4a, 4c–h (and the counts for the 4b schematic); Fig. 5b–d, 5f;
+  Fig. 6b, 6c, 6g, 6h, 6l, 6m, 6r, 6s, 6t.
+- Extended Data Fig. 1a, 1c, 1d, 1e, 1f; 2a–c, 2e, 2g, 2i (bottom); 3a–h; 4a;
+  5a–d; 7a; 8d, 8e, 8g.
+- Supplementary Tables 8, 10–20 (S15 is copied from script 03 so the complete set is
+  assembled in one place).
+- Numbers quoted in Results for the long-read catalog (Fig. 3) and for the junction
+  → isoform mapping (Fig. 4).
+
+## Inputs
+
+- Script 01: `OUT_LFC_INTEGRATED` (integrated CAD sQTL junction table),
+  `OUT_VARIANT_VEP_SPLICEAI` (variant-level VEP/SpliceAI annotation).
+- Script 02: `OUT_JUNCTION_ISOFORM_MAP`, `OUT_CAD_JUNCTION_CODING`.
+- Script 03: `OUT_AGGREGATE_JUNCTION`, `OUT_NMD_CAD_MAJORITY`,
+  `OUT_NMD_NONCAD_MAJORITY`, `OUT_PROPERTY_STATS_MASTER`.
+- Script 04: `OUT_PROTEIN_EFFECTS`, `OUT_AS_DISTRIBUTION`, `OUT_AS_CONSENSUS`.
+- Script 05: `OUT_JUNCTION_VALIDATION`, `OUT_JUNCTION_EXCLUSIVE_PEPS`,
+  `OUT_JUNCTION_NOT_USABLE`, `OUT_PEPTIDE_EVIDENCE_DETAIL`,
+  `OUT_INTERESTING_ISOFORMS`, `OUT_PEPTIDE_SUPP_TABLE`.
+- Script 06: `OUT_PAIR_GROUPINGS`, `OUT_PAIR_DOMINANT_MODE`,
+  `OUT_PAIR_SIGNATURES_LONG`, `OUT_PROPERTY_AXIS_ORDER`, `OUT_PAIR_SIMILARITY`,
+  `OUT_APMS_PAIR_SIGNATURES`, `OUT_APMS_BAIT_PAIRS`.
+- Script 07: `OUT_MASTER_NETWORK_ANNOT`, `OUT_PREY_VSMC_SUPPORT`.
+- Script 08: the per-bait `<BAIT>_pathway_details.csv` files in `D_GO_PAIR_TABLES`.
+- Colocalization and sQTL source data: `F_COLOC_NOVEL_ONLY`, `F_SQTL_PSI_LONG`,
+  `F_SQTL_SNP_JUNCTION`, `F_RAB5C_MST1_PSI`.
+- Long-read catalog: `F_SQANTI3_CLASS`, `F_SQANTI_PROTEIN_TSV`, `F_SQANTI_PROTEIN_CPM`,
+  `F_MAPPED_FL_COUNTS`, `F_DEMUX_SAMPLE_COUNTS`, `F_BEST_ORF_CPM`; reference
+  `F_GENCODE_V38_GTF`.
+- AP-MS: `F_SRP54_SPECTRAL`, `F_SAINT_SET`, `F_APMS_BAIT_PAIRS`, `F_APMS_BAIT_FASTA`.
+- Experimental source data: `F_GEL_DENSITOMETRY`, `F_PARP12_OE_DATA`,
+  `F_PARP12_DESEQ2`, `F_ITGA1_SPHEROID_IMAGING`, `F_ITGA1_SPHEROID_MECH`.
+
+## Outputs
+
+- `FIG_DIR/<panel>.svg` and `.png` for every panel listed above.
+- `TABLE_DIR/*.csv` — the plotted values behind each panel (source data).
+- `SUPP_DIR/TableS<nn>_*.csv` (and `TableS10_SQANTI_classifications.xlsx`) plus
+  `TABLE_MANIFEST.csv`.
+
+## Run order
+
+Scripts 01–09 must have been run; this script reads only their exports.
+
+# 0. Setup
+
+## 0.1 Libraries, local constants and helpers
+
+The palette, `theme_cell()`, `save_fig()`, `save_grid()`, `sz()`, `display_gene()` and
+`sig_label()` come from `config.R`. Helpers that exist only for this script (a
+legend-on-top theme variant, a markdown *P*-value formatter and the dplyr namespace
+guard needed after GenomicRanges is attached) are defined here.
+
+```{r setup, message=FALSE, warning=FALSE}
+source("config.R")
+library(tidyverse)
+library(ggrepel)
+library(svglite)
+library(ggtext)
+library(scales)
+library(readxl)
+library(patchwork)
+library(eulerr)
+library(writexl)
+ensure_dir(FIG_DIR, TABLE_DIR, SUPP_DIR)
+
+# Lighter risk/nonrisk fills are used for bars and heatmaps in the figure panels.
+COL_PANEL <- list(risk = COL_FIG$risk, nonrisk = COL_FIG$nonrisk, cad = COL$cad,
+                  noncad = COL$noncad, novel = COL$novel, annotated = COL$annotated,
+                  replicated = COL$annotated, neutral = COL$light)
+GREEN <- c(darkest = "#3F5A4B", dark = "#557060", base = "#6E8B7B", mid = "#96AC9E", light = "#C2D0C7")
+GREY  <- c(dark = "#7A7A7A", mid = "#A8A8A8", light = "#D4D4D4")
+TEAL  <- GREEN[["base"]]
+DOSAGE_COL <- c("Risk/Risk" = "#E87EA1", "Het" = "#8E6FBF", "Nonrisk/Nonrisk" = "#7FC4E8")
+SPEC_LV  <- c("risk-specific", "shared", "nonrisk-specific")
+SPEC_LAB <- c("Risk-specific", "Shared", "Nonrisk-specific")
+SPEC_COL <- c("risk-specific" = COL_PANEL$risk, "shared" = GREY[["mid"]], "nonrisk-specific" = COL_PANEL$nonrisk)
+cat_novel <- c("novel_in_catalog", "novel_not_in_catalog")
+cat_known <- c("full-splice_match", "incomplete-splice_match")
+
+# Variant of theme_cell() for the stacked bars of Extended Data Fig. 5a/b (legend on top).
+s5_theme <- function(base = BASE_SIZE) {
+  theme_cell(base) +
+    theme(legend.position = "top",
+          legend.key.size = unit(3.2, "mm"),
+          legend.text  = element_text(size = base - 0.5),
+          legend.title = element_text(size = base - 0.5),
+          plot.title    = element_text(size = base + 0.5),
+          plot.subtitle = ggtext::element_markdown(size = base - 0.5, colour = "grey25"),
+          plot.margin   = margin(6, 6, 4, 4))
+}
+
+# Significance stars: star() leaves NA blank, star_p() reports NA as "ns".
+star   <- function(p) sig_label(p)
+star_p <- function(p) ifelse(is.na(p), "ns", sig_label(p))
+wilcox_p <- function(x, g) tryCatch(wilcox.test(x ~ g)$p.value, error = function(e) NA_real_)
+fisher_p <- function(b, g) tryCatch(fisher.test(table(g, b))$p.value, error = function(e) NA_real_)
+fmt_p_md <- function(p) {                 # HTML P-value formatter for ggtext subtitles
+  if (is.na(p))    return("<i>P</i> = NA")
+  if (p < 2.2e-16) return("<i>P</i> < 2.2 × 10<sup>−16</sup>")
+  if (p >= 1e-3)   return(sprintf("<i>P</i> = %s", formatC(p, format = "g", digits = 2)))
+  e <- floor(log10(p)); m <- p / 10^e
+  sprintf("<i>P</i> = %.1f × 10<sup>%s</sup>", m, sub("-", "−", e))
+}
+
+# GenomicRanges/IRanges/S4Vectors (attached for Fig. 4a) mask several dplyr verbs;
+# bind_dplyr() is called after they are attached so that later chunks see dplyr.
+bind_dplyr <- function() {
+  for (f in c("filter", "select", "slice", "count", "rename", "mutate", "arrange", "summarise",
+              "distinct", "first", "desc", "slice_max", "slice_min", "recode"))
+    assign(f, getExportedValue("dplyr", f), envir = globalenv())
+  assign("reduce", purrr::reduce, envir = globalenv())
+  invisible(NULL)
+}
+bind_dplyr()
+```
+
+## 0.2 Shared inputs
+
+Objects used by more than one figure are loaded once so that the script knits from a
+fresh session. Large inputs used by a single figure (the SQANTI3 catalog, the GTF, the
+AP-MS network) are read in the section that uses them.
+
+```{r inputs, message=FALSE, warning=FALSE}
+require_files(OUT_INTERESTING_ISOFORMS, F_SQANTI3_CLASS, F_SQANTI_PROTEIN_TSV, OUT_LFC_INTEGRATED,
+              OUT_PAIR_GROUPINGS, OUT_PAIR_DOMINANT_MODE, OUT_PEPTIDE_EVIDENCE_DETAIL)
+
+cand   <- read_csv(OUT_INTERESTING_ISOFORMS,    show_col_types = FALSE)  # peptide-supported isoforms with notable features
+detail <- read_csv(OUT_PEPTIDE_EVIDENCE_DETAIL, show_col_types = FALSE)  # per-peptide risk/nonrisk/shared classification
+prot   <- read_tsv(F_SQANTI_PROTEIN_TSV,        show_col_types = FALSE)  # SQANTI Protein classification
+lfc_m  <- read_tsv(OUT_LFC_INTEGRATED,          show_col_types = FALSE)  # integrated CAD sQTL table (355 junctions)
+
+# Risk/nonrisk isoform pairs: 94 sQTL-derived pairs plus the manual AP-MS pairs.
+pairs <- read_csv(OUT_PAIR_GROUPINGS, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  mutate(risk_pb    = str_extract(risk_pb,    "PB\\.[0-9]+\\.[0-9]+"),
+         nonrisk_pb = str_extract(nonrisk_pb, "PB\\.[0-9]+\\.[0-9]+"))
+pair_modes <- read_csv(OUT_PAIR_DOMINANT_MODE, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  filter(pair_type != "manual_apms")
+stopifnot("expected 94 sQTL-derived pairs" = nrow(pair_modes) == 94)
+```
+
+## 0.3 Junction master table (n = 355)
+
+One row per distinct CAD sQTL junction, combining annotation status (script 01),
+long-read capture and coding class (script 02), the dominant predicted protein effect
+(script 04) and peptide evidence (script 05). Every Fig. 4 panel reads from this
+object, and it is exported as the basis of Supplementary Table 13.
+
+```{r junction_master, message=FALSE, warning=FALSE}
+require_files(OUT_JUNCTION_ISOFORM_MAP, OUT_CAD_JUNCTION_CODING, OUT_JUNCTION_VALIDATION,
+              OUT_JUNCTION_EXCLUSIVE_PEPS, OUT_JUNCTION_NOT_USABLE, OUT_PROTEIN_EFFECTS)
+
+gj_keys   <- lfc_m %>%
+  filter(str_detect(effect_direction, regex("increas|decreas", ignore_case = TRUE))) %>%
+  pull(junction_key) %>% unique()
+lr_keys   <- unique(read_csv(OUT_JUNCTION_ISOFORM_MAP, show_col_types = FALSE)$junction_key)
+cds_class <- read_csv(OUT_CAD_JUNCTION_CODING,    show_col_types = FALSE)
+jv        <- read_csv(OUT_JUNCTION_VALIDATION,    show_col_types = FALSE)
+excl      <- read_csv(OUT_JUNCTION_EXCLUSIVE_PEPS, show_col_types = FALSE)
+not_usable <- read_csv(OUT_JUNCTION_NOT_USABLE,   show_col_types = FALSE) %>%
+  select(junction_key, not_usable_reason)
+# "Probeable" junctions fall within the CDS of at least one long-read isoform.
+cds_keys  <- cds_class$junction_key[cds_class$coding_class == "CDS (at least partial)"]
+
+# One dominant predicted protein effect per junction. A junction that belongs to more
+# than one cluster can carry more than one call; the priority order below resolves it.
+# NMD is a consequence of the resulting transcript rather than a splice class, so it is
+# reported separately (Extended Data Fig. 5b, Table S13) and is not in this list.
+EFFECT_PRIORITY <- c("ES / inclusion in ORF", "Alt splice site in ORF", "AFE/ALE in ORF",
+                     "Complex / other", "Non-coding splice event")
+pj_full <- read_csv(OUT_PROTEIN_EFFECTS, show_col_types = FALSE)
+rk_of   <- function(x) { m <- match(tolower(x), tolower(EFFECT_PRIORITY))
+                         ifelse(is.na(m), length(EFFECT_PRIORITY) + 1L, m) }
+dom <- pj_full %>%
+  transmute(jid = cad_sqtl_junction, effect = trimws(as.character(protein_effect))) %>%
+  filter(!is.na(effect), effect != "") %>%
+  mutate(rk = rk_of(effect)) %>%
+  arrange(jid, rk) %>% group_by(jid) %>% filter(row_number() == 1) %>% ungroup() %>%
+  select(junction_key = jid, protein_effect = effect)
+write_excel_csv(dom, file.path(TABLE_DIR, "protein_effect_per_junction.csv"))
+
+junction_master <- lfc_m %>%
+  group_by(junction_key) %>%
+  summarise(
+    gene_name        = paste(sort(unique(gene_name)), collapse = ";"),
+    clusters         = paste(sort(unique(cluster)), collapse = ";"),
+    n_clusters       = dplyr::n_distinct(cluster),
+    lead_snps        = paste(sort(unique(SNP_ID)), collapse = ";"),
+    conditions       = paste(sort(unique(Condition)), collapse = ";"),
+    effect_direction = paste(sort(unique(effect_direction)), collapse = ";"),
+    in_lr            = any(!is.na(smc_isoforms)         & smc_isoforms != ""),
+    in_gencode       = any(!is.na(gencode_v38_isoforms) & gencode_v38_isoforms != ""),
+    .groups = "drop") %>%
+  mutate(
+    lr_captured = junction_key %in% lr_keys,
+    probeable   = junction_key %in% cds_keys,
+    annotation_status = case_when(
+      in_lr &  in_gencode ~ "GENCODE v38 + long-read",
+      !in_lr & in_gencode ~ "GENCODE v38 only",
+      in_lr & !in_gencode ~ "Long-read only",
+      TRUE                ~ "Neither")) %>%
+  left_join(cds_class %>% distinct(junction_key, coding_class), by = "junction_key") %>%
+  left_join(dom, by = "junction_key") %>%
+  left_join(jv %>% select(junction_key, n_risk, n_nonrisk, n_shared, validated, side),
+            by = "junction_key") %>%
+  left_join(excl %>% select(junction_key,
+                            n_risk_peptides_possible    = n_R_possible,
+                            n_nonrisk_peptides_possible = n_N_possible,
+                            risk_peptide_status         = risk_status,
+                            nonrisk_peptide_status      = nonrisk_status),
+            by = "junction_key") %>%
+  left_join(not_usable, by = "junction_key") %>%
+  mutate(usable    = junction_key %in% jv$junction_key,
+         validated = replace_na(validated, FALSE),
+         side      = replace_na(side, "not evaluable"),
+         across(c(n_risk, n_nonrisk, n_shared), ~ replace_na(.x, 0L)),
+         not_usable_reason = case_when(
+           usable                     ~ NA_character_,
+           !is.na(not_usable_reason)  ~ not_usable_reason,
+           !junction_key %in% gj_keys ~ "no direction call",
+           TRUE                       ~ "not evaluated")) %>%
+  relocate(junction_key, gene_name, n_clusters, effect_direction,
+           annotation_status, coding_class, lr_captured, probeable,
+           usable, validated, side, not_usable_reason, protein_effect)
+
+# The counts the manuscript relies on: 355 junctions, 146 captured in long-read
+# transcripts, 133 within a CDS (probeable).
+stopifnot(
+  "not 355 distinct junctions" = nrow(junction_master) == 355,
+  "probeable count changed"    = sum(junction_master$probeable)   == 133,
+  "LR-captured count changed"  = sum(junction_master$lr_captured) == 146)
+cat(sprintf("junctions %d | LR-captured %d | probeable %d | usable %d | validated %d\n",
+            nrow(junction_master), sum(junction_master$lr_captured),
+            sum(junction_master$probeable), sum(junction_master$usable),
+            sum(junction_master$validated)))
+write_excel_csv(junction_master, file.path(TABLE_DIR, "SuppTable_junction_master.csv"))
+```
+
+
+# Figure 1 — CAD GWAS colocalization
+
+## 1b — colocalization PPH4 along the genome
+
+The unit is the colocalized junction; x is chromosomal order (not to scale) and y is
+PPH4. A junction colocalized in both VSMC phenotypes is drawn as a barbell linking the
+quiescent (square) and proliferative (triangle) points. Orange marks colocalizations
+not reported previously; sGenes with PPH4 > 0.9 are labelled, one label per gene.
+
+```{r fig1b_coloc, message=FALSE, warning=FALSE}
+PANEL_W <- 7.5; PANEL_H <- 2.8
+LABEL_PPH4_MIN     <- 0.9
+LABEL_ONE_PER_GENE <- TRUE
+Y_FLOOR            <- 0.70
+
+require_files(F_COLOC_NOVEL_ONLY)
+coloc <- read_csv(F_COLOC_NOVEL_ONLY, show_col_types = FALSE) %>%
+  mutate(PPH4 = suppressWarnings(as.numeric(PPH4)),
+         Condition = case_when(
+           grepl("quiesc", Condition, ignore.case = TRUE) ~ "Quiescent",
+           grepl("prolif", Condition, ignore.case = TRUE) ~ "Proliferative",
+           TRUE ~ str_to_title(str_trim(Condition))),
+         junction = str_extract(cluster_id, "^[^:]+:[0-9]+:[0-9]+"))
+
+nov_col <- names(coloc)[grepl("novel|replicat|status", names(coloc), ignore.case = TRUE)]
+coloc$novelty <- if (length(nov_col))
+  ifelse(grepl("replicat", coloc[[nov_col[1]]], ignore.case = TRUE), "Replicated", "Novel") else "Novel"
+
+jx <- coloc %>% group_by(sGene, junction, Condition, novelty) %>%
+  summarise(PPH4 = max(PPH4, na.rm = TRUE), .groups = "drop")
+
+chr_to_num <- function(c) {
+  c <- str_remove(toupper(str_trim(c)), "^CHR")
+  dplyr::case_when(c == "X" ~ 23, c == "Y" ~ 24, c %in% c("M", "MT") ~ 25,
+                   grepl("^[0-9]+$", c) ~ suppressWarnings(as.numeric(c)), TRUE ~ 99)
+}
+jx_pos <- jx %>% distinct(junction) %>%
+  mutate(chr_raw = str_extract(junction, "^[^:]+"),
+         start   = as.numeric(str_extract(junction, "(?<=:)[0-9]+")),
+         chr_num = chr_to_num(chr_raw)) %>%
+  arrange(chr_num, start) %>% mutate(xpos = row_number())
+jx <- jx %>% left_join(jx_pos %>% select(junction, chr_raw, chr_num, xpos), by = "junction")
+
+chr_breaks <- jx_pos %>% group_by(chr_raw, chr_num) %>%
+  summarise(mid = mean(xpos), min_x = min(xpos), max_x = max(xpos), .groups = "drop") %>%
+  arrange(chr_num) %>% mutate(band = chr_num %% 2)
+
+wide <- jx %>% select(junction, xpos, Condition, PPH4) %>%
+  pivot_wider(names_from = Condition, values_from = PPH4)
+seg <- if (all(c("Quiescent", "Proliferative") %in% names(wide)))
+  wide %>% filter(!is.na(Quiescent), !is.na(Proliferative)) else tibble()
+
+jx_label <- jx %>% group_by(sGene, junction, xpos) %>% summarise(y = max(PPH4), .groups = "drop") %>%
+  filter(y > LABEL_PPH4_MIN)
+if (LABEL_ONE_PER_GENE)
+  jx_label <- jx_label %>% group_by(sGene) %>% slice_max(y, n = 1, with_ties = FALSE) %>% ungroup()
+jx_label <- jx_label %>% mutate(sGene = gsub(",\\s*", ", ", sGene))
+
+cat(sprintf("Fig 1b: junctions %d | barbells %d | chromosomes %d | labels %d\n",
+            n_distinct(jx$junction), nrow(seg), n_distinct(jx$chr_raw), nrow(jx_label)))
+
+shape_map <- c(Quiescent = 22, Proliferative = 24)
+fill_map  <- c(Novel = COL_PANEL$novel, Replicated = COL_PANEL$replicated)
+
+p_fig1b <- ggplot() +
+  geom_rect(data = filter(chr_breaks, band == 1),
+            aes(xmin = min_x - 0.5, xmax = max_x + 0.5, ymin = Y_FLOOR, ymax = 1),
+            fill = "white", inherit.aes = FALSE)
+if (nrow(seg))
+  p_fig1b <- p_fig1b +
+    geom_segment(data = seg, aes(x = xpos, xend = xpos, y = Quiescent, yend = Proliferative),
+                 colour = "#BCBCBC", linewidth = 0.35)
+p_fig1b <- p_fig1b +
+  geom_point(data = jx, aes(x = xpos, y = PPH4, shape = Condition, fill = novelty),
+             size = 1.8, colour = "white", stroke = 0.25) +
+  geom_text_repel(data = jx_label, aes(x = xpos, y = y, label = sGene),
+                  size = sz(7), segment.size = 0.15, segment.colour = "grey55",
+                  min.segment.length = 0, box.padding = 0.25, point.padding = 0.1,
+                  max.overlaps = Inf, colour = "grey20", fontface = "italic", seed = 1) +
+  scale_shape_manual(values = shape_map, name = "Phenotype") +
+  scale_fill_manual(values = fill_map, name = "CAD sQTL Colocalization") +
+  scale_x_continuous(breaks = chr_breaks$mid, labels = chr_breaks$chr_raw, expand = expansion(mult = 0.01)) +
+  scale_y_continuous(breaks = seq(Y_FLOOR, 1, 0.1)) +
+  coord_cartesian(ylim = c(Y_FLOOR, 1.0)) +
+  labs(x = "Chromosome (not to scale)", y = "Colocalization posterior (PPH4)") +
+  guides(fill  = guide_legend(override.aes = list(shape = 21, size = 2.4)),
+         shape = guide_legend(override.aes = list(fill = "grey40"))) +
+  theme_cell(BASE_SIZE) +
+  theme(plot.margin = margin(6, 10, 6, 8))
+
+save_fig(p_fig1b, "Fig1b_coloc_barbell", w = min(MAX_W, PANEL_W), h = PANEL_H)
+p_fig1b
+```
+
+## 1d, 2b, 2d, 2e and Extended Data 1a, 1c, 1e, 2a–c — sQTL PSI-by-genotype boxplots
+
+One panel per (gene, SNP, PSI measure) for the sQTLs cited in the manuscript, exported
+at 2.6 in and at 1.7 × 2.2 in (`_smaller`, the size used in the assembled figures).
+Genotypes are ordered by CAD risk-allele dosage, so the risk allele must be known for
+each plotted SNP; the alleles below are the CAD risk alleles of the GWAS lead variant
+(or of the LD proxy that was genotyped) and are the alleles stated in the legends.
+
+```{r sqtl_psi_panels, message=FALSE, warning=FALSE}
+require_files(F_SQTL_PSI_LONG, F_SQTL_SNP_JUNCTION)
+sq          <- read_csv(F_SQTL_PSI_LONG,     show_col_types = FALSE)
+sqtl_lookup <- read_csv(F_SQTL_SNP_JUNCTION, show_col_types = FALSE)
+
+# Panels cited in the manuscript (gene, plotted SNP) and the file-name prefix of the
+# figure panel each one feeds. PARP12 contributes two panels (exon-10 inclusion and
+# skipping junctions), one per PSI measure.
+CITED_PSI_PANELS <- tribble(
+  ~gene,      ~rsid,         ~panel,
+  "R3HCC1L",  "rs10736122",  "Fig1d",
+  "ADAMTS7",  "rs71448830",  "Fig2b",
+  "PARP12",   "rs2286196",   "Fig2de",
+  "TRIM65",   "rs4398150",   "ED1a",
+  "LIPA",     "rs1332328",   "ED1c",
+  "NME7",     "rs1140523",   "ED1e",
+  "WIPI1",    "rs883541",    "ED2a",
+  "DCLRE1B",  "rs3761936",   "ED2b",
+  "ITGA1",    "rs4074793",   "ED2c")
+
+# NME7 and TRIM65 were plotted at an LD proxy of the lead sQTL variant and therefore
+# have no junction_key in the lookup; the colocalized junction (proliferative
+# condition, Supplementary Table 2) is supplied here for the subtitle.
+sqtl_lookup <- sqtl_lookup %>%
+  mutate(junction_key = case_when(
+    sqtl_snp_plotted == "rs1140523" & is.na(junction_key) ~ "chr1:169324500:169367708",
+    sqtl_snp_plotted == "rs4398150" & is.na(junction_key) ~ "chr17:75891347:75892267",
+    TRUE ~ junction_key))
+stopifnot("junction_key missing in the sQTL lookup" = !any(is.na(sqtl_lookup$junction_key)))
+
+# CAD risk allele per plotted SNP (the allele named in each figure legend).
+risk_allele_map <- c(
+  rs2286196 = "G", rs4074793 = "G", rs883541 = "A", rs71448830 = "A", rs1332328 = "T",
+  rs10736122 = "G", rs3761936 = "C", rs4398150 = "T", rs1140523 = "G")
+
+sq <- sq %>%
+  semi_join(CITED_PSI_PANELS, by = c("gene", "rsid")) %>%
+  mutate(
+    # one R3HCC1L measure is labelled with its cluster identifier in the source table
+    psi_measure = ifelse(str_detect(psi_measure, "^clu_"), "PSI", psi_measure),
+    risk_allele = risk_allele_map[rsid],
+    n_risk = str_count(genotype, fixed(coalesce(risk_allele, ""))),
+    dosage = factor(case_when(n_risk == 2 ~ "Risk/Risk", n_risk == 1 ~ "Het", TRUE ~ "Nonrisk/Nonrisk"),
+                    levels = c("Risk/Risk", "Het", "Nonrisk/Nonrisk")))
+stopifnot("risk allele missing for a plotted SNP" = !any(is.na(sq$risk_allele)))
+
+sqtl_panel <- function(d, gene, rsid, measure, name, w = 2.6, h = 2.6) {
+  d <- d %>% filter(gene == !!gene, rsid == !!rsid, psi_measure == !!measure, !is.na(psi))
+  if (nrow(d) == 0) { message("no data: ", gene, " ", rsid, " ", measure); return(invisible(NULL)) }
+  ra <- unique(d$risk_allele)
+  gt_order <- d %>% distinct(genotype) %>%
+    mutate(rk = str_count(genotype, fixed(ra))) %>% arrange(desc(rk)) %>% pull(genotype)
+  d <- d %>% mutate(genotype = factor(genotype, levels = gt_order))
+  ncount <- d %>% count(genotype)
+  xlabs <- setNames(sprintf("%s\n(n=%d)", ncount$genotype, ncount$n), ncount$genotype)
+
+  lk <- sqtl_lookup %>% filter(sqtl_snp_plotted == rsid, psi_measure == measure) %>% slice(1)
+  loc <- if (nrow(lk) == 0) "" else if (is.na(lk$junction_key)) lk$cluster
+         else sprintf("%s · %s", lk$cluster, lk$junction_key)
+
+  p <- ggplot(d, aes(genotype, psi, fill = dosage)) +
+    geom_jitter(aes(colour = dosage), width = 0.18, height = 0, size = 0.5, alpha = 0.55, show.legend = FALSE) +
+    geom_boxplot(width = 0.55, outlier.shape = NA, alpha = 0.75, linewidth = 0.3, colour = "grey25") +
+    scale_fill_manual(values = DOSAGE_COL, name = NULL, drop = FALSE) +
+    scale_colour_manual(values = DOSAGE_COL, guide = "none", drop = FALSE) +
+    scale_x_discrete(labels = xlabs) +
+    labs(x = sprintf("%s  (risk: %s)", rsid, ra), y = "Percent Spliced In (scaled)",
+         title = sprintf("*%s* sQTL", gene), subtitle = loc) +
+    theme_cell(BASE_SIZE) +
+    theme(legend.position = "bottom", legend.key.size = unit(0.25, "cm"),
+          legend.margin = margin(t = -4), aspect.ratio = 1,
+          plot.title = ggtext::element_markdown(),
+          plot.subtitle = element_text(size = BASE_SIZE - 1.5, colour = "grey30"))
+  save_fig(p, name, w = w, h = h); print(p); p
+}
+
+panels <- sq %>% distinct(gene, rsid, psi_measure) %>%
+  inner_join(CITED_PSI_PANELS, by = c("gene", "rsid"))
+for (i in seq_len(nrow(panels))) {
+  g <- panels$gene[i]; rs <- panels$rsid[i]; m <- panels$psi_measure[i]
+  multi_measure <- with(panels, sum(gene == g & rsid == rs) > 1)
+  tag <- paste0(panels$panel[i], "_sqtl_", g,
+                if (multi_measure) paste0("_", str_replace_all(str_trunc(m, 10, ellipsis = ""), "[^A-Za-z0-9]", "")) else "")
+  sqtl_panel(sq, g, rs, m, tag,                     w = 2.6, h = 2.6)
+  sqtl_panel(sq, g, rs, m, paste0(tag, "_smaller"), w = 1.7, h = 2.2)
+}
+```
+
+## 1g — SpliceAI / VEP evidence for the 1,534 LD-expanded variants
+
+The variant-level table from script 01 holds one row per variant with any splicing
+evidence (SpliceAI delta or a VEP splice consequence). The bar partitions those
+variants by maximum SpliceAI delta tier; the denominator in the axis label is the
+number of variants submitted (the end point of the Fig. 1f prioritization).
+
+```{r fig1g_spliceai, message=FALSE, warning=FALSE}
+require_files(OUT_VARIANT_VEP_SPLICEAI)
+per_variant <- read_csv(OUT_VARIANT_VEP_SPLICEAI, show_col_types = FALSE)
+n_submitted <- 1534L   # variants submitted to VEP + SpliceAI (Fig. 1f end point; Supplementary Table 4)
+stopifnot(all(c("rsID", "max_delta", "consequences") %in% names(per_variant)))
+
+tier_levels <- c("High (≥0.5)", "Moderate (0.2-0.5)", "Weak (0.05-0.2)",
+                 "Minimal (<0.05)", "No SpliceAI score (VEP only)")
+tier_pal <- c("High (≥0.5)"             = "#4C1C58",
+              "Moderate (0.2-0.5)"           = "#7B2D8E",
+              "Weak (0.05-0.2)"              = "#C29DCB",
+              "Minimal (<0.05)"              = "#E8DCEC",
+              "No SpliceAI score (VEP only)" = "#969696")
+tier_txt <- c("High (≥0.5)" = "white", "Moderate (0.2-0.5)" = "white",
+              "Weak (0.05-0.2)" = "grey20", "Minimal (<0.05)" = "grey20",
+              "No SpliceAI score (VEP only)" = "white")
+assign_tier <- function(d) factor(dplyr::case_when(
+    is.na(d) | d == 0 ~ "No SpliceAI score (VEP only)",
+    d >= 0.5 ~ "High (≥0.5)", d >= 0.2 ~ "Moderate (0.2-0.5)",
+    d >= 0.05 ~ "Weak (0.05-0.2)", TRUE ~ "Minimal (<0.05)"), levels = tier_levels)
+
+sa_sum <- per_variant %>%
+  mutate(tier_s = assign_tier(max_delta)) %>%
+  count(tier_s, name = "n_variants") %>%
+  complete(tier_s, fill = list(n_variants = 0)) %>%
+  mutate(pct = 100 * n_variants / sum(n_variants))
+n_shown <- sum(sa_sum$n_variants)
+cat(sprintf("Fig 1g: %d variants with splicing evidence (of %d tested)\n", n_shown, n_submitted))
+write_csv(sa_sum, file.path(TABLE_DIR, "Fig1g_spliceai_tiers.csv"))
+
+INLINE_MIN_FRAC <- 0.15   # segments below this fraction are called out above the bar
+sa_pos <- sa_sum %>%
+  arrange(tier_s) %>%
+  mutate(x2 = cumsum(n_variants), x1 = x2 - n_variants, xmid = (x1 + x2) / 2,
+         frac = n_variants / sum(n_variants),
+         lab_short = dplyr::recode(as.character(tier_s),
+                       "High (≥0.5)" = "High", "Moderate (0.2-0.5)" = "Mod.",
+                       "Weak (0.05-0.2)" = "Weak", "Minimal (<0.05)" = "Minimal",
+                       "No SpliceAI score (VEP only)" = "VEP only"))
+inline_lab  <- sa_pos %>% filter(frac >= INLINE_MIN_FRAC, n_variants > 0)
+callout_lab <- sa_pos %>% filter(frac <  INLINE_MIN_FRAC, n_variants > 0)
+
+p_sa_tiers <- ggplot() +
+  geom_rect(data = sa_pos, aes(xmin = x1, xmax = x2, ymin = 0, ymax = 1, fill = tier_s),
+            colour = "white", linewidth = 0.3) +
+  geom_text(data = inline_lab, aes(x = xmid, y = 0.5, label = n_variants,
+                                   colour = tier_txt[as.character(tier_s)]), size = sz(7)) +
+  scale_colour_identity() +
+  ggrepel::geom_text_repel(data = callout_lab,
+            aes(x = xmid, y = 1, label = paste0(lab_short, ": ", n_variants)),
+            nudge_y = 1.05, direction = "x", size = sz(7), colour = "grey20",
+            segment.size = 0.25, segment.colour = "grey55", min.segment.length = 0,
+            box.padding = 0.15, seed = 1) +
+  scale_fill_manual(values = tier_pal, name = NULL, drop = FALSE, breaks = tier_levels) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.03))) +
+  coord_cartesian(ylim = c(0, 2.4), clip = "off") +
+  labs(x = sprintf("CAD-colocalized sQTL variants with splicing evidence (n = %d of %s)",
+                   n_shown, format(n_submitted, big.mark = ",")), y = NULL) +
+  theme_cell(7) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank(),
+        legend.position = "bottom", legend.text = element_text(size = 7),
+        legend.key.size = unit(0.26, "cm")) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+save_fig(p_sa_tiers, "Fig1g_spliceai_tiers", w = 3.6, h = 2.0)
+p_sa_tiers
+```
+
+
+# Extended Data Figure 1 — sQTL effects for prioritized variants
+
+Panels 1a, 1c and 1e (TRIM65, LIPA, NME7) come from the `sqtl_psi_panels` chunk above.
+
+## 1d, 1f — RAB5C and MST1 (genotyped SNPs in LD with the lead variant)
+
+The plotted SNPs (rs2240010, rs13085791) are LD proxies of the colocalizing lead
+variants, so the CAD risk allele of each proxy was established from its phase with the
+lead variant (D′ ≈ 1) and the direction of the sQTL effect; the resulting alleles are
+set explicitly below and are the alleles stated in the legends. Only the junction
+shown in the manuscript is drawn for each gene.
+
+```{r figED1df_rab5c_mst1, message=FALSE, warning=FALSE}
+require_files(F_RAB5C_MST1_PSI)
+RISK_ALLELES <- c(RAB5C = "A", MST1 = "C")
+CITED_JUNCTION <- c(RAB5C = "17:42137878:42154893", MST1 = "3:49684189:49684314")
+ED1_PANEL      <- c(RAB5C = "ED1d", MST1 = "ED1f")
+SQ2_LOC <- c(   # cluster and junction for the subtitle (proliferative condition)
+  "17:42137878:42154893" = "clu_15826 · chr17:42137878:42154893",
+  "3:49684189:49684314"  = "clu_29362 · chr3:49684189:49684314")
+
+read_sqtl_sheet <- function(sheet, gene) {
+  raw <- read_excel(F_RAB5C_MST1_PSI, sheet = sheet)
+  geno_col  <- names(raw)[2]
+  rsid      <- str_extract(geno_col, "rs[0-9]+")
+  junc_cols <- names(raw)[3:ncol(raw)]
+  raw %>%
+    rename(donor = 1, genotype = 2) %>%
+    pivot_longer(all_of(junc_cols), names_to = "junction_full", values_to = "psi") %>%
+    mutate(psi = suppressWarnings(as.numeric(psi))) %>%
+    filter(!is.na(psi)) %>%
+    mutate(gene = gene, rsid = rsid, junction = str_replace(junction_full, ":clu.*$", ""))
+}
+sq2 <- bind_rows(read_sqtl_sheet("RAB5C", "RAB5C"), read_sqtl_sheet("MST1", "MST1")) %>%
+  mutate(risk_allele = RISK_ALLELES[gene]) %>%
+  filter(junction == CITED_JUNCTION[gene])
+stopifnot("cited RAB5C/MST1 junctions not found in the workbook" = n_distinct(sq2$gene) == 2)
+
+sqtl_panel2 <- function(d, gene, junction, name) {
+  d <- d %>% filter(gene == !!gene, junction == !!junction, !is.na(psi))
+  rsid <- unique(d$rsid); ra <- unique(d$risk_allele)
+  gt_order <- d %>% distinct(genotype) %>%
+    mutate(rk = str_count(genotype, fixed(ra))) %>% arrange(desc(rk)) %>% pull(genotype)
+  d <- d %>% mutate(genotype = factor(genotype, levels = gt_order),
+                    n_risk = str_count(as.character(genotype), fixed(ra)),
+                    dosage = factor(case_when(n_risk == 2 ~ "Risk/Risk", n_risk == 1 ~ "Het",
+                                              TRUE ~ "Nonrisk/Nonrisk"),
+                                    levels = c("Risk/Risk", "Het", "Nonrisk/Nonrisk")))
+  ncount <- d %>% count(genotype)
+  xlabs  <- setNames(sprintf("%s\n(n=%d)", ncount$genotype, ncount$n), ncount$genotype)
+  sub_txt <- if (junction %in% names(SQ2_LOC)) SQ2_LOC[[junction]] else paste0("chr", junction)
+
+  p <- ggplot(d, aes(genotype, psi)) +
+    geom_jitter(aes(colour = dosage), width = 0.18, height = 0, size = 0.5, alpha = 0.55, show.legend = FALSE) +
+    geom_boxplot(aes(fill = dosage), width = 0.55, outlier.shape = NA, alpha = 0.75, linewidth = 0.3, colour = "grey25") +
+    scale_fill_manual(values = DOSAGE_COL, name = NULL, drop = FALSE) +
+    scale_colour_manual(values = DOSAGE_COL, guide = "none", drop = FALSE) +
+    scale_x_discrete(labels = xlabs) +
+    labs(x = sprintf("%s  (risk: %s)", rsid, ra), y = "Percent Spliced In (scaled)",
+         title = sprintf("*%s* sQTL", gene), subtitle = sub_txt) +
+    theme_cell(BASE_SIZE) +
+    theme(aspect.ratio = 1, plot.title = ggtext::element_markdown(),
+          plot.subtitle = element_text(size = BASE_SIZE - 1.5, colour = "grey30"),
+          legend.position = "bottom", legend.key.size = unit(0.25, "cm"), legend.margin = margin(t = -4))
+  save_fig(p, name, w = 2, h = 2.6); print(p); invisible(p)
+}
+for (g in names(CITED_JUNCTION))
+  sqtl_panel2(sq2, g, CITED_JUNCTION[[g]], sprintf("%s_sqtl_%s", ED1_PANEL[[g]], g))
+```
+
+
+# Figure 2 — PARP12 splice switch and NF-κB signaling
+
+Fig. 2a (LocusCompare), 2b/2d/2e (PSI panels, above) and 2c/2f (browser tracks) are made
+elsewhere. All source data for the remaining panels are in the deposited experimental
+workbooks.
+
+## 2g (bottom) and Extended Data 2e, 2g — gel densitometry as a fraction of lane signal
+
+Each band is expressed as `band / sum(all bands in that lane)`, so the y-axis reports
+isoform composition per genotype rather than absolute intensity, which differs between
+lanes. ITGA1 (Extended Data Fig. 2i) is plotted from raw replicate values instead
+because only the risk-associated product was quantified.
+
+```{r fig2g_gel_fraction, message=FALSE, warning=FALSE}
+require_files(F_GEL_DENSITOMETRY)
+RISK_ISOFORM  <- c(DCLRE1B = "Canonical", PARP12 = "Canonical", WIPI1 = "Alternative")
+GEL_CONDITION <- c(PARP12 = "Proliferative", WIPI1 = "Proliferative", DCLRE1B = "Proliferative")
+GEL_PANEL     <- c(PARP12 = "Fig2g", WIPI1 = "ED2e", DCLRE1B = "ED2g")
+risk_cols <- c(Risk = COL_PANEL$risk, Nonrisk = COL_PANEL$nonrisk)
+
+gel_fraction <- function(sheet) {
+  cond <- GEL_CONDITION[[sheet]]
+  read_excel(F_GEL_DENSITOMETRY, sheet = sheet) %>%
+    rename(value = `Average (n=2)`) %>%
+    filter(Condition == cond, !is.na(value)) %>%
+    mutate(Genotype = factor(Genotype),
+           risk_class = factor(if_else(Isoform == RISK_ISOFORM[[sheet]], "Risk", "Nonrisk"),
+                               levels = c("Nonrisk", "Risk"))) %>%
+    group_by(Genotype) %>%                       # lane = one genotype in this condition
+    mutate(lane_total = sum(value, na.rm = TRUE), fraction = value / lane_total) %>%
+    ungroup() %>%
+    mutate(gene = sheet, Condition = cond)
+}
+gel_all <- purrr::map_dfr(names(GEL_PANEL), gel_fraction)
+chk <- gel_all %>% group_by(gene, Genotype) %>% summarise(s = sum(fraction), .groups = "drop")
+stopifnot("lane fractions do not sum to 1" = all(abs(chk$s - 1) < 1e-8))
+write_csv(gel_all %>% select(gene, Condition, Genotype, Isoform, risk_class, value, lane_total, fraction),
+          file.path(TABLE_DIR, "gel_quant_lane_fractions.csv"))
+
+for (g in names(GEL_PANEL)) {
+  d <- gel_all %>% filter(gene == g)
+  p <- ggplot(d, aes(Genotype, fraction, fill = risk_class)) +
+    geom_col(width = 0.7, colour = "black", linewidth = 0.2) +
+    scale_fill_manual(values = risk_cols, name = NULL) +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.02))) +
+    labs(x = NULL, y = "Fraction of total\nband intensity", title = sprintf("*%s* amplicon ratios", g)) +
+    theme_cell(BASE_SIZE) +
+    theme(legend.position = "right", legend.key.size = unit(3, "mm"), plot.title = ggtext::element_markdown())
+  save_fig(p, sprintf("%s_gel_fraction_%s", GEL_PANEL[[g]], g), 3.2, 0.79); print(p)
+}
+```
+
+## Extended Data 2i (bottom) — ITGA1 gel densitometry (mean ± s.e.m., donors as points)
+
+```{r figED2i_itga1_gel, message=FALSE, warning=FALSE}
+d <- read_excel(F_GEL_DENSITOMETRY, sheet = "ITGA1_raw") %>%
+  rename_with(str_trim) %>%
+  rename(value = Raw) %>%
+  filter(Condition == "Q" | Condition == "Quiescent") %>%
+  mutate(Genotype = factor(Genotype, levels = c("AG", "AA")),
+         value = as.numeric(value),
+         risk_class = factor("Risk", levels = c("Nonrisk", "Risk")))
+summ <- d %>% group_by(Genotype, risk_class) %>%
+  summarise(mean = mean(value), sd = sd(value), n = n(), sem = sd / sqrt(n), .groups = "drop")
+write_csv(summ, file.path(TABLE_DIR, "ED2i_gel_ITGA1_summary.csv"))
+
+p_itga1_gel <- ggplot(summ, aes(Genotype, mean, fill = risk_class)) +
+  geom_col(width = 0.7, colour = "black", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = mean - sem, ymax = mean + sem), width = 0.18, linewidth = 0.25, colour = "black") +
+  geom_jitter(data = d, aes(Genotype, value), inherit.aes = FALSE, width = 0.1, height = 0, size = 0.7, colour = "grey20") +
+  scale_fill_manual(values = risk_cols, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.06))) +
+  labs(x = NULL, y = "Band intensity", title = "*ITGA1* amplicon intensity") +
+  theme_cell() +
+  theme(legend.position = "right", plot.title = ggtext::element_markdown())
+save_fig(p_itga1_gel, "ED2i_gel_ITGA1", w = 3.2, h = 0.79)
+p_itga1_gel
+```
+
+## 2h — PARP12 isoform overexpression qPCR validation
+
+```{r fig2h_oe_qc, message=FALSE, warning=FALSE}
+require_files(F_PARP12_OE_DATA)
+OE_LV   <- c("GFP (Ctrl)", "Risk", "Nonrisk")
+oe_cols <- c("GFP (Ctrl)" = COL_PANEL$neutral, "Risk" = COL_PANEL$risk, "Nonrisk" = COL_PANEL$nonrisk)
+
+# The exon 10-retaining (canonical) isoform is favoured by the risk allele and the
+# exon 10-skipping (alternative) isoform by the nonrisk allele.
+oe <- read_excel(F_PARP12_OE_DATA, sheet = "Quality control Isoform OE") %>%
+  rename(group = 1) %>%
+  pivot_longer(-group, names_to = "measured_isoform", values_to = "rel_expr") %>%
+  mutate(group = dplyr::recode(group, "Canonical" = "Risk", "Alternative" = "Nonrisk", "GFP" = "GFP (Ctrl)"),
+         group = factor(group, levels = OE_LV),
+         measured_isoform = factor(measured_isoform,
+           levels = c("Canonical Isoform (PARP12-201)", "Alternative Isoform (PARP12-210)"),
+           labels = c("*PARP12* risk OE", "*PARP12* nonrisk OE")))
+write_csv(oe, file.path(TABLE_DIR, "Fig2h_PARP12_OE_qc.csv"))
+
+p_oe <- ggplot(oe, aes(group, rel_expr, fill = group)) +
+  geom_col(width = 0.72, colour = "black", linewidth = 0.2) +
+  facet_wrap(~ measured_isoform, nrow = 1) +
+  scale_fill_manual(values = oe_cols, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.06))) +
+  labs(x = NULL, y = "Relative expression", title = "*PARP12* isoform OE validation") +
+  theme_cell(BASE_SIZE) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1, size = BASE_SIZE - 1),
+        strip.background = element_blank(), strip.text = ggtext::element_markdown(size = 7),
+        plot.title = ggtext::element_markdown())
+save_fig(p_oe, "Fig2h_PARP12_OE_qc", w = 2.1, h = 2.0)
+p_oe
+```
+
+## 2i — Hallmark pathway enrichment (risk versus nonrisk OE)
+
+```{r fig2i_hallmark, message=FALSE, warning=FALSE}
+pe_hall <- read_excel(F_PARP12_OE_DATA, sheet = "Pathway Enrichment") %>%
+  rename(pathway = `HALLMARK Pathway`, FDR = FDR) %>%
+  mutate(pathway = pathway %>% str_replace_all("_", " ") %>% str_to_title(),
+         neglog  = -log10(FDR)) %>%
+  arrange(neglog) %>%
+  mutate(pathway = factor(pathway, levels = pathway))
+cat(sprintf("Fig 2i: %d pathways; %d at FDR < 0.01\n", nrow(pe_hall), sum(pe_hall$FDR < 0.01)))
+write_csv(pe_hall, file.path(TABLE_DIR, "Fig2i_PARP12_hallmark_enrichment.csv"))
+
+p_hall <- ggplot(pe_hall, aes(neglog, pathway)) +
+  geom_col(fill = COL_PANEL$cad, width = 0.72) +
+  geom_vline(xintercept = -log10(0.1), linetype = "dashed", colour = "grey40", linewidth = 0.3) +
+  labs(x = expression(-log[10]*"(FDR)"), y = NULL, title = "Pathways enriched in *PARP12* risk isoform OE") +
+  theme_cell() +
+  theme(plot.title = ggtext::element_markdown())
+save_fig(p_hall, "Fig2i_PARP12_hallmark_enrichment", w = 3.4, h = 2)
+p_hall
+```
+
+## 2j — NF-κB target and inflammatory genes
+
+Normalized expression per sample comes from the source-data workbook; the significance
+stars are the Benjamini–Hochberg-adjusted *P* values of the DESeq2 comparison of risk
+versus nonrisk isoform overexpression (`F_PARP12_DESEQ2`), read from the deposited
+results table rather than re-run here.
+
+```{r fig2j_gene_grid, message=FALSE, warning=FALSE}
+require_files(F_PARP12_DESEQ2)
+gde_cols   <- c("Risk" = COL_PANEL$risk, "Nonrisk" = COL_PANEL$nonrisk)
+GENE_ORDER <- c("IL1A", "TNIP3", "BIRC3", "PTGS2", "SAMD9", "SAMD9L", "ESM1", "BHLHE40")
+GENE_LABS  <- sprintf("*%s*", GENE_ORDER)
+
+gde <- read_excel(F_PARP12_OE_DATA, sheet = "Gene Diff Exp") %>%
+  rename(sample = 1) %>%
+  mutate(group = if_else(str_detect(sample, "_CAN$"), "Risk", "Nonrisk")) %>%
+  pivot_longer(-c(sample, group), names_to = "gene", values_to = "expr") %>%
+  mutate(gene     = factor(str_trim(gene), levels = GENE_ORDER),
+         gene_lab = factor(sprintf("*%s*", as.character(gene)), levels = GENE_LABS),
+         group    = factor(group, levels = c("Risk", "Nonrisk")))
+
+# DESeq2 results (risk vs nonrisk OE): expected columns gene, log2FoldChange, pvalue, padj.
+deseq <- read_csv(F_PARP12_DESEQ2, show_col_types = FALSE)
+need_cols <- c("gene", "log2FoldChange", "pvalue", "padj")
+if (!all(need_cols %in% names(deseq)))
+  stop("F_PARP12_DESEQ2 must contain the columns ", paste(need_cols, collapse = ", "),
+       "; found: ", paste(names(deseq), collapse = ", "))
+deseq_padj <- deseq %>% filter(gene %in% GENE_ORDER) %>% select(gene, padj)
+stopifnot("DESeq2 padj missing for a plotted gene" = all(GENE_ORDER %in% deseq_padj$gene))
+# star thresholds as stated in the Fig. 2j legend (BH-adjusted)
+stars <- deseq_padj %>%
+  mutate(gene = factor(gene, levels = GENE_ORDER),
+         lab  = case_when(padj < 0.001 ~ "***", padj < 0.05 ~ "**", padj < 0.1 ~ "*", TRUE ~ "ns"))
+ann <- gde %>% group_by(gene, gene_lab) %>%
+  summarise(y = max(expr, na.rm = TRUE) * 1.08, .groups = "drop") %>%
+  left_join(stars, by = "gene")
+write_csv(gde %>% left_join(stars %>% select(gene, padj), by = "gene"),
+          file.path(TABLE_DIR, "Fig2j_PARP12_NFkB_target_genes.csv"))
+
+p_grid <- ggplot(gde, aes(group, expr, fill = group)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65, linewidth = 0.25) +
+  geom_jitter(width = 0.12, size = 0.4, stroke = 0, colour = "black", alpha = 0.7) +
+  geom_text(data = ann, aes(x = 1.5, y = y, label = lab), inherit.aes = FALSE, size = sz(9)) +
+  facet_wrap(~ gene_lab, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = gde_cols, name = NULL) +
+  labs(x = NULL, y = "Normalized expression") +
+  theme_cell() +
+  theme(strip.background = element_blank(), strip.text = ggtext::element_markdown(size = 7),
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "bottom", legend.key.size = unit(0.22, "cm"))
+save_fig(p_grid, "Fig2j_PARP12_NFkB_target_genes", w = 6.2, h = 2)
+p_grid
+```
+
+## 2k — NF-κB p65 (pS536) phospho-ELISA
+
+The three conditions were measured on the same 12 lysate measurements (six donors in
+duplicate), so each comparison is a one-tailed paired t-test with the directional
+hypothesis that the overexpression condition listed second has higher phospho-p65
+(Methods, "Statistics and reproducibility").
+
+```{r fig2k_elisa, message=FALSE, warning=FALSE}
+nfkb_cols <- c("GFP" = COL_PANEL$neutral, "Risk" = COL_PANEL$risk, "Nonrisk" = COL_PANEL$nonrisk)
+nfkb_wide <- read_excel(F_PARP12_OE_DATA, sheet = "NFkB ELISA") %>%
+  rename(sample = `Sample ID`) %>%
+  rename_with(~ dplyr::recode(.x, "Canonical OE" = "Risk", "Alternate OE" = "Nonrisk"))
+stopifnot(all(c("GFP", "Risk", "Nonrisk") %in% names(nfkb_wide)),
+          "expected 12 paired measurements per condition" = nrow(nfkb_wide) == 12)
+nfkb <- nfkb_wide %>%
+  pivot_longer(-sample, names_to = "group", values_to = "p65") %>%
+  mutate(group = factor(group, levels = c("GFP", "Risk", "Nonrisk")))
+
+paired_one_tailed <- function(lo, hi)
+  t.test(nfkb_wide[[hi]], nfkb_wide[[lo]], paired = TRUE, alternative = "greater")$p.value
+nfkb_p <- tribble(
+  ~g1,    ~g2,
+  "GFP",  "Risk",
+  "GFP",  "Nonrisk",
+  "Nonrisk", "Risk") %>%
+  mutate(p = map2_dbl(g1, g2, paired_one_tailed))
+stopifnot("risk-vs-nonrisk ELISA P changed" =
+            round(nfkb_p$p[nfkb_p$g1 == "Nonrisk" & nfkb_p$g2 == "Risk"], 3) == 0.029)
+write_csv(nfkb_p, file.path(TABLE_DIR, "Fig2k_PARP12_p65_ELISA_tests.csv"))
+
+ymax <- max(nfkb$p65, na.rm = TRUE)
+brackets <- nfkb_p %>%
+  mutate(x1 = pmin(as.numeric(factor(g1, levels = levels(nfkb$group))),
+                   as.numeric(factor(g2, levels = levels(nfkb$group)))),
+         x2 = pmax(as.numeric(factor(g1, levels = levels(nfkb$group))),
+                   as.numeric(factor(g2, levels = levels(nfkb$group)))),
+         y  = ymax + c(2.0, 4.2, 0.6), tick = ymax * 0.03,
+         lab = ifelse(p < 0.05, sprintf("*P* = %.3f *", p), sprintf("*P* = %.3f", p)))
+
+p_nfkb <- ggplot(nfkb, aes(group, p65, fill = group)) +
+  stat_summary(fun = mean, geom = "col", width = 0.65, colour = "black", linewidth = 0.2) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2, linewidth = 0.3) +
+  geom_jitter(width = 0.12, size = 0.8, stroke = 0, colour = "black", alpha = 0.7) +
+  geom_segment(data = brackets, aes(x = x1, xend = x2, y = y, yend = y), inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = brackets, aes(x = x1, xend = x1, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = brackets, aes(x = x2, xend = x2, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.3) +
+  ggtext::geom_richtext(data = brackets, aes(x = (x1 + x2) / 2, y = y + tick * 1.2, label = lab),
+                        inherit.aes = FALSE, size = sz(7), fill = NA, label.color = NA,
+                        label.padding = grid::unit(rep(0, 4), "pt")) +
+  scale_fill_manual(values = nfkb_cols, guide = "none") +
+  labs(x = NULL, y = "Relative NF-κB p65\n(pS536) levels", title = "NF-κB p65 ELISA") +
+  theme_cell()
+save_fig(p_nfkb, "Fig2k_PARP12_p65_ELISA", w = 1.5, h = 2)
+p_nfkb
+```
+
+
+# Figure 3 and Extended Data Figure 3 — long-read VSMC transcriptome and predicted proteome
+
+Full-length read counts come from the Iso-Seq3 collapse output (`F_MAPPED_FL_COUNTS`),
+whose total matches the demultiplexing table exactly; transcript CPM is
+`FL / total FL × 10^6`. The expressed catalog is the set of isoforms detected in at
+least two of the six donors (`MIN_DONORS`), as stated in Methods.
+
+## 3.0 Expressed transcript and protein catalogs
+
+```{r fig3_setup, message=FALSE, warning=FALSE}
+require_files(F_MAPPED_FL_COUNTS, F_DEMUX_SAMPLE_COUNTS)
+nov_fill <- c(Annotated = COL_PANEL$annotated, Novel = COL_PANEL$novel)
+
+# per-donor read totals (Extended Data Fig. 3a) and the CPM denominator
+demux <- read_tsv(F_DEMUX_SAMPLE_COUNTS, show_col_types = FALSE)
+donor_tbl <- demux %>%
+  group_by(donor) %>%
+  summarise(total_fl_count = sum(fl_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(dn = as.numeric(factor(donor)),
+         donor_label = factor(paste("Donor", dn), levels = paste("Donor", sort(unique(dn))))) %>%
+  arrange(dn)
+TOTAL_FL <- sum(donor_tbl$total_fl_count)
+
+# mapped FL counts: per-isoform total and per-donor detection (samples S01/S02 = donor 1, ...)
+mfl <- read_csv(F_MAPPED_FL_COUNTS, show_col_types = FALSE)
+smp_cols <- setdiff(names(mfl), "id")
+sc <- as.matrix(mfl[smp_cols]); sc[is.na(sc)] <- 0
+don_idx <- ceiling(as.integer(str_extract(smp_cols, "(?<=^S)[0-9]+")) / 2)
+det     <- sapply(sort(unique(don_idx)), function(d) rowSums(sc[, don_idx == d, drop = FALSE]) > 0)
+mfl_slim <- tibble(isoform = mfl$id, FL = rowSums(sc), n_donors = rowSums(det))
+stopifnot("mapped FL total does not match the demux total" = sum(mfl_slim$FL) == TOTAL_FL)
+cat(sprintf("CPM denominator: %s full-length reads\n", comma(TOTAL_FL)))
+
+# transcript catalog (the per-sample FL columns of the SQANTI3 table are incomplete and are replaced)
+rna <- read_tsv(F_SQANTI3_CLASS, show_col_types = FALSE) %>%
+  select(-any_of(c("FL", "total_FL")), -starts_with("FL.")) %>%
+  left_join(mfl_slim, by = "isoform") %>%
+  mutate(CPM_transcript_level = FL / TOTAL_FL * 1e6)
+
+MIN_DONORS <- 2
+rna_expr  <- rna %>% filter(n_donors >= MIN_DONORS)
+prot_expr <- prot %>% filter(pb %in% rna_expr$isoform)
+cat(sprintf("catalog: %s isoforms | expressed (>=%d donors): %s isoforms / %s genes | proteins: %s\n",
+            comma(nrow(rna)), MIN_DONORS, comma(nrow(rna_expr)),
+            comma(n_distinct(rna_expr$associated_gene)), comma(nrow(prot_expr))))
+```
+
+## 3b, 3c — transcript and protein isoforms by SQANTI category
+
+FSM + ISM and NIC + NNC are combined into single bars; the fill gives the novelty.
+Fig. 3c is classified on the SQANTI Protein call (`pr_splice_cat`).
+
+```{r fig3bc_categories, message=FALSE, warning=FALSE}
+rna_cat <- rna_expr %>%
+  filter(structural_category %in% c(cat_known, cat_novel)) %>%
+  mutate(novelty = ifelse(structural_category %in% cat_novel, "Novel", "Annotated"),
+         cat = factor(ifelse(novelty == "Novel", "NIC/NNC", "FSM/ISM"), levels = c("FSM/ISM", "NIC/NNC"))) %>%
+  count(cat, novelty, name = "n")
+write_csv(rna_cat, file.path(TABLE_DIR, "Fig3b_transcript_categories.csv"))
+
+p_rnacat <- ggplot(rna_cat, aes(cat, n, fill = novelty)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = comma(n)), vjust = -0.4, size = sz(7)) +
+  scale_fill_manual(values = nov_fill, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.13)), labels = comma) +
+  labs(x = NULL, y = "Number of isoforms", title = "RNA isoforms") +
+  theme_cell(7) +
+  theme(legend.position = "top", plot.title = element_text(face = "plain", size = 8))
+save_fig(p_rnacat, "Fig3b_transcript_categories", 2.9, 2.3)
+
+stopifnot("pr_splice_cat missing from the SQANTI Protein table" = "pr_splice_cat" %in% names(prot_expr))
+prot_cat <- prot_expr %>%
+  filter(pr_splice_cat %in% c(cat_known, cat_novel)) %>%
+  mutate(novelty = ifelse(pr_splice_cat %in% cat_novel, "Novel", "Annotated"),
+         cat = factor(ifelse(novelty == "Novel", "pNIC/pNNC", "pFSM/pISM"), levels = c("pFSM/pISM", "pNIC/pNNC"))) %>%
+  count(cat, novelty, name = "n")
+cat(sprintf("Fig 3c: %s of %s protein isoforms classified (%.1f%% novel)\n",
+            comma(sum(prot_cat$n)), comma(nrow(prot_expr)),
+            100 * sum(prot_cat$n[prot_cat$novelty == "Novel"]) / sum(prot_cat$n)))
+write_csv(prot_cat, file.path(TABLE_DIR, "Fig3c_protein_categories.csv"))
+
+p_protcat <- ggplot(prot_cat, aes(cat, n, fill = novelty)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = comma(n)), vjust = -0.4, size = sz(7)) +
+  scale_fill_manual(values = nov_fill, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.13)), labels = comma) +
+  labs(x = NULL, y = "Number of protein isoforms", title = "Protein isoforms") +
+  theme_cell(7) +
+  theme(legend.position = "top", plot.title = element_text(face = "plain", size = 8))
+save_fig(p_protcat, "Fig3c_protein_categories", 2.9, 2.3)
+p_rnacat; p_protcat
+```
+
+## 3d — genes whose highest-expressed isoform is novel
+
+```{r fig3d_dominant_novelty, message=FALSE, warning=FALSE}
+dom_gene <- rna_expr %>%
+  filter(!is.na(associated_gene), FL > 0,
+         structural_category %in% c(cat_known, cat_novel)) %>%
+  group_by(associated_gene) %>%
+  slice_max(FL, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  transmute(gene = associated_gene, top_isoform = isoform,
+            cls = ifelse(structural_category %in% cat_novel, "Novel", "Annotated"))
+hi <- dom_gene %>% count(cls, name = "n") %>%
+  mutate(frac = n / sum(n), cls = factor(cls, levels = c("Annotated", "Novel"))) %>%
+  arrange(cls) %>%
+  mutate(ymax = cumsum(n), ymin = lag(ymax, default = 0), mid = (ymin + ymax) / 2)
+cat(sprintf("Fig 3d: %s genes; highest-expressed isoform novel in %s (%.1f%%)\n",
+            comma(sum(hi$n)), comma(hi$n[hi$cls == "Novel"]), 100 * hi$frac[hi$cls == "Novel"]))
+write_csv(dom_gene, file.path(TABLE_DIR, "Fig3d_dominant_isoform_per_gene.csv"))
+
+p_3d <- ggplot(hi) +
+  geom_rect(aes(xmin = 3, xmax = 4, ymin = ymin, ymax = ymax, fill = cls), colour = "white", linewidth = 0.4) +
+  geom_text(aes(x = 3.5, y = mid, label = sprintf("%s\n(%.0f%%)", comma(n), 100 * frac)),
+            size = sz(7), colour = "grey15", lineheight = 0.9) +
+  scale_fill_manual(values = nov_fill, name = "Highest-expressed\nRNA isoform") +
+  coord_polar(theta = "y") + xlim(c(1.5, 4.5)) +
+  annotate("text", x = 1.5, y = 0, label = sprintf("n = %s\ngenes", comma(sum(hi$n))),
+           size = sz(7), colour = "grey15", lineheight = 0.95) +
+  theme_void(base_size = 7) +
+  theme(legend.title = element_text(size = 7), legend.text = element_text(size = 7),
+        legend.key.size = unit(3.4, "mm"), plot.background = element_rect(fill = "white", colour = NA))
+save_fig(p_3d, "Fig3d_dominant_isoform_novelty", 2.8, 2.2)
+p_3d
+```
+
+## 3e, 3f and Extended Data 3g, 3h — per-gene isoform composition donuts
+
+Each isoform is a wedge sized by its share of gene CPM and shaded by novelty (orange
+ramp = novel, grey ramp = annotated, darker = higher CPM); the isoform discussed in the
+text is outlined and labelled. The transcript models shown next to each donut are
+drawn by script 05.
+
+```{r fig3ef_ED3gh_donuts, message=FALSE, warning=FALSE}
+require_files(F_BEST_ORF_CPM)
+DONUT_GENES <- c(CABIN1 = "PB.18162.29", CNN1 = "PB.16522.2", RNF5 = "PB.6529.2", HEPH = "PB.18756.6")
+DONUT_PANEL <- c(CABIN1 = "Fig3e", CNN1 = "Fig3f", RNF5 = "ED3g", HEPH = "ED3h")
+
+pick <- function(df, pats) { for (p in pats) { h <- names(df)[grepl(p, names(df), ignore.case = TRUE)]
+                                                if (length(h)) return(h[1]) }; NA_character_ }
+sp  <- prot %>% mutate(pb = .data[[pick(prot, c("^pb$", "pb_acc", "^isoform$", "pb"))]])
+cpm <- read_tsv(F_BEST_ORF_CPM, show_col_types = FALSE)
+cpm <- cpm %>% mutate(pb = .data[[pick(cpm, c("pb_acc", "^pb$", "pb"))]])
+prot_cpm <- inner_join(sp, cpm, by = "pb", suffix = c(".sp", ".cpm"))
+gene_col <- pick(prot_cpm, c("^gene$", "^gene\\.", "gene_name", "gene"))
+cpm_col  <- pick(prot_cpm, c("^CPM$", "cpm"))
+prot_cpm <- prot_cpm %>% transmute(pb, tx_cat, gene = .data[[gene_col]], CPM = as.numeric(.data[[cpm_col]]))
+
+novel_colors <- colorRampPalette(c("#FBD9BE", "#F2A35E", "#E8700A"))(20)
+annot_colors <- colorRampPalette(c("#EDEDED", "#C2C2C2", "#9E9E9E"))(20)
+RING_IN <- 2.5; RING_OUT <- 4; X_MIN <- 0.5; X_MAX <- 5.5; CENTRE_X <- 1.2; CALLOUT_X <- 4.8
+
+donut_one <- function(gene_name) {
+  gd <- prot_cpm %>% filter(gene == gene_name, CPM > 0) %>%
+    mutate(is_novel = tx_cat %in% cat_novel, type = ifelse(is_novel, "Novel", "Annotated"),
+           total_gene_CPM = sum(CPM), proportion = CPM / total_gene_CPM * 100)
+  if (!nrow(gd)) { message("no CPM>0 isoforms for ", gene_name); return(NULL) }
+  target_pb <- DONUT_GENES[[gene_name]]
+  gd <- gd %>% mutate(is_target = pb == target_pb) %>%
+    arrange(desc(type == "Annotated"), CPM) %>% mutate(plot_order = row_number()) %>%
+    group_by(type) %>%
+    mutate(type_rank = rank(CPM, ties.method = "first"), n_in_type = n(),
+           color_index = pmax(1, pmin(ceiling(type_rank / n_in_type * 20), 20))) %>%
+    ungroup() %>%
+    mutate(fill_color = ifelse(type == "Novel", novel_colors[color_index], annot_colors[color_index])) %>%
+    arrange(plot_order) %>%
+    mutate(ymax = cumsum(proportion), ymin = lag(ymax, default = 0), label_pos = (ymin + ymax) / 2)
+  write_csv(gd %>% select(gene, pb, tx_cat, type, CPM, proportion, is_target),
+            file.path(TABLE_DIR, paste0(DONUT_PANEL[[gene_name]], "_donut_", gene_name, ".csv")))
+
+  tgt <- gd %>% filter(is_target)
+  centre_lab <- sprintf(
+    paste0("<span style='font-size:9pt'><i>%s</i></span><br>",
+           "<span style='color:#666666'>%s CPM</span><br>",
+           "<span style='color:#808080'>%d novel / %d known</span>"),
+    gene_name, round(unique(gd$total_gene_CPM), 1), sum(gd$is_novel), sum(!gd$is_novel))
+
+  p <- ggplot(gd) +
+    geom_rect(aes(xmin = RING_IN, xmax = RING_OUT, ymin = ymin, ymax = ymax, fill = fill_color),
+              colour = "white", linewidth = 0.4) +
+    scale_fill_identity() +
+    coord_polar(theta = "y") + xlim(c(X_MIN, X_MAX)) +
+    ggtext::geom_richtext(data = tibble(x = CENTRE_X, y = 0, lab = centre_lab),
+                          aes(x = x, y = y, label = lab), size = sz(7), lineheight = 1.3,
+                          fill = NA, label.color = NA, label.padding = grid::unit(rep(0, 4), "pt")) +
+    theme_void(base_size = 7) +
+    theme(plot.margin = margin(4, 4, 4, 4), plot.background = element_rect(fill = "white", colour = NA))
+  if (nrow(tgt)) p <- p +
+    geom_rect(data = tgt, aes(xmin = RING_IN, xmax = RING_OUT, ymin = ymin, ymax = ymax),
+              fill = NA, colour = "black", linewidth = 0.3) +
+    geom_label(data = tgt, aes(x = CALLOUT_X, y = label_pos, label = paste0(pb, "\n", round(proportion, 1), "%")),
+               colour = "black", fill = scales::alpha("white", 0.85), label.size = 0, size = sz(7),
+               label.padding = unit(0.2, "lines"))
+  p
+}
+for (g in names(DONUT_GENES)) {
+  pd <- donut_one(g)
+  if (!is.null(pd)) { save_fig(pd, paste0(DONUT_PANEL[[g]], "_donut_", g), 2.6, 2.6); print(pd) }
+}
+```
+
+## Extended Data 3a–c — reads per donor, isoform length and exon-count histograms
+
+```{r figED3abc_qc, message=FALSE, warning=FALSE}
+write_csv(donor_tbl, file.path(TABLE_DIR, "ED3a_donor_read_totals.csv"))
+p_donor <- ggplot(donor_tbl, aes(total_fl_count, donor_label)) +
+  geom_col(fill = TEAL, width = 0.72) +
+  geom_text(aes(label = comma(total_fl_count)), hjust = -0.15, colour = "grey30", size = sz(7)) +
+  scale_x_continuous(limits = c(0, 1.95e6), breaks = seq(0, 1.5e6, 5e5), labels = comma) +
+  labs(x = "Full-length reads", y = NULL) +
+  coord_cartesian(clip = "off") + theme_cell(7)
+save_fig(p_donor, "ED3a_donor_reads", 2.5, 2.0)
+
+p_len <- ggplot(rna_expr, aes(length)) +
+  geom_histogram(bins = 60, fill = TEAL, colour = NA) +
+  scale_x_continuous(labels = comma) +
+  labs(x = "RNA isoform length (bp)", y = "Count") + theme_cell(7)
+save_fig(p_len, "ED3b_isoform_length", 2.7, 2.0)
+
+p_exon <- ggplot(rna_expr, aes(exons)) +
+  geom_histogram(binwidth = 1, fill = TEAL, colour = NA) +
+  labs(x = "Number of exons", y = "Count") + theme_cell(7)
+save_fig(p_exon, "ED3c_exon_count", 2.5, 2.0)
+
+write_csv(rna_expr %>% summarise(n_isoforms = n(), median_length = median(length, na.rm = TRUE),
+                                 max_length = max(length, na.rm = TRUE), median_exons = median(exons, na.rm = TRUE),
+                                 max_exons = max(exons, na.rm = TRUE), median_CPM = median(CPM_transcript_level, na.rm = TRUE)),
+          file.path(TABLE_DIR, "ED3bc_length_exon_summary.csv"))
+p_donor; p_len; p_exon
+```
+
+## Extended Data 3d–f — support for the novel isoforms (length, abundance, quality metrics)
+
+These panels use the full catalog rather than the ≥ 2-donor subset, so that
+"≥ 2 donors detected" remains an informative metric instead of 100% by construction.
+
+```{r figED3def_novelty_qc, message=FALSE, warning=FALSE}
+aslog <- function(x) { y <- toupper(as.character(x))
+  ifelse(y %in% c("TRUE", "T", "YES", "1"), TRUE, ifelse(y %in% c("FALSE", "F", "NO", "0"), FALSE, NA)) }
+
+dat <- rna %>%
+  filter(structural_category %in% c(cat_novel, cat_known)) %>%
+  mutate(novelty = factor(ifelse(structural_category %in% cat_novel, "Novel", "Annotated"),
+                          levels = c("Annotated", "Novel")),
+         multidonor   = n_donors >= 2,
+         canonical_ok = all_canonical == "canonical",
+         not_rts      = !aslog(RTS_stage))
+multiexon <- dat %>% filter(exons > 1)
+cat(sprintf("Annotated (FSM+ISM): %s | Novel (NIC+NNC): %s\n",
+            comma(sum(dat$novelty == "Annotated")), comma(sum(dat$novelty == "Novel"))))
+
+# Extended Data 3f: support metrics (junction and RT-switching metrics on multi-exon isoforms only)
+qc_def <- tibble::tribble(
+  ~metric,                           ~col,           ~scope,
+  ">=2 donors detected",             "multidonor",   "all",
+  "All splice junctions canonical",  "canonical_ok", "multiexon",
+  "Not RT-switching artifact",       "not_rts",      "multiexon")
+summ_one <- function(metric, col, scope) {
+  d <- if (scope == "multiexon") multiexon else dat
+  if (!(col %in% names(d)) || all(is.na(d[[col]]))) return(NULL)
+  d2  <- d %>% filter(!is.na(.data[[col]]))
+  tab <- d2 %>% group_by(novelty) %>% summarise(pct = mean(.data[[col]]) * 100, n = n(), .groups = "drop")
+  tibble(metric = metric,
+         Annotated = tab$pct[tab$novelty == "Annotated"], Novel = tab$pct[tab$novelty == "Novel"],
+         n_annotated = tab$n[tab$novelty == "Annotated"], n_novel = tab$n[tab$novelty == "Novel"],
+         test_p = fisher_p(d2[[col]], d2$novelty))
+}
+qc_summary <- purrr::pmap_dfr(qc_def, summ_one)
+qc_long <- qc_summary %>%
+  mutate(metric = factor(metric, levels = rev(metric))) %>%
+  pivot_longer(c(Annotated, Novel), names_to = "novelty", values_to = "pct") %>%
+  mutate(novelty = factor(novelty, levels = c("Annotated", "Novel")))
+
+p_qc <- ggplot(qc_long, aes(metric, pct, fill = novelty)) +
+  geom_col(position = position_dodge(width = 0.72), width = 0.64) +
+  geom_text(aes(y = pct + 2.5, label = ifelse(pct > 99 & pct < 100, sprintf("%.1f%%", pct), sprintf("%.0f%%", pct))),
+            position = position_dodge(width = 0.72), hjust = 0, size = sz(7)) +
+  scale_fill_manual(values = nov_fill, name = NULL) +
+  scale_y_continuous(limits = c(0, 118), breaks = seq(0, 100, 25), expand = expansion(mult = c(0, 0.02))) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 18)) +
+  coord_flip(clip = "off") +
+  labs(x = NULL, y = "% of RNA isoforms") +
+  theme_cell(7) +
+  theme(legend.position = "top", plot.margin = margin(4, 12, 4, 4))
+save_fig(p_qc, "ED3f_novel_support_qc", 2.5, 2)
+
+# Extended Data 3d, 3e: violins (the display window trims the extreme quantiles only)
+novel_violin <- function(yvar, title, ylab, digits = 0, lo_q = 0.002, hi_q = 0.995, y_breaks = waiver()) {
+  d <- dat %>% transmute(novelty, value = .data[[yvar]]) %>% filter(is.finite(value), value > 0)
+  pv  <- wilcox_p(d$value, d$novelty)
+  nk  <- sum(d$novelty == "Annotated"); nn <- sum(d$novelty == "Novel")
+  med <- d %>% group_by(novelty) %>% summarise(m = median(value), .groups = "drop")
+  lo <- unname(quantile(d$value, lo_q, na.rm = TRUE)); hi_ <- unname(quantile(d$value, hi_q, na.rm = TRUE))
+  ggplot(d, aes(novelty, value, fill = novelty)) +
+    geom_violin(scale = "width", width = 0.85, colour = NA, trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.shape = NA, fill = "white", colour = "grey25", linewidth = 0.3) +
+    geom_label(data = med, aes(x = novelty, y = m, label = comma(round(m, digits))),
+               nudge_x = 0.30, fill = "white", colour = "grey15", size = sz(7), label.size = 0,
+               label.padding = unit(0.1, "lines")) +
+    scale_fill_manual(values = nov_fill, guide = "none") +
+    scale_y_log10(breaks = y_breaks, labels = comma) +
+    coord_cartesian(ylim = c(lo, hi_), clip = "on") +
+    labs(title = title, subtitle = sprintf("%s<br><i>n</i> = %s / %s", fmt_p_md(pv), comma(nk), comma(nn)),
+         x = NULL, y = ylab) +
+    theme_cell(7) +
+    theme(plot.subtitle = element_markdown(), plot.margin = margin(4, 8, 4, 4))
+}
+save_fig(novel_violin("length", "RNA isoform length", expression("RNA isoform length (bp, log"[10]*")"),
+                      y_breaks = c(300, 1000, 3000, 10000)),
+         "ED3d_isoform_length_violin", 2.5, 2)
+save_fig(novel_violin("CPM_transcript_level", "RNA isoform abundance", expression("CPM (log"[10]*")"),
+                      digits = 2, y_breaks = c(0.1, 0.3, 1, 3, 10, 30)),
+         "ED3e_abundance_violin", 2.5, 2)
+
+# summary table for the legend and text
+cont <- dat %>% group_by(novelty) %>%
+  summarise(median_CPM = median(CPM_transcript_level, na.rm = TRUE), median_length = median(length, na.rm = TRUE),
+            median_exons = median(exons, na.rm = TRUE), .groups = "drop")
+getc <- function(df, col, grp) df[[col]][df$novelty == grp]
+novel_summary <- bind_rows(
+  tibble(metric = c("Median CPM", "Median length (bp)", "Median exons"), units = "value",
+         Annotated = c(getc(cont, "median_CPM", "Annotated"), getc(cont, "median_length", "Annotated"), getc(cont, "median_exons", "Annotated")),
+         Novel     = c(getc(cont, "median_CPM", "Novel"),     getc(cont, "median_length", "Novel"),     getc(cont, "median_exons", "Novel")),
+         n_annotated = sum(dat$novelty == "Annotated"), n_novel = sum(dat$novelty == "Novel"), test = "Wilcoxon",
+         test_p = c(wilcox_p(dat$CPM_transcript_level, dat$novelty), wilcox_p(dat$length, dat$novelty), wilcox_p(dat$exons, dat$novelty))),
+  qc_summary %>% mutate(units = "percent", test = "Fisher")) %>%
+  mutate(sig = star(test_p)) %>%
+  select(metric, units, Annotated, Novel, n_annotated, n_novel, test, test_p, sig)
+write_csv(novel_summary, file.path(TABLE_DIR, "ED3_novel_isoform_summary.csv"))
+print(novel_summary)
+p_qc
+```
+
+## Numbers for the text (long-read catalog)
+
+```{r fig3_text_numbers, message=FALSE, warning=FALSE}
+nov_pct <- function(d) round(100 * sum(d$n[d$novelty == "Novel"]) / sum(d$n), 1)
+summary_tbl <- tibble(
+  metric = c("catalog_total", "expressed_isoforms", "expressed_genes", "transcript_novel_pct",
+             "proteins_expressed", "proteins_plotted_fig3c", "protein_novel_pct", "dominant_novel_pct",
+             "median_length_bp", "max_length_bp", "median_exons", "max_exons", "median_CPM"),
+  value  = c(nrow(rna), nrow(rna_expr), n_distinct(rna_expr$associated_gene), nov_pct(rna_cat),
+             nrow(prot_expr), sum(prot_cat$n), nov_pct(prot_cat), round(100 * hi$frac[hi$cls == "Novel"], 1),
+             median(rna_expr$length), max(rna_expr$length), median(rna_expr$exons), max(rna_expr$exons),
+             round(median(rna_expr$CPM_transcript_level), 3)))
+write_csv(summary_tbl, file.path(TABLE_DIR, "Fig3_summary_numbers.csv"))
+print(summary_tbl)
+
+# novel transcripts above the annotated upper quartile of abundance
+KNOWN_Q3 <- quantile(dat$CPM_transcript_level[dat$novelty == "Annotated"], .75, na.rm = TRUE)
+sel <- dat %>% filter(novelty == "Novel", is.finite(CPM_transcript_level), CPM_transcript_level > KNOWN_Q3)
+cat(sprintf("annotated upper quartile: %.2f CPM | novel transcripts above it: %s (%.1f%% of novel); median %.1f CPM [IQR %.1f-%.1f]\n",
+            KNOWN_Q3, comma(nrow(sel)), 100 * nrow(sel) / sum(dat$novelty == "Novel"),
+            median(sel$CPM_transcript_level), quantile(sel$CPM_transcript_level, .25), quantile(sel$CPM_transcript_level, .75)))
+
+# transcript-level versus protein-level novelty on the expressed set
+tx_nov <- rna_expr %>% transmute(pb = isoform, tx_novel = structural_category %in% cat_novel)
+mism <- prot_expr %>% select(pb, pr_splice_cat, pr_transcripts) %>%
+  inner_join(tx_nov, by = "pb") %>% mutate(pr_novel = pr_splice_cat %in% cat_novel)
+cat(sprintf("expressed isoforms with both calls: %s | novel transcript, annotated protein: %s | annotated transcript, novel protein: %s\n",
+            comma(nrow(mism)), comma(sum(mism$tx_novel & !mism$pr_novel)), comma(sum(!mism$tx_novel & mism$pr_novel))))
+collapse <- prot_expr %>% filter(!is.na(pr_transcripts)) %>% count(pr_transcripts, name = "n_tx") %>% filter(n_tx > 1)
+cat(sprintf("protein isoforms encoded by >1 transcript: %s (covering %s transcripts)\n",
+            comma(nrow(collapse)), comma(sum(collapse$n_tx))))
+```
+
+
+# Figure 4 — noncoding CAD variants produce coding changes
+
+Fig. 4b (schematic), 4i/4k (browser tracks) and 4j/4l (AlphaFold3) are made elsewhere.
+
+## 4a — genomic location of the 304 unique CAD sQTL lead SNPs
+
+Each SNP position is classified against GENCODE v38 with the priority CDS > exon >
+intron > intergenic, one row per unique SNP, so that a SNP overlapping the CDS of any
+transcript of the gene counts as coding (Methods, "Mapping CAD sQTL junctions to
+transcripts and proteins"). The GTF overlap takes a few minutes, so the classification
+is cached in `TABLE_DIR`; delete the cache or set `FORCE_RECLASSIFY <- TRUE` to redo it.
+
+```{r fig4a_snp_location, message=FALSE, warning=FALSE}
+FORCE_RECLASSIFY <- FALSE
+SNP_CLASS_OUT <- file.path(TABLE_DIR, "snp_location_classification.csv")
+
+snp_col <- base::intersect(c("SNP_ID", "rsid"), names(lfc_m))[1]
+snp_combos <- lfc_m %>%
+  mutate(SNP_ID = .data[[snp_col]], pos = suppressWarnings(as.integer(pos))) %>%
+  filter(!is.na(SNP_ID), SNP_ID != "", !is.na(pos)) %>%
+  distinct(SNP_ID, chr, pos, junction_key, gene_name)
+
+if (!FORCE_RECLASSIFY && file.exists(SNP_CLASS_OUT)) {
+  snp_class <- read_csv(SNP_CLASS_OUT, show_col_types = FALSE)
+} else {
+  require_files(F_GENCODE_V38_GTF)
+  suppressMessages(library(GenomicRanges))
+  hdr <- readLines(F_GENCODE_V38_GTF, n = 200)
+  n_comment <- which(!startsWith(hdr, "#"))[1] - 1L; if (is.na(n_comment)) n_comment <- 0L
+  g <- data.table::fread(file = F_GENCODE_V38_GTF, sep = "\t", header = FALSE, quote = "",
+                         skip = n_comment, showProgress = FALSE,
+                         col.names = c("seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attr"))
+  stopifnot("GTF did not parse into 9 columns" = ncol(g) == 9L)
+  g <- g[feature %in% c("gene", "exon", "CDS")]
+  mk <- function(ft) { d <- g[feature == ft]
+    GenomicRanges::reduce(GRanges(as.character(d$seqname), IRanges(d$start, d$end)), ignore.strand = TRUE) }
+  cds_gr <- mk("CDS"); exon_gr <- mk("exon"); gene_gr <- mk("gene")
+  snps <- snp_combos %>% distinct(chr, pos)
+  snp_gr <- GRanges(as.character(snps$chr), IRanges(snps$pos, snps$pos))
+  snps <- snps %>% mutate(
+    in_cds  = IRanges::overlapsAny(snp_gr, cds_gr,  ignore.strand = TRUE),
+    in_exon = IRanges::overlapsAny(snp_gr, exon_gr, ignore.strand = TRUE),
+    in_gene = IRanges::overlapsAny(snp_gr, gene_gr, ignore.strand = TRUE),
+    snp_region = dplyr::case_when(in_cds ~ "CDS (coding)", in_exon ~ "Exonic noncoding (UTR/ncRNA)",
+                                  in_gene ~ "Intronic", TRUE ~ "Intergenic"),
+    snp_coding = ifelse(in_cds, "Coding", "Noncoding"))
+  snp_class <- snp_combos %>% left_join(snps, by = c("chr", "pos"))
+  write_csv(snp_class, SNP_CLASS_OUT)
+  rm(g, cds_gr, exon_gr, gene_gr); gc(verbose = FALSE)
+  bind_dplyr()   # GenomicRanges masks dplyr verbs
+}
+
+snp_region_lv <- c("CDS (coding)", "Exonic noncoding (UTR/ncRNA)", "Intronic", "Intergenic")
+region_rank   <- setNames(seq_along(snp_region_lv), snp_region_lv)
+snp_unique <- snp_class %>%
+  mutate(rrank = region_rank[snp_region]) %>%
+  arrange(SNP_ID, rrank) %>%
+  group_by(SNP_ID) %>% filter(row_number() == 1) %>% ungroup() %>%
+  mutate(snp_region = factor(snp_region, levels = snp_region_lv),
+         snp_coding = ifelse(snp_region == "CDS (coding)", "Coding", "Noncoding"))
+
+loc <- snp_unique %>% count(snp_region, .drop = FALSE) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  arrange(snp_region) %>%
+  mutate(ymax = cumsum(n), ymin = lag(ymax, default = 0), mid = (ymin + ymax) / 2)
+cat(sprintf("Fig 4a: %d unique CAD sQTL SNPs\n", nrow(snp_unique))); print(loc %>% select(snp_region, n, pct))
+write_csv(loc %>% select(snp_region, n, pct), file.path(TABLE_DIR, "Fig4a_snp_location_summary.csv"))
+
+loc_pal <- c("CDS (coding)" = GREEN[["base"]], "Exonic noncoding (UTR/ncRNA)" = "#B8CFC5",
+             "Intronic" = "#9E9E9E", "Intergenic" = "#D4D4D4")
+n_snp_u    <- nrow(snp_unique)
+noncod_pct <- round(sum(snp_unique$snp_coding == "Noncoding") / n_snp_u * 100)
+
+p_snploc <- ggplot(loc) +
+  geom_rect(aes(xmin = 3, xmax = 4, ymin = ymin, ymax = ymax, fill = snp_region), colour = "white", linewidth = 0.4) +
+  geom_text(aes(x = 3.5, y = mid, label = ifelse(n >= 4, n, "")), colour = "grey15", size = sz(7)) +
+  scale_fill_manual(values = loc_pal, name = "SNP location") +
+  coord_polar(theta = "y") + xlim(c(1.5, 4.5)) +
+  annotate("text", x = 1.5, y = 0, label = paste0("n = ", comma(n_snp_u)), size = sz(8), colour = "grey15") +
+  annotate("text", x = 2.05, y = 0, label = "unique\nsQTL SNPs", size = sz(6.5), colour = "grey40", lineheight = 0.9) +
+  labs(subtitle = sprintf("%d%% of sQTL SNPs are noncoding", noncod_pct)) +
+  theme_void(base_size = 7) +
+  theme(legend.title = element_text(size = 7), legend.text = element_text(size = 7, colour = "grey15"),
+        legend.key.size = unit(3.4, "mm"), legend.position = "right",
+        plot.subtitle = element_text(size = 7.5, hjust = 0, colour = "grey15", margin = margin(b = 4)),
+        plot.background = element_rect(fill = "white", colour = NA))
+save_fig(p_snploc, "Fig4a_snp_location", w = 4.6, h = 2.6)
+p_snploc
+```
+
+## 4b — counts for the SNP → junction schematic
+
+```{r fig4b_counts, message=FALSE, warning=FALSE}
+lfc_snp <- lfc_m %>% mutate(SNP = .data[[snp_col]]) %>% filter(!is.na(SNP), SNP != "", !is.na(junction_key))
+fig4b <- tibble(
+  metric = c("snp_junction_associations", "distinct_snps", "distinct_junctions", "distinct_snp_junction_pairs",
+             "median_junctions_per_snp", "median_snps_per_junction"),
+  value  = c(nrow(lfc_snp), n_distinct(lfc_snp$SNP), n_distinct(lfc_snp$junction_key),
+             nrow(distinct(lfc_snp, SNP, junction_key)),
+             median(table(lfc_snp$SNP)), median(table(lfc_snp$junction_key))))
+write_csv(fig4b, file.path(TABLE_DIR, "Fig4b_snp_junction_counts.csv"))
+print(fig4b)
+```
+
+## 4c — overlap of the 355 junctions with GENCODE v38 and the long-read transcriptome
+
+```{r fig4c_nested_set, message=FALSE, warning=FALSE}
+ann <- count(junction_master, annotation_status) %>% deframe()
+n_both <- ann[["GENCODE v38 + long-read"]]; n_gc_only <- ann[["GENCODE v38 only"]]
+n_lr_only <- ann[["Long-read only"]];       n_neither <- ann[["Neither"]]
+stopifnot(n_both + n_gc_only + n_lr_only + n_neither == 355)
+cat("Fig 4c: both", n_both, "| GENCODE only", n_gc_only, "| long-read only", n_lr_only, "| neither", n_neither, "\n")
+write_csv(tibble(set = c("both", "gencode_only", "longread_only", "neither"),
+                 n = c(n_both, n_gc_only, n_lr_only, n_neither)),
+          file.path(TABLE_DIR, "Fig4c_junction_nested_set.csv"))
+
+circle_df <- function(x0, y0, r, n = 100) { t <- seq(0, 2 * pi, length.out = n)
+  data.frame(x = x0 + r * cos(t), y = y0 + r * sin(t)) }
+outer <- circle_df(0, 0, 3.2); gc_circ <- circle_df(-0.5, 0.2, 2.2); lr_circ <- circle_df(0.5, 0.2, 2.0)
+
+p_venn <- ggplot() +
+  geom_polygon(data = outer,   aes(x, y), fill = "gray85", color = "gray40", linewidth = 0.5, alpha = 0.3) +
+  geom_polygon(data = gc_circ, aes(x, y), fill = "#6B8F96", color = "#6B8F96", linewidth = 0.5, alpha = 0.25) +
+  geom_polygon(data = lr_circ, aes(x, y), fill = "#8A7FA8", color = "#8A7FA8", linewidth = 0.5, alpha = 0.25) +
+  annotate("text", x = 0,    y = 0.5,  label = sprintf("GENCODE\nv38 +\nlrRNA seq\n%d", n_both), size = sz(7.5), lineheight = 0.9) +
+  annotate("text", x = -1.8, y = 0.2,  label = sprintf("GENCODE\nv38 only\n%d", n_gc_only), size = sz(7), lineheight = 0.9) +
+  annotate("text", x = 1.7,  y = 0.2,  label = sprintf("lrRNA\nseq only\n%d", n_lr_only),   size = sz(7), lineheight = 0.9) +
+  annotate("text", x = -2.5, y = -2.5, label = sprintf("Not\nCaptured\n%d", n_neither),     size = sz(7), lineheight = 0.9) +
+  coord_equal(xlim = c(-4, 4), ylim = c(-4, 4.5)) + theme_void() +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+save_fig(p_venn, "Fig4c_junction_nested_set", w = 2.6, h = 3)
+p_venn
+```
+
+## 4d — coding versus noncoding junctions, by long-read capture
+
+"Coding" here means that the junction overlaps GENCODE-annotated CDS, a definition
+available for all 355 junctions (unlike the long-read ORF-based class used for 4e).
+
+```{r fig4d_coding_capture, message=FALSE, warning=FALSE}
+coding_keys <- cds_class$junction_key[cds_class$overlaps_cds %in% c(TRUE, "TRUE")]
+cap_levels  <- c("In long-read (carried forward)", "Annotation only")
+
+cc <- junction_master %>%
+  mutate(coding  = factor(ifelse(junction_key %in% coding_keys, "Coding", "Noncoding"), levels = c("Coding", "Noncoding")),
+         capture = factor(ifelse(lr_captured, cap_levels[1], cap_levels[2]), levels = cap_levels)) %>%
+  count(coding, capture) %>%
+  group_by(coding) %>% arrange(capture, .by_group = TRUE) %>%
+  mutate(ypos = rev(cumsum(rev(n))) - n / 2) %>% ungroup()
+totals <- cc %>% group_by(coding) %>% summarise(n = sum(n), .groups = "drop")
+stopifnot("does not sum to 355" = sum(cc$n) == 355)
+write_csv(cc %>% select(coding, capture, n), file.path(TABLE_DIR, "Fig4d_coding_by_capture.csv"))
+
+p4d <- ggplot(cc, aes(coding, n, fill = capture)) +
+  geom_col(width = 0.6, colour = "white", linewidth = 0.4) +
+  geom_text(aes(y = ypos, label = comma(n), colour = ifelse(capture == "Annotation only", "grey20", "grey15")), size = sz(7)) +
+  geom_text(data = totals, aes(coding, n, label = comma(n)), inherit.aes = FALSE, vjust = -0.6, size = sz(7), colour = "grey15") +
+  scale_colour_identity() +
+  scale_fill_manual(values = c("Annotation only" = "#D4D4D4", "In long-read (carried forward)" = "#8A7FA8"), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12)), labels = comma) +
+  labs(title = sprintf("CAD sQTL junctions (n = %s)", comma(sum(cc$n))), x = NULL, y = "Number of junctions") +
+  theme_cell(7) +
+  theme(legend.position = "bottom", legend.key.size = unit(0.3, "cm"), plot.title = element_text(size = 7.5))
+save_fig(p4d, "Fig4d_coding_by_capture", 2.8, 2.4)
+p4d
+```
+
+## 4e — predicted junction consequence among the 146 long-read-captured junctions
+
+Reads `dom` (one dominant call per junction, from the junction master). Junctions that
+received no call are grouped with "Complex / other"; the composition of that wedge is
+exported for the legend.
+
+```{r fig4e_effect_donut, message=FALSE, warning=FALSE}
+universe <- junction_master$junction_key[junction_master$lr_captured]
+stopifnot(length(universe) == 146)
+
+PE_PAL  <- c("ES / inclusion in ORF" = GREEN[["dark"]], "Alt splice site in ORF" = GREEN[["base"]],
+             "AFE/ALE in ORF" = GREEN[["mid"]], "Complex / other" = GREY[["mid"]],
+             "Non-coding splice event" = GREY[["dark"]])
+PE_DISP <- c("ES / inclusion in ORF" = "Exon skipping or inclusion", "Alt splice site in ORF" = "Alternative splice site",
+             "AFE/ALE in ORF" = "Alternative first or last exon", "Complex / other" = "Complex or unclassified",
+             "Non-coding splice event" = "Noncoding splice event")
+ORF_ALTERING <- c("ES / inclusion in ORF", "Alt splice site in ORF", "AFE/ALE in ORF")
+
+pe <- tibble(junction_key = universe) %>%
+  left_join(dom, by = "junction_key") %>%
+  mutate(effect = ifelse(is.na(protein_effect), "Complex / other", protein_effect)) %>%
+  count(effect, name = "n") %>%
+  mutate(label = factor(effect, levels = intersect(names(PE_PAL), effect))) %>%
+  arrange(label) %>%
+  mutate(ymax = cumsum(n), ymin = lag(ymax, default = 0), mid = (ymin + ymax) / 2,
+         txt_col = ifelse(as.character(label) %in% c("ES / inclusion in ORF", "Alt splice site in ORF", "Non-coding splice event"),
+                          "white", "grey15"),
+         label_disp = factor(PE_DISP[as.character(label)], levels = unname(PE_DISP)))
+PE_PAL_DISP <- setNames(unname(PE_PAL[as.character(pe$label)]), as.character(pe$label_disp))
+n_orf <- sum(pe$n[as.character(pe$label) %in% ORF_ALTERING]); total_n <- sum(pe$n)
+cat(sprintf("Fig 4e: %d of %d junctions (%.0f%%) predicted to alter the ORF\n", n_orf, total_n, 100 * n_orf / total_n))
+write_csv(pe %>% select(effect, label_disp, n), file.path(TABLE_DIR, "Fig4e_protein_effects_plotted.csv"))
+
+pPE <- ggplot(pe) +
+  geom_rect(aes(xmin = 3, xmax = 4, ymin = ymin, ymax = ymax, fill = label_disp), colour = "white", linewidth = 0.4) +
+  geom_text(aes(x = 3.5, y = mid, label = ifelse(n >= 8, n, ""), colour = txt_col), size = sz(7)) +
+  scale_fill_manual(values = PE_PAL_DISP, name = "Predicted junction consequence") +
+  scale_colour_identity() +
+  coord_polar(theta = "y") + xlim(c(1.5, 4.5)) +
+  annotate("text", x = 1.5, y = 0,
+           label = sprintf("%d of %d\njunctions\n(%.0f%%) predicted\nto alter the ORF", n_orf, total_n, 100 * n_orf / total_n),
+           size = sz(7), colour = "grey15", lineheight = 0.95) +
+  theme_void(base_size = 7) +
+  theme(legend.title = element_text(size = 7), legend.text = element_text(size = 7, colour = "grey15"),
+        legend.key.size = unit(3.4, "mm"), legend.position = "right",
+        plot.background = element_rect(fill = "white", colour = NA))
+save_fig(pPE, "Fig4e_protein_effects_donut", 4.6, 2.4)
+pPE
+
+# Composition of the "Complex / other" wedge. GNL3 and PPT2 junctions have no GWAS
+# risk allele in the summary statistics and therefore no direction call.
+complex_called <- pj_full %>%
+  filter(protein_effect == "Complex / other", cad_sqtl_junction %in% universe) %>%
+  distinct(gene_name, cluster_bed, cad_sqtl_junction, as_type_A, any_cds)
+no_call <- setdiff(universe, pj_full$cad_sqtl_junction)
+wedge_breakdown <- bind_rows(
+  complex_called %>% transmute(gene_name, junction_key = cad_sqtl_junction,
+                               reason = "Splice class unresolved by junction topology"),
+  junction_master %>% filter(junction_key %in% no_call) %>%
+    transmute(gene_name, junction_key,
+              reason = ifelse(gene_name %in% c("GNL3", "PPT2"), "No GWAS risk allele, no direction call",
+                              "Junction not part of a defined risk/nonrisk pair"))) %>%
+  distinct() %>% arrange(reason, gene_name)
+write_csv(wedge_breakdown, file.path(TABLE_DIR, "Fig4e_complex_wedge_breakdown.csv"))
+```
+
+## 4f — junction overlap with protein features (CAD versus non-CAD VSMC sQTL junctions)
+
+The ±30-bp overlap with UniProt domains, secondary-structure elements and disordered
+regions, with Fisher's exact test, is computed in script 03; this chunk plots the three
+rows of that aggregate table.
+
+```{r fig4f_feature_overlap, message=FALSE, warning=FALSE}
+require_files(OUT_AGGREGATE_JUNCTION)
+jres <- read_csv(OUT_AGGREGATE_JUNCTION, show_col_types = FALSE)
+
+# binary overlap properties are stored as proportions (0-1) in the median columns
+nm <- names(jres)
+pct_cad_col <- nm[str_detect(nm, regex("(pct|prop|percent|frac).*cad(?!.*non)|cad.*(pct|prop|percent|frac)", ignore_case = TRUE)) & !str_detect(nm, "non")][1]
+pct_non_col <- nm[str_detect(nm, regex("non.*(pct|prop|percent|frac)|(pct|prop|percent|frac).*non", ignore_case = TRUE))][1]
+base <- if (!is.na(pct_cad_col) && !is.na(pct_non_col)) {
+  jres %>% transmute(property_label, CAD = .data[[pct_cad_col]], nonCAD = .data[[pct_non_col]], p_value, n_cad, n_noncad)
+} else if (all(c("median_cad", "median_noncad") %in% nm)) {
+  jres %>% transmute(property_label, CAD = median_cad * 100, nonCAD = median_noncad * 100, p_value, n_cad, n_noncad)
+} else stop("Cannot find CAD/nonCAD percentage columns in ", basename(OUT_AGGREGATE_JUNCTION))
+
+# the three +/-30 bp overlap properties (anchored so "Domain category:" rows do not match)
+WANT <- c("Protein Domain" = "^Protein Domain", "Secondary Structure" = "^Secondary Structure",
+          "Disordered Region" = "^Disordered Region")
+pick_label <- function(pat) { hit <- unique(base$property_label)[str_detect(unique(base$property_label), regex(pat, ignore_case = TRUE))]
+                              if (length(hit)) hit[1] else NA_character_ }
+sel <- tibble(display = names(WANT), pat = unname(WANT)) %>% mutate(property_label = map_chr(pat, pick_label))
+stopifnot("could not match all three properties" = !any(is.na(sel$property_label)))
+
+bar <- base %>% inner_join(sel, by = "property_label") %>%
+  pivot_longer(c(CAD, nonCAD), names_to = "group", values_to = "pct") %>%
+  mutate(group = factor(ifelse(group == "nonCAD", "Non-CAD", "CAD"), levels = c("Non-CAD", "CAD")),
+         display = factor(display, levels = rev(names(WANT))),
+         sig = star_p(p_value))
+write_csv(bar, file.path(TABLE_DIR, "Fig4f_junction_overlap_features.csv"))
+
+p_bar <- ggplot(bar, aes(display, pct, fill = group)) +
+  geom_col(position = position_dodge(0.72), width = 0.66, colour = "grey25", linewidth = 0.2) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)), position = position_dodge(0.72), hjust = -0.15, size = sz(7)) +
+  geom_text(data = bar %>% group_by(display, sig) %>% summarise(y = max(pct), .groups = "drop"),
+            aes(x = display, y = y + 11, label = sig), inherit.aes = FALSE, size = sz(7), colour = "grey30") +
+  scale_fill_manual(values = c("CAD" = COL_PANEL$cad, "Non-CAD" = COL_PANEL$neutral), breaks = c("CAD", "Non-CAD"), name = NULL) +
+  scale_y_continuous(limits = c(0, 62), breaks = seq(0, 60, 20), expand = expansion(mult = c(0, 0.02))) +
+  coord_flip() +
+  labs(x = NULL, y = "Percentage of junctions (%)", title = "Junction overlap with protein features",
+       subtitle = sprintf("*n* CAD = %s, non-CAD = %s", comma(first(bar$n_cad)), comma(first(bar$n_noncad)))) +
+  theme_cell(BASE_SIZE) +
+  theme(legend.position = "top", legend.justification = "left", legend.key.size = unit(2.6, "mm"),
+        legend.margin = margin(b = -4), legend.text = element_text(size = BASE_SIZE - 1),
+        axis.text.y = element_text(size = BASE_SIZE - 1), plot.title = element_text(size = BASE_SIZE, face = "plain"),
+        plot.subtitle = ggtext::element_markdown(size = BASE_SIZE - 1.5, colour = "grey35"),
+        plot.title.position = "plot")
+save_fig(p_bar, "Fig4f_junction_overlap_features", w = 2, h = 2.6)
+p_bar
+```
+
+## 4g — coding CAD sQTL junctions with distinguishing peptide evidence (n = 133)
+
+For each probeable junction, script 05 compared the long-read isoforms carrying the
+risk-associated junction with those carrying the nonrisk-associated junction and
+recorded on which side at least one distinguishing peptide was detected. Percentages
+are of the 133 probeable junctions.
+
+```{r fig4g_peptide_sides, message=FALSE, warning=FALSE}
+N_DENOM <- sum(junction_master$probeable)   # 133 coding CAD sQTL junctions
+SIDE_LV  <- c("Risk only", "Nonrisk only", "Both sides")
+SIDE_LAB <- c("Risk only" = "Risk", "Nonrisk only" = "Nonrisk", "Both sides" = "Both")
+SIDE_COL <- c("Risk only" = COL_PANEL$risk, "Nonrisk only" = COL_PANEL$nonrisk, "Both sides" = COL_PANEL$cad)
+
+valC <- junction_master %>%
+  filter(probeable) %>%
+  count(side) %>%
+  filter(side %in% SIDE_LV) %>%
+  mutate(side = factor(side, levels = SIDE_LV),
+         pct = 100 * n / N_DENOM, lab = sprintf("%d\n(%.1f%%)", n, pct))
+n_val <- sum(valC$n)
+cat(sprintf("Fig 4g: %d of %d coding CAD sQTL junctions (%.1f%%) with a distinguishing peptide\n",
+            n_val, N_DENOM, 100 * n_val / N_DENOM))
+write_csv(valC %>% select(side, n, pct), file.path(TABLE_DIR, "Fig4g_distinguishing_peptides.csv"))
+
+p_4g <- ggplot(valC, aes(side, n, fill = side)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", n, pct)), vjust = -0.25, size = sz(7), lineheight = 0.85) +
+  scale_fill_manual(values = SIDE_COL, guide = "none") +
+  scale_x_discrete(labels = SIDE_LAB) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(x = "Set with a distinguishing peptide", y = "CAD sQTL junctions",
+       title = "Peptide evidence",
+       subtitle = sprintf("%d of %d junctions (%.0f%%)", n_val, N_DENOM, 100 * n_val / N_DENOM)) +
+  theme_cell(BASE_SIZE) +
+  theme(axis.title.x = element_text(lineheight = 0.9),
+        plot.subtitle = element_text(size = BASE_SIZE - 0.5, colour = "grey30"))
+save_fig(p_4g, "Fig4g_distinguishing_peptides", 2.0, 2.4)
+p_4g
+```
+
+## 4h — direction of the dominant property change (82 of 94 pairs)
+
+Fill encodes direction with the risk/nonrisk colours; the property family is the row
+grouping. Manual AP-MS pairs are excluded so that the count matches the 94 computed
+pairs described in the text.
+
+```{r fig4h_direction, message=FALSE, warning=FALSE}
+DIR_LV  <- c("Risk increased", "Risk decreased")
+DIR_COL <- c("Risk increased" = COL_PANEL$risk, "Risk decreased" = COL_PANEL$nonrisk)
+
+fam_div <- pair_modes %>%
+  filter(!gated, !is.na(mode_family)) %>%
+  mutate(dir_grp = factor(ifelse(mode_oriented > 0, "Risk increased", "Risk decreased"), levels = DIR_LV)) %>%
+  count(mode_family, dir_grp, name = "n") %>%
+  mutate(signed = ifelse(dir_grp == "Risk increased", n, -n)) %>%
+  group_by(mode_family) %>% mutate(fam_tot = sum(n)) %>% ungroup() %>%
+  mutate(mode_family = fct_reorder(mode_family, fam_tot))
+n_dom  <- sum(!pair_modes$gated, na.rm = TRUE)
+n_gate <- sum(pair_modes$gated,  na.rm = TRUE)
+cat(sprintf("Fig 4h: %d pairs with a dominant mode; %d minimal or mixed\n", n_dom, n_gate))
+write_csv(fam_div %>% select(mode_family, dir_grp, n), file.path(TABLE_DIR, "Fig4h_dominant_change_direction.csv"))
+
+p_famdiv <- ggplot(fam_div, aes(signed, mode_family, fill = dir_grp)) +
+  geom_col(width = 0.68, colour = "white", linewidth = 0.3) +
+  geom_vline(xintercept = 0, linewidth = 0.4, colour = "grey40") +
+  geom_text(aes(label = abs(signed), hjust = ifelse(signed > 0, -0.3, 1.3)), size = sz(7), colour = "grey15") +
+  scale_fill_manual(values = DIR_COL, breaks = DIR_LV, name = NULL) +
+  scale_x_continuous(labels = abs, limits = c(-26, 16), breaks = seq(-20, 10, 10)) +
+  labs(x = "Number of pairs", y = NULL, title = "Dominant change",
+       subtitle = sprintf("%d of %d pairs", n_dom, n_dom + n_gate)) +
+  theme_cell(BASE_SIZE) +
+  theme(legend.position = "bottom", legend.direction = "vertical",
+        legend.key.size = unit(2.6, "mm"), legend.text = element_text(size = BASE_SIZE - 0.5),
+        legend.margin = margin(t = -2), legend.spacing.y = unit(0, "mm"),
+        plot.title = element_text(face = "plain", size = BASE_SIZE + 1),
+        plot.title.position = "plot",
+        plot.subtitle = element_text(size = BASE_SIZE - 0.5, colour = "grey30"),
+        axis.text.y = element_text(size = BASE_SIZE - 0.5),
+        panel.grid.major.y = element_blank())
+save_fig(p_famdiv, "Fig4h_dominant_change_direction", 2.0, 2.6)
+p_famdiv
+```
+
+## Row 2 assembled — 4f, 4g, 4h as one strip
+
+Patchwork sizes the title, legend and axis strips of every panel to the tallest in the
+row, so that the panel areas and x-axis baselines align, and the `&` theme gives all
+three panels one text scale.
+
+```{r fig4_row2_assembled, message=FALSE, warning=FALSE}
+row_f <- p_bar
+row_g <- p_4g
+row_h <- p_famdiv +
+  guides(fill = guide_legend(nrow = 2)) +
+  theme(legend.position = "top", legend.justification = "left", legend.direction = "vertical")
+
+fig4_row2 <- (row_f | row_g | row_h) +
+  plot_layout(widths = c(1.25, 0.9, 1.1)) &
+  theme(plot.title.position = "plot",
+        plot.title    = element_text(size = 8, face = "plain"),
+        plot.subtitle = ggtext::element_markdown(size = 7, colour = "grey30"),
+        axis.title    = element_text(size = 7),
+        axis.text     = element_text(size = 7, colour = "black"),
+        legend.text   = element_text(size = 7),
+        legend.title  = element_text(size = 7),
+        legend.key.size = unit(2.8, "mm"),
+        plot.margin   = margin(4, 6, 4, 4))
+save_fig(fig4_row2, "Fig4_row2_f-h", 5.6, 2.4)
+fig4_row2
+```
+
+## Numbers for the text (junction → isoform mapping)
+
+For the 146 long-read-captured junctions, the share whose carrying isoforms include at
+least one novel (NIC/NNC) transcript, and the share of all junction-assigned isoforms
+that are novel.
+
+```{r fig4_text_numbers, message=FALSE, warning=FALSE}
+iso_cat  <- rna %>% transmute(pb_id = str_extract(isoform, "PB\\.[0-9]+\\.[0-9]+"), cat = structural_category)
+novel_pb <- unique(iso_cat$pb_id[iso_cat$cat %in% cat_novel])
+
+lr_map <- read_csv(OUT_JUNCTION_ISOFORM_MAP, show_col_types = FALSE) %>%
+  mutate(pb_id = str_extract(as.character(pb_id), "PB\\.[0-9]+\\.[0-9]+")) %>%
+  filter(!is.na(pb_id))
+
+jn <- lr_map %>%
+  filter(junction_key %in% junction_master$junction_key[junction_master$lr_captured]) %>%
+  group_by(junction_key) %>%
+  summarise(n_isoforms = n_distinct(pb_id),
+            n_novel    = n_distinct(pb_id[pb_id %in% novel_pb]),
+            any_novel  = n_novel > 0, .groups = "drop")
+stopifnot("LR-captured junction count changed" = nrow(jn) == sum(junction_master$lr_captured))
+cat(sprintf("%d of %d LR-captured junctions (%.0f%%) carried >= 1 novel (NIC/NNC) isoform\n",
+            sum(jn$any_novel), nrow(jn), 100 * mean(jn$any_novel)))
+iso_assigned <- lr_map %>% filter(junction_key %in% jn$junction_key) %>% distinct(pb_id)
+cat(sprintf("%d of %d junction-assigned isoforms (%.0f%%) are novel\n",
+            sum(iso_assigned$pb_id %in% novel_pb), nrow(iso_assigned),
+            100 * mean(iso_assigned$pb_id %in% novel_pb)))
+write_csv(jn, file.path(TABLE_DIR, "Fig4_novel_isoform_per_LR_junction.csv"))
+```
+
+
+# Extended Data Figure 4 — peptide evidence for CAD sQTL isoforms
+
+Panels 4b–e (browser tracks, AlphaFold3) are made elsewhere.
+
+## 4a — peptide evidence per CAD sGene by isoform class
+
+Rows: Risk (peptide exclusive to the risk-junction isoforms), Nonrisk, Shared (sequence
+present in both sets). Point size is the number of distinct peptides; an asterisk marks
+at least one IS-PRM detection in that group. Genes are ordered by evidence tier (both
+sides supported, one side, shared only).
+
+```{r figED4a_peptide_dotplot, message=FALSE, warning=FALSE}
+STATUS_LV  <- c("Risk", "Nonrisk", "Shared")
+STATUS_COL <- c(Risk = COL_PANEL$risk, Nonrisk = COL_PANEL$nonrisk, Shared = COL_PANEL$cad)
+pep_dot <- detail %>%
+  mutate(status = dplyr::recode(as.character(peptide_class), "Both (shared)" = "Shared", "Non-Risk" = "Nonrisk")) %>%
+  filter(status %in% STATUS_LV) %>%
+  group_by(gene = gene_symbol, status) %>%
+  summarise(n_pep = n_distinct(peptide), any_isprm = any(detected_by == "IS-PRM"), .groups = "drop") %>%
+  mutate(status = factor(status, levels = STATUS_LV), shape_lab = ifelse(any_isprm, "IS-PRM", "Discovery"))
+tiers <- pep_dot %>%
+  group_by(gene) %>%
+  summarise(has_risk = any(status == "Risk" & n_pep > 0), has_nonrisk = any(status == "Nonrisk" & n_pep > 0),
+            has_shared = any(status == "Shared" & n_pep > 0), tot = sum(n_pep), .groups = "drop") %>%
+  mutate(tier = case_when(has_risk & has_nonrisk ~ 1L, has_risk | has_nonrisk ~ 2L, has_shared ~ 3L, TRUE ~ 4L))
+write_csv(pep_dot %>% left_join(tiers %>% select(gene, tier), by = "gene"), file.path(TABLE_DIR, "ED4a_peptide_evidence_dotplot.csv"))
+
+ord <- tiers %>% arrange(tier, desc(tot)) %>% pull(gene)
+d <- pep_dot %>% mutate(gene = factor(sprintf("*%s*", gene), levels = sprintf("*%s*", ord)))
+p_pepdot <- ggplot(d, aes(gene, status)) +
+  geom_point(aes(size = n_pep, colour = status, shape = shape_lab)) +
+  scale_colour_manual(values = STATUS_COL, breaks = STATUS_LV, name = NULL) +
+  scale_shape_manual(values = c("IS-PRM" = 8, "Discovery" = 16), name = NULL) +
+  scale_size_area(max_size = 2.0, name = "Distinct peptides") +
+  scale_y_discrete(limits = rev(STATUS_LV)) +
+  guides(colour = guide_legend(override.aes = list(size = 2.2)), shape = guide_legend(override.aes = list(size = 2.2))) +
+  labs(x = NULL, y = NULL, title = "Peptide evidence by gene and peptide class") +
+  theme_cell(7) +
+  theme(panel.grid.major = element_line(linewidth = 0.2, colour = "grey92"),
+        axis.text.x = element_markdown(angle = 90, vjust = 0.5, hjust = 1, size = 5),
+        legend.position = "top", legend.key.size = unit(3, "mm"), legend.text = element_text(size = 6),
+        plot.title = element_text(size = 8))
+save_fig(p_pepdot, "ED4a_peptide_evidence_dotplot", 7.5, 1.5)
+p_pepdot
+```
+
+
+# Extended Data Figure 5 — splice event classes, NMD status and isoform property differences
+
+## 5a — alternative-splicing event class, CAD versus non-CAD VSMC sQTL clusters
+
+The overall χ² test and the per-class Fisher tests (BH-corrected) are exported; the
+statistics are reported in the legend rather than drawn on the panel.
+
+```{r figED5a_as_classes, message=FALSE, warning=FALSE}
+require_files(OUT_AS_DISTRIBUTION)
+as_df <- read_csv(OUT_AS_DISTRIBUTION, show_col_types = FALSE) %>%
+  mutate(as_type_B = ifelse(is.na(as_type_B), "NA", as.character(as_type_B)), pct = as.numeric(pct))
+as_ct <- as_df %>% group_by(group, as_type_B) %>% summarise(n = sum(n), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = n, values_fill = 0)
+ct_mat <- as.matrix(as_ct[setdiff(names(as_ct), "as_type_B")]); rownames(ct_mat) <- as_ct$as_type_B
+overall_chi <- suppressWarnings(chisq.test(ct_mat))
+per_type <- purrr::map_dfr(as_ct$as_type_B, function(t) {
+  this <- ct_mat[t, , drop = FALSE]; rest <- colSums(ct_mat[rownames(ct_mat) != t, , drop = FALSE])
+  ft <- suppressWarnings(fisher.test(rbind(this, rest)))
+  tibble(as_type = t, odds_ratio = unname(ft$estimate), fisher_p = ft$p.value)
+}) %>% mutate(fisher_p_BH = p.adjust(fisher_p, "BH"), sig = star(fisher_p_BH))
+n_cad    <- sum(as_df$n[!grepl("non", as_df$group, ignore.case = TRUE)])
+n_noncad <- sum(as_df$n[ grepl("non", as_df$group, ignore.case = TRUE)])
+cat(sprintf("ED 5a: chi-square P = %.3g | n clusters CAD = %s, non-CAD = %s\n", overall_chi$p.value, comma(n_cad), comma(n_noncad)))
+write_csv(per_type %>% arrange(fisher_p_BH), file.path(TABLE_DIR, "ED5a_as_type_per_class_fisher.csv"))
+write_csv(tibble(test = "chi-square (overall)", statistic = unname(overall_chi$statistic),
+                 df = unname(overall_chi$parameter), p_value = overall_chi$p.value),
+          file.path(TABLE_DIR, "ED5a_as_type_overall_chisq.csv"))
+
+as_df$group <- factor(ifelse(grepl("non", as_df$group, ignore.case = TRUE), "Non-CAD", "CAD"), levels = c("CAD", "Non-CAD"))
+ord <- as_df %>% group_by(as_type_B) %>% summarise(tot = sum(n), .groups = "drop") %>% arrange(desc(tot)) %>% pull(as_type_B)
+tail_lv <- intersect(c("complex", "NA"), ord); ord <- c(setdiff(ord, tail_lv), tail_lv)
+as_df <- as_df %>%
+  mutate(as_type_B = factor(as_type_B, levels = rev(ord)),
+         seg_lab = ifelse(pct >= 4, sprintf("%s\n(%d%%)", comma(n), round(pct)), ""))
+AS_PAL <- c("ES" = GREEN[["mid"]], "AAS" = GREEN[["light"]], "ADS" = "#DDE6E0", "MXE" = "#EEF2EF",
+            "complex" = GREY[["mid"]], "NA" = GREY[["light"]])
+sig_lookup <- per_type %>% transmute(as_type, sig = ifelse(is.na(sig) | sig == "ns", "", sig))
+leg_labs <- setNames(vapply(ord, function(t) { s <- sig_lookup$sig[sig_lookup$as_type == t]
+                                               if (length(s) && s != "") paste0(t, " ", s) else t }, character(1)), ord)
+
+pAS <- ggplot(as_df, aes(group, pct, fill = as_type_B)) +
+  geom_col(width = 0.7, colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = seg_lab), position = position_stack(vjust = 0.5), colour = "grey15", size = sz(7), lineheight = 0.85) +
+  scale_fill_manual(values = AS_PAL[intersect(names(AS_PAL), ord)], name = "AS type", breaks = ord, labels = leg_labs) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Percentage of clusters (%)", title = "Alternative splicing event class") +
+  s5_theme(7) +
+  guides(fill = guide_legend(nrow = 2, title.position = "top"))
+save_fig(pAS, "ED5a_as_event_types", 2.2, 2.6)
+pAS
+```
+
+## 5b — predicted NMD status (majority vote across the junction's isoforms)
+
+```{r figED5b_nmd, message=FALSE, warning=FALSE}
+require_files(OUT_NMD_CAD_MAJORITY, OUT_NMD_NONCAD_MAJORITY)
+nmd_cad    <- read_csv(OUT_NMD_CAD_MAJORITY,    show_col_types = FALSE)
+nmd_noncad <- read_csv(OUT_NMD_NONCAD_MAJORITY, show_col_types = FALSE)
+NMD_COLS <- c("NMD" = GREEN[["base"]], "Non-NMD" = GREY[["light"]])
+
+cad_nmd <- sum(nmd_cad$majority_nmd);    cad_non    <- nrow(nmd_cad)    - cad_nmd
+noncad_nmd <- sum(nmd_noncad$majority_nmd); noncad_non <- nrow(nmd_noncad) - noncad_nmd
+nmd_p <- fisher.test(matrix(c(cad_nmd, cad_non, noncad_nmd, noncad_non), nrow = 2))$p.value
+cat(sprintf("ED 5b: NMD %d/%d CAD vs %d/%d non-CAD; Fisher P = %.3g\n", cad_nmd, nrow(nmd_cad), noncad_nmd, nrow(nmd_noncad), nmd_p))
+
+nmd_df <- tibble(group = rep(c("CAD", "Non-CAD"), each = 2), status = rep(c("NMD", "Non-NMD"), 2),
+                 n = c(cad_nmd, cad_non, noncad_nmd, noncad_non)) %>%
+  group_by(group) %>% mutate(pct = 100 * n / sum(n)) %>% ungroup() %>%
+  mutate(group = factor(group, levels = c("CAD", "Non-CAD")), status = factor(status, levels = c("NMD", "Non-NMD")),
+         lab = sprintf("%d\n(%.1f%%)", n, pct)) %>%
+  arrange(group, desc(status)) %>% group_by(group) %>% mutate(ypos = cumsum(pct) - pct / 2) %>% ungroup()
+write_csv(nmd_df %>% select(-ypos) %>% mutate(fisher_p = nmd_p), file.path(TABLE_DIR, "ED5b_nmd_status.csv"))
+
+p_nmd <- ggplot(nmd_df, aes(group, pct, fill = status)) +
+  geom_col(width = 0.6, colour = "white", linewidth = 0.3) +
+  geom_text(aes(y = ypos, label = lab), colour = "grey15", size = sz(7), lineheight = 0.85) +
+  scale_fill_manual(values = NMD_COLS, name = "Status") +
+  scale_y_continuous(breaks = c(0, 25, 50, 75, 100), expand = expansion(mult = c(0, 0.02))) +
+  labs(x = NULL, y = "Percentage of junctions (%)", title = "Predicted NMD status") +
+  s5_theme(7) +
+  guides(fill = guide_legend(nrow = 1, title.position = "top"))
+save_fig(p_nmd, "ED5b_nmd_status", 2.6, 2.6)
+p_nmd
+```
+
+## 5c — peptide evidence for isoforms with notable features, by pair role
+
+Script 05 defines the peptide-supported isoforms with novel-transcript, novel-protein,
+predicted-NMD or retained-intron features (one isoform may carry several). The colour
+added here states whether the isoform is the representative risk- or nonrisk-associated
+isoform of a pair (script 06) or another member of the risk- or nonrisk-junction set.
+A distinguishing peptide is exclusive to a set rather than to a single isoform, so the
+grey category keeps the panel from reading as individually validated isoforms.
+
+```{r figED5c_features_by_role, message=FALSE, warning=FALSE}
+risk_set    <- unique(na.omit(pairs$risk_pb))
+nonrisk_set <- unique(na.omit(pairs$nonrisk_pb))
+ROLE_LV   <- c("Risk-associated isoform", "Nonrisk-associated isoform", "Other isoform")
+ROLE_COLS <- setNames(c(COL_PANEL$risk, COL_PANEL$nonrisk, GREY[["mid"]]), ROLE_LV)
+cand <- cand %>%
+  select(-any_of("sqtl_role")) %>%
+  mutate(sqtl_role = factor(case_when(pb_id %in% risk_set    ~ ROLE_LV[1],
+                                      pb_id %in% nonrisk_set ~ ROLE_LV[2],
+                                      TRUE                   ~ ROLE_LV[3]), levels = ROLE_LV))
+
+# every candidate isoform must sit in the risk or nonrisk set of some cluster
+in_set <- detail %>%
+  filter(peptide_class %in% c("Risk", "Nonrisk")) %>%
+  separate_rows(isoforms_evidenced, sep = ";\\s*") %>%
+  pull(isoforms_evidenced) %>% unique()
+cat(sprintf("ED 5c: %d isoforms across %d genes | in a risk/nonrisk set: %d | pair representatives: %d\n",
+            nrow(cand), n_distinct(cand$gene), sum(cand$pb_id %in% in_set),
+            sum(cand$sqtl_role != ROLE_LV[3])))
+stopifnot("candidate isoform outside both junction sets" = all(cand$pb_id %in% in_set))
+
+feat_levels <- c("Novel transcript", "Novel protein", "NMD", "Retained intron")
+feat_long <- cand %>%
+  transmute(pb_id, sqtl_role, `Novel transcript` = novel_tx, `Novel protein` = novel_protein,
+            `NMD` = nmd, `Retained intron` = retained_intron) %>%
+  pivot_longer(-c(pb_id, sqtl_role), names_to = "feature", values_to = "has") %>%
+  filter(has) %>%
+  mutate(feature = factor(feature, levels = feat_levels))
+feat_tot <- feat_long %>% count(feature, name = "n")
+feat_seg <- feat_long %>% count(feature, sqtl_role, name = "n") %>%
+  arrange(feature, desc(sqtl_role)) %>% group_by(feature) %>% mutate(ypos = cumsum(n) - n / 2) %>% ungroup()
+write_csv(feat_seg %>% select(-ypos), file.path(TABLE_DIR, "ED5c_features_by_role.csv"))
+write_csv(cand %>% select(gene, pb_id, sqtl_role, novel_tx, novel_protein, nmd, retained_intron, n_excl_pep, via_isprm, via_dda),
+          file.path(TABLE_DIR, "ED5c_supported_isoforms.csv"))
+
+p_feat <- ggplot(feat_long, aes(feature, fill = sqtl_role)) +
+  geom_bar(width = 0.7, colour = "white", linewidth = 0.3) +
+  geom_text(data = feat_seg, aes(feature, ypos, label = n), inherit.aes = FALSE, size = sz(7), colour = "grey15") +
+  geom_text(data = feat_tot, aes(feature, n, label = n), inherit.aes = FALSE, vjust = -0.4, size = sz(7), colour = "grey15") +
+  scale_fill_manual(values = ROLE_COLS, name = NULL, drop = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "Peptide-supported isoforms",
+       title = "Peptide evidence for isoforms with notable features",
+       subtitle = sprintf("%d isoforms across %d genes with a distinguishing peptide; features overlap",
+                          nrow(cand), n_distinct(cand$gene))) +
+  theme_cell(BASE_SIZE) +
+  theme(legend.position = "top", legend.justification = "left",
+        legend.key.size = unit(3.2, "mm"), legend.margin = margin(0, 0, 2, 0),
+        plot.subtitle = element_text(size = BASE_SIZE - 1, colour = "grey30")) +
+  guides(fill = guide_legend(nrow = 1))
+save_fig(p_feat, "ED5c_features_by_role", w = 4, h = 2.8)
+p_feat
+```
+
+## 5d — property-difference heatmap for the 94 risk/nonrisk pairs
+
+Reads the scaled risk − nonrisk property differences, the property axis order and the
+pairwise sequence/structure similarity exported by script 06. Similarity forms the
+first two columns and carries the row labels; rows are grouped by dominant property
+family and ordered by the strength of the dominant change.
+
+```{r figED5d_pair_heatmap, message=FALSE, warning=FALSE}
+require_files(OUT_PAIR_SIGNATURES_LONG, OUT_PROPERTY_AXIS_ORDER, OUT_PAIR_SIMILARITY)
+axis_ord  <- read_csv(OUT_PROPERTY_AXIS_ORDER, show_col_types = FALSE)
+FAM_ORDER <- c("Fold & disorder", "Domains", "PTM", "Biochemistry", "Localization", "Other", "Minimal")
+sig <- read_csv(OUT_PAIR_SIGNATURES_LONG, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  filter(pair_type != "manual_apms")
+
+pair_lab_tbl <- sig %>%
+  distinct(gene_name, risk_pb, nonrisk_pb, pair_type, mode_family, mode_strength, gated) %>%
+  mutate(gene_disp = display_gene(gene_name)) %>%
+  group_by(gene_disp) %>%
+  mutate(pair_lab = if (n() > 1) sprintf("%s (%d)", gene_disp, row_number()) else gene_disp) %>%
+  ungroup() %>% select(-gene_disp)
+stopifnot("expected 94 sQTL-derived pairs" = nrow(pair_lab_tbl) == 94)
+
+hm <- sig %>%
+  left_join(pair_lab_tbl %>% select(gene_name, risk_pb, nonrisk_pb, pair_lab), by = c("gene_name", "risk_pb", "nonrisk_pb")) %>%
+  mutate(axis = factor(axis, levels = axis_ord$axis),
+         mode_family = factor(ifelse(gated, "Minimal", as.character(mode_family)),
+                              levels = intersect(FAM_ORDER, c(as.character(mode_family), "Minimal"))),
+         z = pmax(pmin(score, 3), -3))
+ord <- hm %>% distinct(pair_lab, mode_family, mode_strength) %>% arrange(mode_family, desc(mode_strength)) %>% pull(pair_lab)
+hm <- hm %>% mutate(pair_lab = factor(pair_lab, levels = rev(ord)))
+cat(sprintf("ED 5d: %d pairs x %d axes | %d families\n", n_distinct(hm$pair_lab), n_distinct(hm$axis), n_distinct(hm$mode_family)))
+
+heat_theme <- theme_cell(7) +
+  theme(axis.text.x.top = element_text(angle = 45, hjust = 0, size = 6, colour = "grey15", face = "plain"),
+        panel.grid = element_blank(), panel.spacing = unit(2, "pt"),
+        legend.title = element_text(size = 6.5, face = "plain"), legend.text = element_text(size = 6),
+        legend.key.width = unit(2.6, "mm"), legend.key.height = unit(5, "mm"))
+
+# similarity z-scored across all pairs in the file
+sim <- read_csv(OUT_PAIR_SIMILARITY, show_col_types = FALSE) %>%
+  select(gene_name, risk_pb, nonrisk_pb, struct_sim, seq_sim) %>%
+  pivot_longer(c(struct_sim, seq_sim), names_to = "metric", values_to = "v") %>%
+  filter(is.finite(v)) %>%
+  group_by(metric) %>% mutate(z = as.numeric(scale(v))) %>% ungroup() %>%
+  inner_join(pair_lab_tbl %>% select(gene_name, risk_pb, nonrisk_pb, pair_lab, mode_family, gated),
+             by = c("gene_name", "risk_pb", "nonrisk_pb")) %>%
+  mutate(metric = factor(metric, levels = c("seq_sim", "struct_sim"), labels = c("Sequence", "Structure")),
+         mode_family = factor(ifelse(gated, "Minimal", as.character(mode_family)), levels = levels(hm$mode_family)),
+         pair_lab = factor(pair_lab, levels = levels(hm$pair_lab)))
+stopifnot("no similarity rows matched the 94 pairs" = nrow(sim) > 0)
+p_sim <- ggplot(sim, aes(metric, pair_lab, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.2) +
+  facet_grid(mode_family ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient(low = "white", high = GREEN[["base"]], name = "Similarity\n(z)") +
+  scale_x_discrete(position = "top") + labs(x = NULL, y = NULL) +
+  heat_theme + theme(axis.text.y = element_text(size = 4.3, colour = "grey15"), strip.text = element_blank())
+
+p_main <- ggplot(hm, aes(axis, pair_lab, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.2) +
+  facet_grid(mode_family ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(low = COL_PANEL$nonrisk, mid = "white", high = COL_PANEL$risk, midpoint = 0, limits = c(-3, 3),
+                       name = "Scaled difference\n(risk − nonrisk)") +
+  scale_x_discrete(position = "top") + labs(x = NULL, y = NULL) +
+  heat_theme +
+  theme(axis.text.y  = element_blank(), axis.ticks.y = element_blank(),
+        strip.text.y = element_text(angle = 0, size = 6, colour = "grey15", face = "plain"))
+
+p_ED5d <- p_sim + p_main + plot_layout(widths = c(1.2, 6), guides = "collect") &
+  theme(legend.position = "right", legend.box = "vertical", legend.box.just = "left", legend.spacing.y = unit(2, "mm"))
+save_fig(p_ED5d, "ED5d_pair_property_heatmap", 4.4, 8.5)
+write_csv(hm %>% select(pair_lab, gene_name, risk_pb, nonrisk_pb, mode_family, mode_strength, axis, score, z),
+          file.path(TABLE_DIR, "ED5d_pair_property_heatmap_data.csv"))
+p_ED5d
+```
+
+
+# Figure 5 — isoform-resolved AP-MS
+
+Fig. 5a (schematic) and 5e, 5g, 5h (Cytoscape networks) are made elsewhere. Everything
+here reads the exports of scripts 07 and 08.
+
+## 5.0 High-confidence network (CompPASS ∩ SAINT)
+
+```{r fig5_network_load, message=FALSE, warning=FALSE}
+require_files(OUT_MASTER_NETWORK_ANNOT)
+network <- read_csv(OUT_MASTER_NETWORK_ANNOT, show_col_types = FALSE) %>%
+  filter(!is.na(source_harmonized), !is.na(target_harmonized))
+
+spec_df <- network %>%
+  distinct(gene = display_gene(source_harmonized), PreyGene = target_harmonized, specificity) %>%
+  filter(specificity %in% SPEC_LV) %>%
+  mutate(specificity = factor(specificity, levels = SPEC_LV))
+cat(sprintf("Fig 5: %d interactions | %d baits\n", nrow(spec_df), n_distinct(spec_df$gene)))
+print(count(spec_df, specificity))
+```
+
+## 5b — VSMC expression support for the interactors
+
+Each interactor is scored by the number of VSMC evidence sources supporting it (HPA
+smooth-muscle annotation, VSMC discovery proteomics, VSMC long-read RNA-seq), as
+annotated in script 07. The control bait is excluded.
+
+```{r fig5b_vsmc_support, message=FALSE, warning=FALSE}
+require_files(OUT_PREY_VSMC_SUPPORT)
+sup <- read_csv(OUT_PREY_VSMC_SUPPORT, show_col_types = FALSE) %>%
+  filter(!Bait %in% "RAB11B-3xFLAG") %>%
+  distinct(PreyGene, specificity, In_SMCs_in_HPA, `SMC Protein`, `SMC LR RNAseq`) %>%
+  mutate(n_support = (In_SMCs_in_HPA == "YES") + (`SMC Protein` == "YES") + (`SMC LR RNAseq` == "YES"),
+         support = factor(case_when(n_support == 3 ~ "All three", n_support == 2 ~ "Two",
+                                    n_support == 1 ~ "One", TRUE ~ "None"),
+                          levels = c("All three", "Two", "One", "None")),
+         specificity = factor(specificity, levels = SPEC_LV, labels = SPEC_LAB))
+sup_ct <- sup %>% count(specificity, support) %>%
+  arrange(specificity, desc(support)) %>% group_by(specificity) %>% mutate(ypos = cumsum(n) - n / 2) %>% ungroup()
+tot <- sup_ct %>% group_by(specificity) %>% summarise(n = sum(n), .groups = "drop")
+cat(sprintf("Fig 5b: interactor entries %d | >=1 VSMC measure %d (%.1f%%)\n",
+            nrow(sup), sum(sup$n_support > 0), 100 * mean(sup$n_support > 0)))
+write_csv(sup, file.path(TABLE_DIR, "Fig5b_vsmc_support_per_interactor.csv"))
+
+SUP_PAL <- c("All three" = GREEN[["base"]], "Two" = GREEN[["mid"]], "One" = GREEN[["light"]], "None" = GREY[["dark"]])
+p_5b <- ggplot(sup_ct, aes(specificity, n, fill = support)) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.3) +
+  geom_text(aes(y = ypos, label = ifelse(n >= 20, n, "")), size = sz(7), colour = "grey15") +
+  geom_text(data = tot, aes(specificity, n, label = n), inherit.aes = FALSE, vjust = -0.5, size = sz(7), colour = "grey15") +
+  scale_fill_manual(values = SUP_PAL, name = "VSMC evidence") +
+  scale_x_discrete(labels = function(x) sub("-", "-\n", x)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(x = NULL, y = "Number of interactors", title = "VSMC support for interactors",
+       subtitle = sprintf("%d of %d (%.1f%%) with ≥1 measure",
+                          sum(sup$n_support > 0), nrow(sup), 100 * mean(sup$n_support > 0))) +
+  theme_cell(BASE_SIZE) +
+  theme(legend.position = "right", legend.key.size = unit(3.2, "mm"), plot.title = element_text(face = "plain", size = 8),
+        plot.subtitle = element_text(size = 6.5, colour = "grey30"),
+        axis.text.x = element_text(size = 6.5, lineheight = 0.85, vjust = 1))
+save_fig(p_5b, "Fig5b_vsmc_support", w = 2.3, h = 1.9)
+p_5b
+```
+
+## 5c — Venn of risk-specific, shared and nonrisk-specific interactions
+
+```{r fig5c_venn, message=FALSE, warning=FALSE}
+vc   <- spec_df %>% count(specificity)
+n_nr <- vc$n[vc$specificity == "nonrisk-specific"]; n_r <- vc$n[vc$specificity == "risk-specific"]; n_sh <- vc$n[vc$specificity == "shared"]
+cat(sprintf("Fig 5c: nonrisk-specific %d | risk-specific %d | shared %d | total %d\n", n_nr, n_r, n_sh, n_nr + n_r + n_sh))
+write_csv(vc, file.path(TABLE_DIR, "Fig5c_venn_counts.csv"))
+
+fit <- euler(c("Nonrisk" = n_nr, "Risk" = n_r, "Nonrisk&Risk" = n_sh))
+pv <- plot(fit, fills = list(fill = c(COL_PANEL$nonrisk, COL_PANEL$risk), alpha = 0.55),
+           edges = list(col = "grey30", lwd = 1), labels = list(fontsize = 8), quantities = list(fontsize = 8))
+save_grid(pv, "Fig5c_venn", 2.6, 2.4)
+pv
+```
+
+## 5d — interactions per isoform pair (percentage)
+
+```{r fig5d_interactions, message=FALSE, warning=FALSE}
+risk_frac <- spec_df %>% count(gene, specificity, name = "n") %>%
+  group_by(gene) %>% summarise(risk_pct = sum(n[specificity == "risk-specific"]) / sum(n), .groups = "drop")
+gene_order <- risk_frac %>% arrange(risk_pct) %>% pull(gene)
+bar_df <- spec_df %>%
+  mutate(gene = factor(sprintf("*%s*", gene), levels = sprintf("*%s*", gene_order))) %>%
+  count(gene, specificity, name = "n") %>%
+  group_by(gene) %>% mutate(pct = 100 * n / sum(n)) %>% ungroup()
+write_csv(bar_df, file.path(TABLE_DIR, "Fig5d_interactions_per_pair.csv"))
+
+bar_theme <- theme_cell(BASE_SIZE) +
+  theme(axis.text.x = ggtext::element_markdown(angle = 45, hjust = 1, size = 6),
+        legend.position = "top", legend.key.size = unit(3, "mm"), legend.text = element_text(size = 6))
+p_pct <- ggplot(bar_df, aes(gene, pct, fill = specificity)) +
+  geom_col(width = 0.72, colour = "white", linewidth = 0.3, position = "fill") +
+  scale_fill_manual(values = SPEC_COL, name = NULL, breaks = SPEC_LV, labels = SPEC_LAB) +
+  scale_y_continuous(labels = scales::percent, expand = c(0, 0)) +
+  labs(x = NULL, y = "Percentage of interactions") + bar_theme
+save_fig(p_pct, "Fig5d_interactions_percent", 2.6, 2.6)
+p_pct
+```
+
+## 5f — enriched GO terms per bait, by interactor category
+
+Built from the per-bait `<BAIT>_pathway_details.csv` files written by script 08, the
+same source as Supplementary Table 18, so that the panel and the table cannot drift.
+
+```{r fig5f_go_counts, message=FALSE, warning=FALSE}
+stopifnot("GO pathway-details folder not found (run script 08)" = dir.exists(D_GO_PAIR_TABLES))
+go_terms <- list.files(D_GO_PAIR_TABLES, pattern = "_pathway_details\\.csv$", full.names = TRUE) %>%
+  set_names(~ str_remove(basename(.x), "_pathway_details\\.csv")) %>%
+  map_dfr(read_csv, show_col_types = FALSE, .id = "bait_file") %>%
+  transmute(bait = display_gene(bait_file),
+            specificity = dplyr::recode(Specificity, Risk = "risk-specific", NonRisk = "nonrisk-specific", Shared = "shared"),
+            ontology = Ontology, GO_id = ID, GO_term = Description,
+            n_genes_in_term = as.integer(str_split_fixed(GeneRatio, "/", 2)[, 1]),
+            n_genes_in_set  = as.integer(str_split_fixed(GeneRatio, "/", 2)[, 2]),
+            p_value = pvalue, p_adjust = p.adjust)
+cat(sprintf("Fig 5f: %d enriched terms | %d baits\n", nrow(go_terms), n_distinct(go_terms$bait)))
+
+pc <- go_terms %>%
+  distinct(bait, specificity, ontology, GO_id) %>%
+  count(gene = bait, category = specificity, name = "n_pathways") %>%
+  mutate(category = factor(category, levels = SPEC_LV))
+g_ord <- pc %>% group_by(gene) %>% summarise(tot = sum(n_pathways)) %>% arrange(tot) %>% pull(gene)
+pc <- pc %>% mutate(gene = factor(sprintf("*%s*", gene), levels = sprintf("*%s*", g_ord)))
+write_csv(pc, file.path(TABLE_DIR, "Fig5f_go_by_category.csv"))
+
+p_go <- ggplot(pc, aes(n_pathways, gene, fill = category)) +
+  geom_col(width = 0.72, colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = SPEC_COL, name = NULL, breaks = SPEC_LV, labels = SPEC_LAB) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Number of enriched GO terms (BP + MF + CC)", y = NULL, title = "GO enrichment by interactor category") +
+  theme_cell(BASE_SIZE) +
+  theme(legend.position = "top", legend.key.size = unit(3, "mm"), legend.text = element_text(size = 6),
+        axis.text.y = ggtext::element_markdown(size = 6), plot.title = element_text(face = "plain", size = 8))
+save_fig(p_go, "Fig5f_go_by_category", 2.6, 2.6)
+p_go
+```
+
+
+# Extended Data Figure 7 — the 13 AP-MS pairs
+
+Panel 7b (complete network) is made in Cytoscape.
+
+## 7a — property-difference heatmap for the 13 AP-MS bait pairs
+
+Same construction as Extended Data Fig. 5d, restricted to the 13 bait pairs and without
+family facets. Scaling uses the SD of each feature across all pairs (script 06), so
+the 13 pairs sit on the same scale as the 94. Seven of the 13 bait pairs are not among
+the 94 computed pairs (their gene already has a systematically derived pair), so the
+same gene can show different isoforms in the two panels.
+
+```{r figED7a_apms_heatmap, message=FALSE, warning=FALSE}
+require_files(OUT_APMS_PAIR_SIGNATURES, OUT_APMS_BAIT_PAIRS)
+manual <- read_csv(OUT_APMS_BAIT_PAIRS, show_col_types = FALSE)
+
+hm13 <- read_csv(OUT_APMS_PAIR_SIGNATURES, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  mutate(axis = factor(axis, levels = axis_ord$axis), z = pmax(pmin(score, 3), -3),
+         gene_name = display_gene(gene_name))
+row_ord <- hm13 %>% group_by(gene_name) %>% summarise(strength = max(abs(score), na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(strength)) %>% pull(gene_name)
+hm13 <- hm13 %>% mutate(gene_name = factor(gene_name, levels = rev(row_ord)))
+cat(sprintf("ED 7a: AP-MS pairs %d of %d | axes %d\n", n_distinct(hm13$gene_name), nrow(manual), n_distinct(hm13$axis)))
+write_csv(hm13, file.path(TABLE_DIR, "ED7a_apms_property_heatmap_data.csv"))
+
+heat_theme13 <- theme_cell(BASE_SIZE) +
+  theme(axis.text.x.top = element_text(angle = 45, hjust = 0, size = BASE_SIZE - 1, colour = "grey15", face = "plain"),
+        panel.grid = element_blank(), legend.title = element_text(size = 6, face = "plain"),
+        legend.text = element_text(size = 5.5), legend.key.width = unit(2.2, "mm"), legend.key.height = unit(3.2, "mm"))
+
+# five bait pairs are also computed pairs and appear twice in the similarity file
+sim13 <- read_csv(OUT_PAIR_SIMILARITY, show_col_types = FALSE) %>%
+  select(gene_name, risk_pb, nonrisk_pb, struct_sim, seq_sim) %>%
+  distinct(gene_name, risk_pb, nonrisk_pb, .keep_all = TRUE) %>%
+  pivot_longer(c(struct_sim, seq_sim), names_to = "metric", values_to = "v") %>%
+  filter(is.finite(v)) %>%
+  group_by(metric) %>% mutate(z = as.numeric(scale(v))) %>% ungroup() %>%
+  semi_join(manual, by = c("gene_name", "risk_pb", "nonrisk_pb")) %>%
+  mutate(metric = factor(metric, levels = c("seq_sim", "struct_sim"), labels = c("Sequence", "Structure")),
+         gene_name = factor(display_gene(gene_name), levels = levels(hm13$gene_name)))
+stopifnot("gene names did not match between the similarity and signature tables" = !all(is.na(sim13$gene_name)))
+p_sim13 <- ggplot(sim13, aes(metric, gene_name, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  scale_fill_gradient(low = "white", high = GREEN[["base"]], name = "Similarity (z)", limits = c(-3, 2), breaks = c(-3, -1, 1)) +
+  scale_x_discrete(position = "top") + labs(x = NULL, y = NULL) +
+  heat_theme13 + theme(axis.text.y = element_text(size = BASE_SIZE - 1, colour = "grey15", face = "plain"))
+
+p_main13 <- ggplot(hm13, aes(axis, gene_name, fill = z)) +
+  geom_tile(colour = "white", linewidth = 0.25) +
+  scale_fill_gradient2(low = COL_PANEL$nonrisk, mid = "white", high = COL_PANEL$risk, midpoint = 0, limits = c(-3, 3),
+                       name = "Scaled Δ\n(risk − nonrisk)", breaks = c(-3, 0, 3)) +
+  scale_x_discrete(position = "top") + labs(x = NULL, y = NULL) +
+  heat_theme13 + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+p_ED7a <- p_sim13 + p_main13 + plot_layout(widths = c(1.2, 6), guides = "collect") &
+  theme(legend.position = "right", legend.box = "vertical", legend.box.just = "left", legend.spacing.y = unit(2, "mm"))
+save_fig(p_ED7a, "ED7a_apms_pair_heatmap", 7.5, 2.6)
+p_ED7a
+```
+
+
+# Figure 6 — SRP54, MLX and ITGA1 vignettes
+
+Fig. 6a/6f/6k (browser tracks), 6d/6e/6i/6j/6n/6o (structures), 6p (schematic) and 6q
+(images) are made elsewhere.
+
+## 6.0 AP-MS spectral counts
+
+SRP complex members come from the SRP54 pulldown table; the MLX and ITGA1 panels come
+from the SAINTexpress output, in which `Spec` holds the per-replicate bait counts and
+`ctrlCounts` the control pulldowns. Every prey × group combination is completed so that
+a lost or gained interaction shows a zero bar (the control n therefore includes imputed
+zeros for preys absent from a control run).
+
+```{r fig6_apms_load, message=FALSE, warning=FALSE}
+require_files(F_SRP54_SPECTRAL, F_SAINT_SET)
+srp_complex_apms <- read_csv(F_SRP54_SPECTRAL, show_col_types = FALSE)
+srp_all_long <- bind_rows(
+  srp_complex_apms %>% pivot_longer(starts_with("Spec"), names_to = "rep", values_to = "value") %>%
+    transmute(PreyGene, value = as.numeric(value), group = as.character(status)),
+  srp_complex_apms %>% pivot_longer(starts_with("ctrlCounts"), names_to = "rep", values_to = "value") %>%
+    transmute(PreyGene, value = as.numeric(value), group = "Control"))
+
+saint <- map_dfr(F_SAINT_SET, read_csv, show_col_types = FALSE)
+build_bait_long <- function(saint, bait_nonrisk, bait_risk, preys = NULL) {
+  d <- saint %>% filter(Bait %in% c(bait_nonrisk, bait_risk))
+  if (!is.null(preys)) d <- d %>% filter(PreyGene %in% preys)
+  d <- d %>% mutate(status = if_else(Bait == bait_nonrisk, "Nonrisk", "Risk"),
+                    Spec_list = str_split(Spec, "\\|"), ctrl_list = str_split(ctrlCounts, "\\|"))
+  spec_long <- d %>% select(status, PreyGene, Spec_list) %>% unnest_longer(Spec_list) %>%
+    transmute(PreyGene, value = as.numeric(Spec_list), group = status)
+  ctrl_long <- d %>% select(status, PreyGene, ctrl_list) %>% unnest_longer(ctrl_list) %>%
+    transmute(PreyGene, value = as.numeric(ctrl_list), group = "Control")
+  bind_rows(spec_long, ctrl_long) %>% mutate(value = replace_na(value, 0)) %>%
+    tidyr::complete(PreyGene, group = c("Nonrisk", "Risk", "Control"), fill = list(value = 0))
+}
+# bait names as they appear in the SAINT output (gene-PB accession)
+itga1_all_long <- build_bait_long(saint, "ITGA1-PB5448-2", "ITGA1-PB5448-10",
+                                  preys = c("ITGB1", "ITM2B", "ITM2C", "ITGA1_PB_5448_2"))
+mlx_all_long   <- build_bait_long(saint, "MLX-PB-15434-10", "MLX-PB-15434-2")
+cat(sprintf("SRP preys: %d | ITGA1 rows: %d | MLX rows: %d\n",
+            n_distinct(srp_all_long$PreyGene), nrow(itga1_all_long), nrow(mlx_all_long)))
+```
+
+## 6b, 6c, 6g, 6h, 6l, 6m — spectral-count panels (bars = mean, points = replicates)
+
+```{r fig6_apms_panels, message=FALSE, warning=FALSE}
+GRP_COL <- c(Nonrisk = COL_PANEL$nonrisk, Risk = COL_PANEL$risk, Control = COL_PANEL$neutral)
+GRP_LV  <- c("Nonrisk", "Risk", "Control")
+
+apms_prey_panel <- function(df, preys, title = NULL, name = "apms_panel", test = "t", w = NULL, h = 1, prey_labels = NULL) {
+  d <- df %>% filter(PreyGene %in% preys) %>%
+    mutate(PreyGene = factor(PreyGene, levels = preys), group = factor(group, levels = GRP_LV))
+  if (!is.null(prey_labels)) levels(d$PreyGene) <- dplyr::recode(levels(d$PreyGene), !!!prey_labels)
+  stat <- d %>% filter(group %in% c("Nonrisk", "Risk")) %>%
+    group_by(PreyGene) %>%
+    summarise(p = tryCatch(if (test == "wilcox") wilcox.test(value ~ droplevels(group))$p.value
+                           else t.test(value ~ droplevels(group))$p.value, error = function(e) NA_real_), .groups = "drop") %>%
+    mutate(label = star(p))
+  ymax  <- d %>% group_by(PreyGene) %>% summarise(y = max(value, na.rm = TRUE), .groups = "drop")
+  stat  <- stat %>% left_join(ymax, by = "PreyGene") %>% mutate(y = pmax(y, 1))
+  means <- d %>% group_by(PreyGene, group) %>% summarise(m = mean(value, na.rm = TRUE), .groups = "drop")
+
+  p <- ggplot(d, aes(group, value, fill = group)) +
+    geom_col(data = means, aes(group, m, fill = group), width = 0.68, colour = "grey25", linewidth = 0.3) +
+    geom_jitter(width = 0.14, height = 0, size = 0.4, alpha = 0.75, colour = "grey15") +
+    geom_segment(data = stat, inherit.aes = FALSE, aes(x = 1, xend = 2, y = y * 1.08, yend = y * 1.08), linewidth = 0.3) +
+    geom_text(data = stat, inherit.aes = FALSE, aes(x = 1.5, y = y * 1.3, label = label), size = sz(7)) +
+    scale_fill_manual(values = GRP_COL, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.16))) +
+    labs(x = NULL, y = "Protein Abundance\n(PSM)", title = title) +
+    theme_cell(7) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 6), axis.title.y = element_text(lineheight = 0.9),
+          strip.background = element_blank(), strip.text = element_text(size = 7))
+  if (length(preys) > 1)
+    p <- p + facet_wrap(~ PreyGene, nrow = 1, scales = "free_y") +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 5.5), strip.text = element_text(size = 6.5))
+  if (is.null(w)) w <- max(1.5, 0.9 * length(preys) + 0.8)
+  save_fig(p, name, w, h); print(p); invisible(p)
+}
+
+apms_prey_panel(srp_all_long, "SRP54", title = "SRP54 (Bait)", name = "Fig6b_SRP54_bait", w = 1.2)
+apms_prey_panel(srp_all_long, c("SRP14", "SRP19", "SRP68", "SRP72", "SRP9"),
+                title = "SRP Complex Members (Interactors)", name = "Fig6c_SRP_complex", w = 3)
+apms_prey_panel(mlx_all_long, "MLX",   title = "MLX (Bait)",         name = "Fig6g_MLX_bait", w = 1.9)
+apms_prey_panel(mlx_all_long, "MLXIP", title = "MLXIP (Interactor)", name = "Fig6h_MLXIP",    w = 1.9)
+apms_prey_panel(itga1_all_long, "ITGA1_PB_5448_2", title = "ITGA1 (Bait)", name = "Fig6l_ITGA1_bait", w = 1.9,
+                prey_labels = c("ITGA1_PB_5448_2" = "ITGA1"))
+apms_prey_panel(itga1_all_long, "ITGB1", title = "ITGB1 (Interactor)", name = "Fig6m_ITGB1", w = 1.9)
+```
+
+## AP-MS statistics for the text, the Fig. 6 legend and Supplementary Table 19
+
+The same two-sided Welch's t-test as the panels, so the numbers and the stars agree,
+with BH correction within each bait (six preys for SRP54, two each for MLX and ITGA1).
+
+```{r fig6_apms_stats, message=FALSE, warning=FALSE}
+apms_stats <- function(d, bait_label, preys = NULL) {
+  if (!is.null(preys)) d <- d %>% filter(PreyGene %in% preys)
+  d <- d %>% mutate(group = factor(group, levels = GRP_LV))
+  means <- d %>% group_by(PreyGene, group) %>%
+    summarise(mean = mean(value, na.rm = TRUE), sd = sd(value, na.rm = TRUE), n = sum(!is.na(value)), .groups = "drop") %>%
+    pivot_wider(names_from = group, values_from = c(mean, sd, n), names_glue = "{group}_{.value}")
+  tests <- d %>% filter(group %in% c("Nonrisk", "Risk")) %>%
+    group_by(PreyGene) %>%
+    summarise(p_welch = tryCatch(t.test(value ~ droplevels(group))$p.value, error = function(e) NA_real_), .groups = "drop") %>%
+    mutate(q_welch = p.adjust(p_welch, "BH"))
+  means %>% left_join(tests, by = "PreyGene") %>%
+    mutate(bait = bait_label, sig = star(p_welch), risk_above_control = Risk_mean > Control_mean) %>%
+    relocate(bait, PreyGene) %>% arrange(p_welch)
+}
+srp_stats   <- apms_stats(srp_all_long,   "SRP54", c("SRP9", "SRP14", "SRP19", "SRP54", "SRP68", "SRP72"))
+mlx_stats   <- apms_stats(mlx_all_long,   "MLX",   c("MLX", "MLXIP"))
+itga1_stats <- apms_stats(itga1_all_long, "ITGA1", c("ITGA1_PB_5448_2", "ITGB1")) %>%
+  mutate(PreyGene = dplyr::recode(PreyGene, "ITGA1_PB_5448_2" = "ITGA1"))
+apms_focus_stats <- bind_rows(srp_stats, mlx_stats, itga1_stats)
+print(apms_focus_stats %>% select(bait, PreyGene, Nonrisk_mean, Risk_mean, Control_mean, Nonrisk_n, Risk_n, Control_n, p_welch, q_welch, sig), width = Inf)
+write_excel_csv(apms_focus_stats, file.path(TABLE_DIR, "SuppTable_APMS_focus_locus_stats.csv"))
+```
+
+## 6r, 6s, 6t and Extended Data 8d, 8e, 8g — ITGA1 spheroid metrics
+
+Per-spheroid mechanics (raw Young's modulus, raw shear modulus, deformation ratio and
+circularity, with the experimental batch) come from the compression workbook; fold
+change is `value / mean(empty-vector control of the same batch)`, so that batch-to-batch
+differences in absolute stiffness do not enter the comparison. Fig. 6s and 6t show the
+batch-normalized moduli; the raw Young's modulus is shown in Extended Data Fig. 8e.
+Actin/membrane and collagen SHG come from the imaging workbook. Pairwise comparisons
+are two-sided Wilcoxon rank-sum tests, BH-corrected across the three comparisons, with
+a permutation test alongside as a robustness check (Supplementary Table 20).
+
+```{r fig6rst_ED8_spheroid, message=FALSE, warning=FALSE}
+require_files(F_ITGA1_SPHEROID_IMAGING, F_ITGA1_SPHEROID_MECH)
+YOUNGS_UNIT <- "kPa"
+
+norm_cond <- function(x) { x <- tolower(trimws(as.character(x)))
+  dplyr::case_when(str_detect(x, "trunc") ~ "Risk (OE)", str_detect(x, "can") ~ "Nonrisk (OE)",
+                   str_detect(x, "cont") ~ "Empty vector (Ctrl)", TRUE ~ str_to_title(x)) }
+COND_LV  <- c("Empty vector (Ctrl)", "Nonrisk (OE)", "Risk (OE)")
+COND_COL <- c("Empty vector (Ctrl)" = COL_PANEL$neutral, "Nonrisk (OE)" = COL_PANEL$nonrisk, "Risk (OE)" = COL_PANEL$risk)
+
+# The batch column holds the experiment date as an unpadded integer (mddyy), so the
+# three batches are mapped explicitly.
+BATCH_DATES <- c(`41125` = "2025-04-11", `52725` = "2025-05-27", `6225` = "2025-06-02")
+parse_batch <- function(x) { k <- as.character(as.integer(x))
+  stopifnot("unknown batch code in the compression workbook" = all(k %in% names(BATCH_DATES)))
+  as.Date(unname(BATCH_DATES[k])) }
+
+# per-spheroid mechanics (columns B:K of the first sheet; header on row 3)
+crush <- read_excel(F_ITGA1_SPHEROID_MECH, sheet = 1, range = cell_limits(c(3, 2), c(NA, 11))) %>%
+  filter(!is.na(Youngs)) %>%
+  transmute(cond  = norm_cond(Type), batch = parse_batch(Date), spheroid = as.integer(`#`),
+            youngs_raw = as.numeric(Youngs), shear_raw = as.numeric(Shear),
+            deformation = as.numeric(Def), circularity = as.numeric(Circ)) %>%
+  mutate(cond = factor(cond, levels = COND_LV))
+cat(sprintf("spheroids %d | batches %d\n", nrow(crush), n_distinct(crush$batch)))
+stopifnot("expected 20 control, 24 nonrisk and 25 risk spheroids" = all(table(crush$cond) == c(20, 24, 25)))
+
+ctrl_mean <- crush %>% filter(cond == "Empty vector (Ctrl)") %>% group_by(batch) %>%
+  summarise(youngs_ctrl = mean(youngs_raw), shear_ctrl = mean(shear_raw), .groups = "drop")
+crush <- crush %>% left_join(ctrl_mean, by = "batch") %>%
+  mutate(youngs_fc = youngs_raw / youngs_ctrl, shear_fc = shear_raw / shear_ctrl)
+
+actin <- read_excel(F_ITGA1_SPHEROID_IMAGING, sheet = "Actin per Membrane Scan"); names(actin)[1:2] <- c("Type", "value")
+shg   <- read_excel(F_ITGA1_SPHEROID_IMAGING, sheet = "SHG")
+itga1_all <- bind_rows(
+  crush %>% transmute(cond, batch, value = youngs_raw,  metric = paste0("Young's modulus (", YOUNGS_UNIT, ")")),
+  crush %>% transmute(cond, batch, value = youngs_fc,   metric = "Young's modulus (FC)"),
+  crush %>% transmute(cond, batch, value = shear_raw,   metric = paste0("Shear modulus (", YOUNGS_UNIT, ")")),
+  crush %>% transmute(cond, batch, value = shear_fc,    metric = "Shear modulus (FC)"),
+  crush %>% transmute(cond, batch, value = circularity, metric = "Spheroid circularity"),
+  crush %>% transmute(cond, batch, value = deformation, metric = "Deformation ratio"),
+  actin %>% transmute(cond = norm_cond(Type), batch = as.Date(NA), value = as.numeric(value), metric = "Actin / Membrane"),
+  shg   %>% transmute(cond = norm_cond(Type), batch = as.Date(NA), value = as.numeric(Value), metric = "Collagen (SHG)")
+) %>% filter(!is.na(value)) %>% mutate(cond = factor(cond, levels = COND_LV))
+
+perm_p <- function(x, y, nperm = 5000) {
+  obs <- abs(mean(x) - mean(y)); comb <- c(x, y); n1 <- length(x)
+  d <- replicate(nperm, { s <- sample(comb); abs(mean(s[1:n1]) - mean(s[-(1:n1)])) })
+  (sum(d >= obs) + 1) / (nperm + 1)
+}
+pairwise_stats <- function(d) {
+  cs <- levels(droplevels(d$cond))
+  combn(cs, 2, simplify = FALSE) %>%
+    lapply(function(pr) { x <- d$value[d$cond == pr[1]]; y <- d$value[d$cond == pr[2]]
+      tibble(g1 = pr[1], g2 = pr[2], n1 = length(x), n2 = length(y),
+             median1 = median(x), median2 = median(y),
+             p_wilcox = suppressWarnings(wilcox.test(x, y)$p.value), p_perm = perm_p(x, y)) }) %>%
+    bind_rows() %>% mutate(p_wilcox_BH = p.adjust(p_wilcox, "BH"))
+}
+
+metric_panel <- function(metric_name, ylab, title, ref_line = NA_real_, name) {
+  d <- itga1_all %>% filter(metric == metric_name) %>% droplevels()
+  st <- pairwise_stats(d)
+  yr <- diff(range(d$value)); ymax <- max(d$value)
+  sig <- st %>% filter(p_wilcox_BH < 0.05) %>% arrange(match(g1, COND_LV), match(g2, COND_LV))
+  xi <- setNames(seq_along(COND_LV), COND_LV)
+  base_y <- ymax + 0.06 * yr; step <- 0.10 * yr; brackets <- list()
+  if (nrow(sig) > 0) for (k in seq_len(nrow(sig))) {
+    x1 <- xi[[sig$g1[k]]]; x2 <- xi[[sig$g2[k]]]; yy <- base_y + (k - 1) * step
+    brackets <- c(brackets, list(
+      annotate("segment", x = x1, xend = x2, y = yy, yend = yy, linewidth = 0.3),
+      annotate("segment", x = x1, xend = x1, y = yy, yend = yy - 0.02 * yr, linewidth = 0.3),
+      annotate("segment", x = x2, xend = x2, y = yy, yend = yy - 0.02 * yr, linewidth = 0.3),
+      annotate("text", x = (x1 + x2) / 2, y = yy + 0.01 * yr, label = star(sig$p_wilcox_BH[k]), size = sz(8), vjust = 0)))
+  }
+  top <- if (nrow(sig) > 0) base_y + nrow(sig) * step else ymax + 0.08 * yr
+  ylo <- min(d$value) - 0.05 * yr
+  p <- ggplot(d, aes(cond, value))
+  if (!is.na(ref_line)) p <- p + geom_hline(yintercept = ref_line, linetype = "dashed", linewidth = 0.3, colour = "grey60")
+  p <- p +
+    geom_boxplot(aes(fill = cond), width = 0.6, outlier.shape = NA, linewidth = 0.3, colour = "grey25") +
+    geom_jitter(width = 0.14, height = 0, size = 0.7, alpha = 0.5, colour = "grey20") +
+    brackets +
+    scale_fill_manual(values = COND_COL, guide = "none") +
+    scale_x_discrete(labels = function(x) sub(" \\(", "\n(", x)) +
+    scale_y_continuous(limits = c(ylo, top + 0.03 * yr), expand = expansion(mult = c(0.02, 0.02))) +
+    labs(x = NULL, y = ylab, title = title) +
+    theme_cell(BASE_SIZE)
+  save_fig(p, name, 2, 2); print(p); invisible(p)
+}
+
+set.seed(1)   # permutation test
+metric_panel("Spheroid circularity", "Spheroid circularity",          "Circularity",     name = "Fig6r_circularity")
+metric_panel("Shear modulus (FC)",   "Shear modulus (fold change)",   "Shear modulus",   ref_line = 1, name = "Fig6s_shear_modulus")
+metric_panel("Young's modulus (FC)", "Young's modulus (fold change)", "Young's modulus", ref_line = 1, name = "Fig6t_youngs_modulus")
+metric_panel("Actin / Membrane",     "Actin / Membrane (a.u.)",       "Actin / Membrane", name = "ED8d_actin_membrane")
+metric_panel(paste0("Young's modulus (", YOUNGS_UNIT, ")"), paste0("Young's modulus (", YOUNGS_UNIT, ")"),
+             "Young's modulus (raw)", name = "ED8e_youngs_modulus_raw")
+metric_panel("Collagen (SHG)",       "Collagen SHG (a.u.)",           "Collagen",        name = "ED8g_collagen_SHG")
+
+itga1_stats_all <- itga1_all %>% distinct(metric) %>% pull(metric) %>%
+  set_names() %>% map_dfr(~ pairwise_stats(filter(itga1_all, metric == .x)), .id = "metric")
+write_csv(itga1_stats_all, file.path(TABLE_DIR, "itga1_spheroid_pairwise_stats.csv"))
+```
+
+
+# Supplementary Tables
+
+Numbering follows the manuscript workbook: S8 AP-MS bait constructs, S10 SQANTI
+classifications, S11 GENCODE versus VSMC repertoire, S12 peptide evidence, S13 CAD
+sQTL junction master, S14 AS event classification, S15 property statistics (written by
+script 03 and copied here), S16 risk/nonrisk pairs, S17 AP-MS interactions, S18 GO
+terms, S19 vignette statistics, S20 spheroid measurements. Tables S1–S7 and S9
+(colocalization, LD, SpliceAI/VEP, primers, ESE, ELISA) are assembled from the deposited
+source data outside this script.
+
+```{r tables_setup, message=FALSE, warning=FALSE}
+put <- function(d, n, name) {
+  f <- file.path(SUPP_DIR, sprintf("TableS%02d_%s.csv", n, name))
+  write_excel_csv(d, f)
+  cat(sprintf("S%-2d  %-46s %5d rows x %2d cols\n", n, name, nrow(d), ncol(d)))
+  invisible(f)
+}
+```
+
+## S8 — AP-MS bait constructs
+
+One row per bait (26 rows: 13 genes × risk/nonrisk): gene, isoform role, PB accession,
+ENST (only for FSM/ISM isoforms; blank = novel), SQANTI transcript and protein
+categories, length and protein sequence.
+
+```{r tableS08_baits, message=FALSE, warning=FALSE}
+require_files(F_APMS_BAIT_PAIRS, F_APMS_BAIT_FASTA)
+suppressMessages(library(Biostrings))
+
+bait <- read_csv(F_APMS_BAIT_PAIRS, show_col_types = FALSE) %>% rename_with(~ sub("^﻿", "", .x))
+gene_col    <- grep("Gene",  names(bait), ignore.case = TRUE, value = TRUE)[1]
+risk_col    <- grep("^risk", names(bait), ignore.case = TRUE, value = TRUE)[1]
+nonrisk_col <- grep("^non",  names(bait), ignore.case = TRUE, value = TRUE)[1]
+desc_col    <- grep("Descr", names(bait), ignore.case = TRUE, value = TRUE)[1]
+stopifnot(!is.na(gene_col), !is.na(risk_col), !is.na(nonrisk_col))
+baits_long <- bait %>%
+  transmute(gene = .data[[gene_col]], description = if (!is.na(desc_col)) .data[[desc_col]] else NA_character_,
+            risk = str_extract(.data[[risk_col]], "PB\\.[0-9]+\\.[0-9]+"),
+            nonrisk = str_extract(.data[[nonrisk_col]], "PB\\.[0-9]+\\.[0-9]+")) %>%
+  pivot_longer(c(risk, nonrisk), names_to = "isoform_role", values_to = "pb_id") %>%
+  mutate(isoform_role = factor(isoform_role, levels = c("risk", "nonrisk"))) %>%
+  arrange(gene, isoform_role)
+stopifnot("bait without a PB accession" = !any(is.na(baits_long$pb_id)))
+
+sq_slim <- rna %>%
+  transmute(pb_id = isoform, enst_id = associated_transcript, sqanti_transcript_category = structural_category) %>%
+  mutate(enst_id = ifelse(enst_id %in% c("novel", "NA", ""), NA_character_, enst_id))
+psub_col <- intersect(c("pr_splice_subcat", "protein_classification_subset"), names(prot))[1]
+sp_slim <- prot %>%
+  transmute(pb_id = pb, sqanti_protein_category = pr_splice_cat,
+            sqanti_protein_subcategory = if (!is.na(psub_col)) .data[[psub_col]] else NA_character_)
+
+fa <- Biostrings::readAAStringSet(F_APMS_BAIT_FASTA)
+fa_tbl <- tibble(header = names(fa), sequence = as.character(fa), aa_length = Biostrings::width(fa)) %>%
+  mutate(pb_id = str_extract(header, "PB[._-][0-9]+[._-][0-9]+"), pb_id = gsub("[_-]", ".", pb_id))
+
+supp_baits <- baits_long %>%
+  left_join(sq_slim, by = "pb_id") %>%
+  left_join(sp_slim, by = "pb_id") %>%
+  left_join(fa_tbl %>% filter(!is.na(pb_id)) %>% select(pb_id, sequence, aa_length), by = "pb_id") %>%
+  select(gene, description, isoform_role, pb_id, enst_id, sqanti_transcript_category,
+         sqanti_protein_category, sqanti_protein_subcategory, aa_length, sequence)
+stopifnot("expected 26 bait constructs" = nrow(supp_baits) == 26,
+          "bait sequence not found in the FASTA" = !any(is.na(supp_baits$sequence)))
+put(supp_baits, 8, "APMS_bait_constructs")
+```
+
+## S10 — SQANTI3 transcript and SQANTI Protein classifications (expressed catalog)
+
+```{r tableS10_sqanti, message=FALSE, warning=FALSE}
+require_files(F_SQANTI_PROTEIN_CPM)
+prot_cpm_lookup <- read_csv(F_SQANTI_PROTEIN_CPM, show_col_types = FALSE) %>%
+  transmute(pb, CPM = as.numeric(CPM)) %>% distinct(pb, .keep_all = TRUE)
+prot_expr_out <- prot_expr %>% left_join(prot_cpm_lookup, by = "pb") %>% arrange(desc(CPM))
+put(rna_expr,      10, "SQANTI3_transcripts_expressed")
+put(prot_expr_out, 10, "SQANTI_protein_isoforms_expressed")
+writexl::write_xlsx(list("SQANTI3 transcripts" = rna_expr, "SQANTI Protein isoforms" = prot_expr_out),
+                    path = file.path(SUPP_DIR, "TableS10_SQANTI_classifications.xlsx"))
+```
+
+## S11 — GENCODE versus VSMC transcript repertoire, per gene
+
+Two GENCODE denominators (all transcripts / protein-coding only) and two VSMC
+definitions (FSM only / FSM + ISM), for all VSMC-expressed genes and for the CAD sGenes.
+The summary table gives the medians quoted in the Results.
+
+```{r tableS11_gencode_vs_vsmc, message=FALSE, warning=FALSE}
+require_files(F_GENCODE_V38_GTF)
+gtf <- data.table::fread(F_GENCODE_V38_GTF, sep = "\t", header = FALSE, quote = "", skip = "##", showProgress = FALSE)
+gencode_tx <- gtf[V3 == "transcript",
+  .(gene_id = str_extract(V9, '(?<=gene_id ")[^"]+'), symbol = str_extract(V9, '(?<=gene_name ")[^"]+'),
+    tx_id = str_extract(V9, '(?<=transcript_id ")[^"]+'), tx_type = str_extract(V9, '(?<=transcript_type ")[^"]+'))] |> as_tibble()
+rm(gtf); gc(verbose = FALSE)
+gencode_n <- gencode_tx %>% group_by(gene_id, symbol) %>%
+  summarise(n_gencode = n_distinct(tx_id), n_gencode_pc = n_distinct(tx_id[tx_type == "protein_coding"]), .groups = "drop")
+cat(sprintf("GENCODE v38: %s genes | %s transcripts | %s protein-coding\n",
+            comma(nrow(gencode_n)), comma(sum(gencode_n$n_gencode)), comma(sum(gencode_n$n_gencode_pc))))
+
+vsmc <- rna_expr %>%
+  filter(!is.na(associated_gene)) %>%
+  group_by(gene_id = associated_gene) %>%
+  summarise(n_vsmc = n(),
+            n_fsm     = n_distinct(associated_transcript[structural_category == "full-splice_match" &
+                                                         !is.na(associated_transcript) & associated_transcript != "novel"]),
+            n_fsm_ism = n_distinct(associated_transcript[structural_category %in% cat_known &
+                                                         !is.na(associated_transcript) & associated_transcript != "novel"]),
+            n_novel = sum(structural_category %in% cat_novel), .groups = "drop")
+rep_tbl <- vsmc %>% inner_join(gencode_n, by = "gene_id") %>% relocate(symbol, .after = gene_id) %>%
+  mutate(frac_fsm = n_fsm / n_gencode, frac_fsm_ism = n_fsm_ism / n_gencode,
+         frac_fsm_pc = ifelse(n_gencode_pc > 0, n_fsm / n_gencode_pc, NA_real_),
+         frac_fsm_ism_pc = ifelse(n_gencode_pc > 0, n_fsm_ism / n_gencode_pc, NA_real_))
+sgenes <- unique(lfc_m$gene_name)
+sg_tbl <- rep_tbl %>% filter(symbol %in% sgenes)
+cat(sprintf("genes analysed: %s | CAD sGenes matched: %d of %d\n", comma(nrow(rep_tbl)), nrow(sg_tbl), length(sgenes)))
+
+fmt <- function(x) sprintf("%.0f [%.0f-%.0f]", median(x, na.rm = TRUE), quantile(x, .25, na.rm = TRUE), quantile(x, .75, na.rm = TRUE))
+pct <- function(x) sprintf("%.1f%% [%.1f-%.1f%%]", 100 * median(x, na.rm = TRUE), 100 * quantile(x, .25, na.rm = TRUE), 100 * quantile(x, .75, na.rm = TRUE))
+make_summary <- function(d, label) tibble(
+  Measure = c("GENCODE transcripts per gene", "GENCODE protein-coding transcripts per gene",
+              "VSMC isoforms detected per gene (all)", "  of which annotated, exact match (FSM)",
+              "  of which annotated, exact or partial (FSM+ISM)", "  of which novel (NIC/NNC)",
+              "GENCODE repertoire detected, exact match", "GENCODE repertoire detected, exact or partial",
+              "Protein-coding repertoire detected, exact match", "Protein-coding repertoire detected, exact or partial"),
+  !!label := c(fmt(d$n_gencode), fmt(d$n_gencode_pc), fmt(d$n_vsmc), fmt(d$n_fsm), fmt(d$n_fsm_ism), fmt(d$n_novel),
+               pct(d$frac_fsm), pct(d$frac_fsm_ism), pct(d$frac_fsm_pc), pct(d$frac_fsm_ism_pc)))
+summary_tbl <- make_summary(rep_tbl, sprintf("All genes (n = %s)", comma(nrow(rep_tbl)))) %>%
+  left_join(make_summary(sg_tbl, sprintf("CAD sGenes (n = %d)", nrow(sg_tbl))), by = "Measure")
+print(as.data.frame(summary_tbl), row.names = FALSE, right = FALSE)
+write_excel_csv(summary_tbl, file.path(TABLE_DIR, "TableS11_gencode_vs_vsmc_summary.csv"))
+put(rep_tbl, 11, "gencode_vs_vsmc_repertoire_per_gene")
+```
+
+## S12 — peptide evidence in CAD sGenes
+
+```{r tableS12_peptide_evidence, message=FALSE, warning=FALSE}
+require_files(OUT_PEPTIDE_SUPP_TABLE)
+s12 <- read_csv(OUT_PEPTIDE_SUPP_TABLE, show_col_types = FALSE)
+cat(sprintf("S12: %d peptides | %d genes\n", nrow(s12),
+            n_distinct(s12[[grep("gene", names(s12), ignore.case = TRUE, value = TRUE)[1]]])))
+put(s12, 12, "CAD_sGene_peptide_evidence")
+```
+
+## S13 — CAD sQTL junction master (355 junctions), with NMD status
+
+`junction_master` already carries the exclusive-peptide ceiling and the dominant protein
+effect; NMD is added as its own column because it is a consequence of the resulting
+transcript rather than a splice class.
+
+```{r tableS13_junctions, message=FALSE, warning=FALSE}
+s13 <- junction_master %>%
+  left_join(nmd_cad %>% select(junction_key, nmd_majority_vote = majority_nmd), by = "junction_key")
+stopifnot("expected 355 junctions" = nrow(s13) == 355)
+cat(sprintf("S13: NMD status available for %d of %d junctions | %d NMD\n",
+            sum(!is.na(s13$nmd_majority_vote)), nrow(s13), sum(s13$nmd_majority_vote, na.rm = TRUE)))
+put(s13, 13, "CAD_sQTL_junction_master")
+```
+
+## S14 — alternative-splicing event classification per cluster
+
+```{r tableS14_as_classification, message=FALSE, warning=FALSE}
+require_files(OUT_AS_CONSENSUS)
+s14 <- read_csv(OUT_AS_CONSENSUS, show_col_types = FALSE) %>%
+  select(cluster_bed, gene_name, risk_junction, nonrisk_junction, slope, direction, complement_source,
+         as_type_A, confidence_A, reason_A, as_type_B, n_junctions_B, confidence_B, reason_B,
+         as_type_C_modal, as_type_C_all, n_iso_pairs, consensus_as_type, consensus_source)
+put(s14, 14, "AS_event_classification_per_cluster")
+```
+
+## S15 — CAD versus non-CAD and risk versus nonrisk property statistics
+
+Produced by `03_protein_feature_annotation.Rmd`; copied into the Supplementary Table set
+so that the complete workbook is assembled in one place.
+
+```{r tableS15_property_stats, message=FALSE, warning=FALSE}
+require_files(OUT_PROPERTY_STATS_MASTER)
+s15 <- read_csv(OUT_PROPERTY_STATS_MASTER, show_col_types = FALSE)
+put(s15, 15, "CAD_vs_nonCAD_property_statistics")
+```
+
+## S16 — risk/nonrisk isoform pairs: dominant mode, property axes and similarity
+
+```{r tableS16_pairs, message=FALSE, warning=FALSE}
+pk  <- c("gene_name", "risk_pb", "nonrisk_pb")
+pdm <- read_csv(OUT_PAIR_DOMINANT_MODE, show_col_types = FALSE) %>% rename_with(~ sub("^﻿", "", .x))   # all pairs
+sim_tbl <- read_csv(OUT_PAIR_SIMILARITY, show_col_types = FALSE) %>%
+  select(all_of(pk), seq_identity_pct = seq_sim, structure_tm_score = struct_sim) %>%
+  distinct(across(all_of(pk)), .keep_all = TRUE)
+sig_wide <- read_csv(OUT_PAIR_SIGNATURES_LONG, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  select(all_of(pk), axis, score) %>%
+  distinct(across(all_of(c(pk, "axis"))), .keep_all = TRUE) %>%
+  pivot_wider(names_from = axis, values_from = score, names_prefix = "axis_")
+s16 <- pdm %>% left_join(sig_wide, by = pk) %>% left_join(sim_tbl, by = pk)
+stopifnot("join changed the row count" = nrow(s16) == nrow(pdm))
+cat(sprintf("S16: %d pairs (%d sQTL-derived, %d manual AP-MS) | axis columns: %d | similarity for %d\n",
+            nrow(s16), sum(s16$pair_type != "manual_apms"), sum(s16$pair_type == "manual_apms"),
+            sum(str_starts(names(s16), "axis_")), sum(!is.na(s16$seq_identity_pct))))
+put(s16, 16, "risk_nonrisk_isoform_pair_properties")
+```
+
+## S17 — AP-MS high-confidence interactions, with VSMC support
+
+The BioGRID flag and the CAD GWAS annotation of each interactor (most likely causal
+genes of Aragam et al., 2022) are carried from the network table of script 07.
+
+```{r tableS17_apms_interactions, message=FALSE, warning=FALSE}
+bg_col   <- grep("biogrid", names(network), ignore.case = TRUE, value = TRUE)
+gwas_col <- grep("aragam", names(network), ignore.case = TRUE, value = TRUE)
+stopifnot("no BioGRID column found in the network table" = length(bg_col) >= 1,
+          "no Aragam CAD GWAS column found in the network table" = length(gwas_col) >= 1)
+sup_tbl <- read_csv(OUT_PREY_VSMC_SUPPORT, show_col_types = FALSE) %>%
+  rename_with(~ sub("^﻿", "", .x)) %>%
+  filter(!Bait %in% "RAB11B-3xFLAG") %>%
+  distinct(PreyGene, In_SMCs_in_HPA, `SMC Protein`, `SMC LR RNAseq`) %>%
+  transmute(prey = display_gene(PreyGene),
+            interactor_in_HPA_SMC = In_SMCs_in_HPA, interactor_in_VSMC_protein = `SMC Protein`,
+            interactor_in_VSMC_longread = `SMC LR RNAseq`,
+            n_VSMC_measures_supporting = (In_SMCs_in_HPA == "YES") + (`SMC Protein` == "YES") + (`SMC LR RNAseq` == "YES"))
+s17 <- network %>%
+  transmute(bait = display_gene(source_harmonized), prey = target_harmonized, specificity,
+            PSM_risk, PSM_nonrisk, log2FC_PSM, in_biogrid = .data[[bg_col[1]]],
+            interactor_in_Aragam_CAD_GWAS = .data[[gwas_col[1]]]) %>%
+  left_join(sup_tbl, by = "prey") %>%
+  distinct(bait, prey, specificity, .keep_all = TRUE) %>%
+  arrange(bait, desc(abs(log2FC_PSM)))
+cat(sprintf("S17: %d interactions | %d baits | %d distinct prey | %d in BioGRID\n",
+            nrow(s17), n_distinct(s17$bait), n_distinct(s17$prey),
+            sum(s17$in_biogrid %in% c(TRUE, "TRUE", "YES"))))
+put(s17, 17, "APMS_interactions_with_VSMC_support")
+```
+
+## S18 — GO enrichment per bait by interactor category
+
+```{r tableS18_go_terms, message=FALSE, warning=FALSE}
+put(go_terms, 18, "APMS_GO_enrichment_terms_by_interactor_category")
+```
+
+## S19 — AP-MS spectral counts and statistics, focus loci
+
+```{r tableS19_apms_stats, message=FALSE, warning=FALSE}
+put(apms_focus_stats, 19, "APMS_focus_locus_statistics")
+```
+
+## S20 — spheroid measurements and pairwise tests
+
+One sheet: per-spheroid values with batch (raw and fold-change moduli both kept so that a
+reader can redo the normalization), a blank row, then the pairwise tests under their own
+header.
+
+```{r tableS20_spheroid, message=FALSE, warning=FALSE}
+meas <- itga1_all %>% mutate(batch = format(batch, "%Y-%m-%d")) %>%
+  select(metric, condition = cond, batch, value) %>% arrange(metric, condition, batch)
+stats <- itga1_stats_all %>%
+  select(metric, group_1 = g1, group_2 = g2, n_1 = n1, n_2 = n2, median_1 = median1, median_2 = median2,
+         p_wilcoxon = p_wilcox, p_wilcoxon_BH = p_wilcox_BH, p_permutation = p_perm)
+cat(sprintf("S20: %d measurements | %d metrics | %d conditions | %d pairwise tests\n",
+            nrow(meas), n_distinct(meas$metric), n_distinct(meas$condition), nrow(stats)))
+
+as_chr <- function(d) mutate(d, across(everything(), ~ as.character(.x)))
+pad <- function(d, n) { for (i in seq_len(max(0, n - ncol(d)))) d[[paste0("pad", i)]] <- ""; d }
+w <- max(ncol(meas), ncol(stats))
+block_a <- pad(as_chr(meas), w)
+block_b <- pad(bind_rows(as_chr(stats)[0, ] %>% add_row(!!!setNames(as.list(names(stats)), names(stats))),
+                         as_chr(stats)), w)
+names(block_b) <- names(block_a)
+blank_row <- block_a[0, ] %>% add_row()
+title_row <- blank_row
+title_row[[1]] <- "Pairwise tests (two-sided Wilcoxon rank-sum, BH-corrected across the three comparisons; permutation test as robustness check)"
+s20 <- bind_rows(block_a, blank_row, title_row, block_b) %>% mutate(across(everything(), ~ replace_na(.x, "")))
+names(s20)[str_detect(names(s20), "^pad")] <- ""
+put(s20, 20, "ITGA1_spheroid_measurements_and_tests")
+```
+
+## Manifest of the Supplementary Table files
+
+```{r tables_manifest, message=FALSE, warning=FALSE}
+man <- tibble(file = list.files(SUPP_DIR, pattern = "^TableS.*\\.csv$")) %>%
+  mutate(path = file.path(SUPP_DIR, file),
+         n_rows = map_int(path, ~ nrow(read_csv(.x, show_col_types = FALSE))),
+         n_cols = map_int(path, ~ ncol(read_csv(.x, show_col_types = FALSE)))) %>%
+  select(-path)
+print(as.data.frame(man), row.names = FALSE)
+write_excel_csv(man, file.path(SUPP_DIR, "TABLE_MANIFEST.csv"))
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```

@@ -1,0 +1,463 @@
+---
+title: "Colocalization integration: CAD sQTL junctions mapped to long-read and GENCODE transcripts"
+output: html_document
+---
+
+## Purpose
+
+This script turns the CAD GWAS–VSMC sQTL colocalization results into the junction table that
+every downstream analysis in this repository builds on. Each colocalized LeafCutter junction is
+first assigned an effect direction relative to the CAD risk allele, because the sQTL slope is
+reported per alternative allele and therefore only equals the risk-allele effect when the risk
+allele happens to be the alternative allele; the risk allele is taken from the Aragam et al.
+(2022) CAD GWAS summary statistics, with an LD-proxy lookup for lead variants that are not
+themselves reported. Each junction is then matched by exact intron coordinates to the intron set
+of the VSMC long-read transcript models and to the intron set of GENCODE v38, which yields the
+annotation status (both, GENCODE only, long-read only, neither) used throughout the manuscript.
+Finally, the colocalization, LD-expansion and VEP/SpliceAI counts quoted in the text and shown in
+Fig. 1g are derived from the Supplementary Tables workbook so that the reported numbers and the
+published tables share one source.
+
+## Manuscript outputs produced
+
+- Numbers in Results and Methods: 355 distinct colocalized junctions, 168 sGenes, 304 lead sQTL
+  variants, 1,534 variants shared between the sQTL and CAD GWAS LD sets, 115 variants returning
+  SpliceAI or VEP splicing evidence (`colocalization_number_summary.csv`).
+- Variant-level SpliceAI/VEP table that `10_figure_and_table_generation.Rmd` plots as Fig. 1g
+  (`variant_level_vep_spliceai.csv`).
+- Methods, "Colocalization with CAD GWAS" and "Mapping CAD sQTL junctions to transcripts and
+  proteins".
+
+## Inputs
+
+- `F_COLOC_WITH_SLOPES` — colocalized sQTL junctions (one row per junction × condition) with the
+  lead sQTL variant, sQTL slope, reference/alternative alleles and nominal statistics.
+- `F_ARAGAM_SNP_SUBSET` — rows of the Aragam et al. (2022) summary statistics (GWAS Catalog
+  GCST90132314) for the lead sQTL variants and their LD proxies.
+- `F_CAD_SQTL_SNPS_LD` — HaploReg v4.2 LD expansion (r² ≥ 0.8) of the lead sQTL variants.
+- `F_SMC_INTRON_COORDS` — intron coordinates of every VSMC long-read transcript model.
+- `F_GENCODE_V38_INTRONS` — intron coordinates of every GENCODE v38 transcript.
+- `F_SUPP_TABLES_XLSX` — the Supplementary Tables workbook (sheets S1–S5).
+
+## Outputs
+
+- `OUT_LFC_INTEGRATED` — the integrated junction table; read by scripts 02, 03, 04, 05 and 10.
+- `OUT_VARIANT_VEP_SPLICEAI` — one row per annotated variant with its maximum SpliceAI delta
+  score and VEP consequences; read by script 10 (Fig. 1g).
+- `OUT_COLOC_NUMBER_SUMMARY` — the colocalization, LD-expansion and annotation counts.
+
+## Run order
+
+First script in the chain; it depends only on files in `data/`.
+
+```{r setup, message=FALSE, warning=FALSE}
+source("config.R")
+library(tidyverse)
+library(readxl)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+require_files(F_COLOC_WITH_SLOPES, F_ARAGAM_SNP_SUBSET, F_CAD_SQTL_SNPS_LD,
+              F_SMC_INTRON_COORDS, F_GENCODE_V38_INTRONS, F_SUPP_TABLES_XLSX)
+ensure_dir(RES_01)
+```
+
+# 1. Colocalized junctions
+
+The colocalization results identify each junction by a LeafCutter `cluster_id` of the form
+`chr:intron_start:intron_end:clu_N_strand:ENSG`. The `clu_N` label is assigned per LeafCutter
+run and is therefore not comparable between conditions, so all matching in this repository uses
+the genomic coordinates (`chr:start:end`, the `junction_key`) instead.
+
+```{r load_coloc}
+coloc_raw <- read_csv(F_COLOC_WITH_SLOPES, show_col_types = FALSE)
+
+coloc <- coloc_raw %>%
+  separate(cluster_id,
+           into = c("chr_num", "intron_start", "intron_end", "cluster", "gene_id"),
+           sep = ":", remove = FALSE, extra = "merge", fill = "right") %>%
+  mutate(
+    intron_start  = as.numeric(intron_start),
+    intron_end    = as.numeric(intron_end),
+    chr_junc      = ifelse(grepl("^chr", chr_num), chr_num, paste0("chr", chr_num)),
+    gene_id_clean = str_remove(gene_id, "\\.\\d+$"),
+    junction_key  = paste(chr_junc, intron_start, intron_end, sep = ":"),
+    gene_name     = sGene
+  )
+
+stopifnot(!any(is.na(coloc$intron_start)), !any(is.na(coloc$intron_end)))
+cat(sprintf("%d junction x condition rows; %d distinct junctions; %d sGenes\n",
+            nrow(coloc), n_distinct(coloc$junction_key), n_distinct(coloc$gene_name)))
+```
+
+# 2. Effect direction relative to the CAD risk allele
+
+The sQTL slope is the per-alternative-allele effect on junction usage. The GWAS risk allele is
+the effect allele when the GWAS beta is positive and the other allele when it is negative; the
+slope sign is kept when the risk allele is the alternative allele and inverted when it is the
+reference allele. Alleles are also compared to their reverse complements so that strand
+differences between the two resources do not leave a variant unresolved. Where several rows
+exist for one rsID, the most significant GWAS association is used.
+
+```{r correct_effect_direction}
+aragam <- read_tsv(F_ARAGAM_SNP_SUBSET, show_col_types = FALSE)
+
+aragam_risk <- aragam %>%
+  filter(!is.na(rsid), !is.na(beta)) %>%
+  mutate(
+    gwas_risk_allele       = toupper(ifelse(beta > 0, effect_allele, other_allele)),
+    gwas_protective_allele = toupper(ifelse(beta > 0, other_allele, effect_allele)),
+    gwas_beta              = beta,
+    gwas_or                = odds_ratio) %>%
+  group_by(rsid) %>%
+  slice_min(p_value, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(rsid, gwas_risk_allele, gwas_protective_allele, gwas_beta, gwas_or, gwas_p = p_value)
+
+revcomp_base <- function(b) {
+  b <- toupper(b)
+  dplyr::recode(b, A = "T", T = "A", C = "G", G = "C", .default = NA_character_)
+}
+
+# Returns the direction of the risk-allele effect on junction usage ("Increased" /
+# "Decreased" / NA) and a status flag recording how the risk allele was matched.
+compute_effect_direction <- function(slope, ref, alt, risk_allele) {
+  if (is.na(slope) || is.na(risk_allele) || is.na(ref) || is.na(alt))
+    return(c(dir = NA_character_, status = "missing_input"))
+  ref <- toupper(ref); alt <- toupper(alt); ra <- toupper(risk_allele)
+
+  if (ra == alt) {
+    return(c(dir = ifelse(slope > 0, "Increased", "Decreased"), status = "risk_is_alt"))
+  } else if (ra == ref) {
+    return(c(dir = ifelse(slope > 0, "Decreased", "Increased"), status = "risk_is_ref"))
+  }
+
+  # Strand-flip fallback: compare against the reverse complement of the risk allele.
+  ra_rc <- revcomp_base(ra)
+  if (!is.na(ra_rc)) {
+    if (ra_rc == alt) {
+      return(c(dir = ifelse(slope > 0, "Increased", "Decreased"), status = "risk_is_alt_strandflip"))
+    } else if (ra_rc == ref) {
+      return(c(dir = ifelse(slope > 0, "Decreased", "Increased"), status = "risk_is_ref_strandflip"))
+    }
+  }
+  c(dir = NA_character_, status = "allele_mismatch")
+}
+
+coloc <- coloc %>% left_join(aragam_risk, by = "rsid")
+
+ed <- mapply(compute_effect_direction,
+             coloc$slope, coloc$ref, coloc$alt, coloc$gwas_risk_allele, SIMPLIFY = TRUE)
+
+coloc <- coloc %>%
+  mutate(
+    effect_direction_old     = effect_direction,   # slope-sign-only direction, kept for reference
+    effect_direction         = ed["dir", ],         # direction relative to the CAD risk allele
+    risk_allele_status       = ed["status", ],
+    effect_direction_verbose = case_when(
+      effect_direction == "Increased" ~ "Increased Expression with Risk Allele",
+      effect_direction == "Decreased" ~ "Decreased Expression with Risk Allele",
+      TRUE                            ~ NA_character_)
+  )
+
+cat("Risk-allele resolution status:\n")
+print(count(coloc, risk_allele_status))
+```
+
+## 2b. LD-proxy lookup for unresolved lead variants
+
+Lead variants absent from the GWAS summary statistics are looked up through their LD proxies
+(r² ≥ 0.8); the proxy with the most significant GWAS association is retained. Because the proxy
+risk allele is defined on the proxy's own reference/alternative alleles and its phase with the
+lead variant is not known from these tables, the proxy information is attached to the table for
+inspection rather than used to assign `effect_direction` automatically.
+
+```{r ld_proxy_fallback}
+unresolved_rsids <- coloc %>% filter(is.na(gwas_risk_allele)) %>% pull(rsid) %>% unique()
+
+if (length(unresolved_rsids) > 0) {
+  snp_ld <- read_csv(F_CAD_SQTL_SNPS_LD, show_col_types = FALSE)
+  names(snp_ld)[1] <- "proxy_snp"
+
+  proxy_lookup <- snp_ld %>%
+    filter(query_lead_snp_rsid %in% unresolved_rsids, proxy_snp %in% aragam_risk$rsid) %>%
+    left_join(aragam_risk, by = c("proxy_snp" = "rsid")) %>%
+    group_by(query_lead_snp_rsid) %>%
+    slice_min(gwas_p, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(query_lead_snp_rsid, proxy_snp,
+           proxy_risk_allele = gwas_risk_allele, proxy_gwas_p = gwas_p)
+
+  if (nrow(proxy_lookup) > 0) {
+    coloc <- coloc %>% left_join(proxy_lookup, by = c("rsid" = "query_lead_snp_rsid"))
+  }
+  cat(sprintf("%d of %d unresolved lead variants have an LD proxy in the GWAS table\n",
+              nrow(proxy_lookup), length(unresolved_rsids)))
+}
+```
+
+# 3. Intron sets of the long-read and GENCODE v38 transcripts
+
+Transcript identifiers in the long-read intron table have the form `GENE|PB.x.y|N`; the PacBio
+accession is extracted with an explicit pattern so that, for example, `PB.6545.1` is never
+matched as a prefix of `PB.6545.10`. Isoforms are collapsed to one row per junction so that the
+join to the colocalization table adds a comma-separated isoform list rather than duplicating
+junction rows.
+
+```{r load_lr_introns}
+intron_lr <- read_tsv(F_SMC_INTRON_COORDS, show_col_types = FALSE) %>%
+  mutate(
+    gene_id_clean = str_remove(gene_id, "\\.\\d+$"),
+    pb_acc        = str_extract(trans_id, "PB\\.[0-9]+\\.[0-9]+"),
+    junction_key  = paste(chr, intron_start, intron_end, sep = ":")
+  )
+
+lr_junc_isoforms <- intron_lr %>%
+  group_by(chr, intron_start, intron_end, gene_id, gene_id_clean) %>%
+  summarise(
+    smc_isoforms   = paste(unique(trans_id), collapse = ","),
+    pb_gene_id     = dplyr::first(na.omit(str_extract(trans_id, "PB\\.[0-9]+"))),
+    n_smc_isoforms = n_distinct(trans_id),
+    strand         = dplyr::first(strand),
+    junc_id        = dplyr::first(junc_id),
+    .groups = "drop"
+  ) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+
+cat(sprintf("%d long-read junction-gene pairs across %d isoforms\n",
+            nrow(lr_junc_isoforms), n_distinct(intron_lr$pb_acc)))
+```
+
+```{r load_gencode}
+gencode_lr <- read_tsv(F_GENCODE_V38_INTRONS, show_col_types = FALSE) %>%
+  mutate(gene_id_clean = str_remove(gene_id, "\\.\\d+$"))
+
+gc_junc_isoforms <- gencode_lr %>%
+  group_by(chr, intron_start, intron_end, gene_id_clean) %>%
+  summarise(gencode_v38_isoforms = paste(unique(gencode_v38_isoforms), collapse = ","),
+            .groups = "drop") %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+
+cat(sprintf("%d GENCODE v38 junction-gene pairs\n", nrow(gc_junc_isoforms)))
+```
+
+# 4. Integrated junction table
+
+Both joins are by exact intron coordinates, which is the matching rule stated in Methods. The
+column order of the exported table is fixed because downstream scripts and the junction master
+table in script 10 address these columns by name.
+
+```{r integrate}
+lfc_integrated <- coloc %>%
+  left_join(lr_junc_isoforms %>%
+              select(junction_key, pb_gene_id, smc_isoforms, n_smc_isoforms, strand, junc_id),
+            by = "junction_key") %>%
+  left_join(gc_junc_isoforms %>% select(junction_key, gencode_v38_isoforms),
+            by = "junction_key")
+
+lfc_final <- lfc_integrated %>%
+  select(
+    chr = chr_junc, intron_start, intron_end, pb_gene_id,
+    gene_id = gene_id_clean, gene_name,
+    smc_isoforms, gencode_v38_isoforms, cluster,
+    SNP_ID = rsid, sQTL_pval_nominal, sQTL_pval_nominal_threshold, sQTL_qval,
+    pos, ref, alt, MAF, Condition, strand, junc_id, junction_key,
+    slope, slope_se,
+    effect_direction, effect_direction_old, effect_direction_verbose,
+    gwas_risk_allele, gwas_protective_allele, gwas_beta, gwas_or, risk_allele_status,
+    tensorqtl_pval, tensorqtl_qval
+  )
+```
+
+```{r summary}
+n_total   <- n_distinct(lfc_final$junction_key)
+n_smc     <- lfc_final %>% filter(!is.na(smc_isoforms)) %>% pull(junction_key) %>% n_distinct()
+n_gc      <- lfc_final %>% filter(!is.na(gencode_v38_isoforms)) %>% pull(junction_key) %>% n_distinct()
+n_both    <- lfc_final %>% filter(!is.na(smc_isoforms), !is.na(gencode_v38_isoforms)) %>%
+  pull(junction_key) %>% n_distinct()
+n_neither <- lfc_final %>% filter(is.na(smc_isoforms), is.na(gencode_v38_isoforms)) %>%
+  pull(junction_key) %>% n_distinct()
+
+cat(sprintf(paste0("Distinct junctions: %d\n  in long-read transcripts: %d\n",
+                   "  in GENCODE v38: %d\n  in both: %d\n  in neither: %d\n"),
+            n_total, n_smc, n_gc, n_both, n_neither))
+```
+
+```{r export}
+write_tsv(lfc_final, OUT_LFC_INTEGRATED)
+cat(sprintf("Wrote %s (%d rows)\n", basename(OUT_LFC_INTEGRATED), nrow(lfc_final)))
+```
+
+# 5. Colocalization, LD-expansion and annotation counts
+
+The counts quoted in Results and Methods are computed from the Supplementary Tables workbook
+rather than from intermediate files, so that every reported number can be traced to a published
+table. Junctions are keyed on `chr:start:end` for the reason given in Section 1, and the two
+conditions are never summed because 110 junctions are colocalized in both.
+
+```{r coloc_numbers_setup}
+coord_key <- function(df) {
+  p <- stringr::str_split_fixed(df$cluster_id, ":", 4)
+  paste(p[, 1], p[, 2], p[, 3], sep = ":")
+}
+mk_keys <- function(df) {
+  names(df)[names(df) == "rsid (lead sQTL SNP)"] <- "lead_rsid"
+  names(df)[names(df) == "Phenotype"]            <- "Condition"
+  df$coord <- coord_key(df)
+  df$gc    <- paste(df$sGene, df$Condition, sep = "|")
+  df
+}
+
+s1 <- read_excel(F_SUPP_TABLES_XLSX, sheet = "S1-new coloc results")       %>% mk_keys()
+s2 <- read_excel(F_SUPP_TABLES_XLSX, sheet = "S2-Aggregate coloc results") %>% mk_keys()
+```
+
+```{r coloc_numbers}
+n_junc      <- n_distinct(s2$coord)       # distinct colocalized junctions
+n_junc_cond <- nrow(s2)                   # junction x condition observations
+n_sgenes    <- n_distinct(s2$sGene)       # sGene labels (comma-joined multi-gene labels kept intact)
+n_lead_snps <- n_distinct(s2$lead_rsid)   # lead sQTL variants
+
+jq <- unique(s2$coord[s2$Condition == "Quiescent"])
+jp <- unique(s2$coord[s2$Condition == "Proliferative"])
+gq <- unique(s2$sGene[s2$Condition == "Quiescent"])
+gp <- unique(s2$sGene[s2$Condition == "Proliferative"])
+
+stopifnot(n_junc == 355, n_sgenes == 168, n_lead_snps == 304)
+cat(sprintf("%d distinct junctions (%d junction x condition rows); %d sGenes; %d lead variants\n",
+            n_junc, n_junc_cond, n_sgenes, n_lead_snps))
+```
+
+## 5b. LD expansion and overlap with CAD GWAS variants
+
+Sheet S3 lists the lead sQTL variants with their LD proxies (columns 1–2) and the CAD GWAS lead
+variants with theirs (columns 3–4); the variants shared between the two LD-expanded sets are the
+1,534 variants submitted to VEP and SpliceAI (Fig. 1f), and sheet S4 is the published listing of
+that same set.
+
+```{r ld_expansion}
+s3 <- read_excel(F_SUPP_TABLES_XLSX, sheet = "S3-LD snp list", skip = 1)
+lead_all <- unique(na.omit(s3[[1]]))
+ld_all   <- unique(na.omit(s3[[2]]))
+cad_ld   <- unique(na.omit(s3[[4]]))
+overlap  <- intersect(ld_all, cad_ld)
+
+s4      <- read_excel(F_SUPP_TABLES_XLSX, sheet = "S4-CAD_sQTL SNP overlap")
+s4_snps <- unique(na.omit(s4[[1]]))
+stopifnot(identical(sort(s4_snps), sort(overlap)))
+n_sgenes_shared <- n_distinct(na.omit(s4[[7]]))
+
+cat(sprintf("lead variants %d; LD r2 >= 0.8 variants %d; CAD GWAS LD variants %d; shared %d\n",
+            length(lead_all), length(ld_all), length(cad_ld), length(overlap)))
+```
+
+## 5c. VEP and SpliceAI annotation
+
+All shared variants were annotated; sheet S5 lists only those with a non-zero SpliceAI score or
+a splicing-related VEP consequence, so the denominator for every proportion is the number of
+submitted variants. SpliceAI reports four delta scores per variant (acceptor/donor gain/loss) and
+one row per affected transcript; the maximum delta across scores and rows is taken as the
+variant's score, and a variant counts as having a splicing VEP consequence if any transcript
+annotation carries one of the splice-site or splice-region terms.
+
+```{r vep_spliceai_annotation}
+s5 <- read_excel(F_SUPP_TABLES_XLSX, sheet = "S5-SpliceAI & VEP all data")
+score_cols <- c("Acceptor Gain SpliceAI Score", "Acceptor Loss SpliceAI Score",
+                "Donor Gain SpliceAI Score",    "Donor Loss SpliceAI Score")
+stopifnot(all(score_cols %in% names(s5)))
+
+s5 <- s5 %>%
+  mutate(across(all_of(score_cols), ~ suppressWarnings(as.numeric(ifelse(. == "-", NA, .)))))
+
+splice_terms <- c("splice_acceptor_variant", "splice_donor_variant",
+                  "splice_region_variant", "splice_donor_5th_base_variant",
+                  "splice_donor_region_variant", "splice_polypyrimidine_tract_variant")
+
+per_variant <- s5 %>%
+  group_by(rsID) %>%
+  summarise(
+    max_delta = suppressWarnings(max(
+      c(.data[[score_cols[1]]], .data[[score_cols[2]]],
+        .data[[score_cols[3]]], .data[[score_cols[4]]]), na.rm = TRUE)),
+    consequences = paste(unique(unlist(strsplit(paste(Consequence, collapse = ","), ","))),
+                         collapse = ","),
+    n_rows = dplyr::n(), .groups = "drop") %>%
+  mutate(max_delta = ifelse(is.finite(max_delta), max_delta, NA_real_),
+         has_splice_vep = purrr::map_lgl(consequences,
+                                         ~ any(splice_terms %in% trimws(strsplit(.x, ",")[[1]]))))
+
+n_submitted  <- length(overlap)
+n_in_s5      <- nrow(per_variant)
+n_scored     <- sum(!is.na(per_variant$max_delta))
+n_nonzero    <- sum(per_variant$max_delta > 0, na.rm = TRUE)
+n_ge02       <- sum(per_variant$max_delta >= 0.2, na.rm = TRUE)
+n_ge05       <- sum(per_variant$max_delta >= 0.5, na.rm = TRUE)
+n_splice_vep <- sum(per_variant$has_splice_vep)
+n_either     <- sum(per_variant$has_splice_vep |
+                      (per_variant$max_delta >= 0.2 & !is.na(per_variant$max_delta)))
+
+cat(sprintf("%d of %d submitted variants returned splicing evidence; %d with SpliceAI >= 0.2\n",
+            n_in_s5, n_submitted, n_ge02))
+
+readr::write_excel_csv(per_variant, OUT_VARIANT_VEP_SPLICEAI)
+```
+
+## 5d. Summary table of reported numbers
+
+```{r number_summary}
+pct <- function(x, d = n_submitted, dp = 2) {
+  sprintf(paste0("%.", dp, "f%% of %s submitted"), 100 * x / d, format(d, big.mark = ","))
+}
+
+coloc_numbers <- tibble::tribble(
+  ~step, ~quantity, ~n, ~source, ~note,
+  "Colocalization", "Colocalized junctions (distinct)",  n_junc,
+    "S2", "Coordinate level (chr:start:end)",
+  "Colocalization", "Junction x condition observations", n_junc_cond,
+    "S2", sprintf("%d junctions colocalized in both conditions", length(intersect(jq, jp))),
+  "Colocalization", "Colocalized sGenes",                n_sgenes,
+    "S2", "Labels as reported; multi-gene labels kept intact",
+  "Colocalization", "Lead sQTL variants",                n_lead_snps,
+    "S2", "Distinct rsIDs across both conditions",
+  "Colocalization", "Junctions, quiescent",              length(jq), "S2", "",
+  "Colocalization", "Junctions, proliferative",          length(jp), "S2", "",
+  "Colocalization", "Junctions in both conditions",      length(intersect(jq, jp)),
+    "S2", "The union is the total; conditions are not summed",
+  "Colocalization", "sGenes, quiescent",                 length(gq), "S2", "",
+  "Colocalization", "sGenes, proliferative",             length(gp), "S2", "",
+  "Colocalization", "sGenes in both conditions",         length(intersect(gq, gp)), "S2", "",
+
+  "Updated colocalization", "Junctions in the updated run", n_distinct(s1$coord),
+    "S1", "Subset of S2 at the coordinate level",
+  "Updated colocalization", "sGenes in the updated run",    n_distinct(s1$sGene), "S1", "",
+
+  "LD expansion", "Lead variants entering LD expansion", length(lead_all), "S3", "",
+  "LD expansion", "Variants in LD r2 >= 0.8",           length(ld_all),   "S3", "",
+  "LD expansion", "CAD GWAS LD-expanded variants",      length(cad_ld),   "S3", "",
+  "LD expansion", "Shared sQTL + CAD variants",         length(overlap),
+    "S3 / S4", "Fig. 1f endpoint; the set annotated with VEP and SpliceAI",
+  "LD expansion", "sGenes among shared variants",       n_sgenes_shared,  "S4", "",
+
+  "Annotation", "Variants submitted to VEP + SpliceAI", n_submitted,
+    "S3 / S4", "Denominator for all annotation proportions",
+  "Annotation", "Returned any splicing evidence",       n_in_s5,
+    "S5", "Non-zero SpliceAI score or splicing VEP consequence",
+  "Annotation", "Scored by SpliceAI",                   n_scored,  "S5", "",
+  "Annotation", "Non-zero SpliceAI score",              n_nonzero, "S5", "",
+  "Annotation", "SpliceAI >= 0.2",                      n_ge02,    "S5", pct(n_ge02),
+  "Annotation", "SpliceAI >= 0.5",                      n_ge05,    "S5", "",
+  "Annotation", "SpliceAI < 0.2",                       n_submitted - n_ge02, "S5", "",
+  "Annotation", "Splicing VEP consequence",             n_splice_vep,
+    "S5", "Unique variants, not annotation count",
+  "Annotation", "Prioritized (either criterion)",       n_either,  "S5", pct(n_either)
+) %>% mutate(n = as.integer(n))
+
+readr::write_excel_csv(coloc_numbers, OUT_COLOC_NUMBER_SUMMARY)
+knitr::kable(coloc_numbers, format = "simple")
+```
+
+# Session information
+
+```{r session_info}
+sessionInfo()
+```

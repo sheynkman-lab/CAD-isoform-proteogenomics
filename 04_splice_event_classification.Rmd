@@ -1,0 +1,874 @@
+---
+title: "Alternative-splicing event classification of CAD sQTL clusters"
+output: html_document
+---
+
+## Purpose
+
+Each CAD-colocalized sQTL identifies a LeafCutter cluster of mutually exclusive
+intron-excision events, but the cluster alone does not say what kind of splicing
+change the risk allele produces. This script assigns one of the nine
+alternative-splicing (AS) classes (exon skipping, alternative donor or acceptor
+site, mutually exclusive exons, intron retention, alternative first or last exon
+and their mutually exclusive variants), plus "complex" for clusters that fit no
+single pattern, to every CAD-associated cluster and to every non-CAD VSMC sQTL
+cluster used as background. Three classifiers are run because each sees a
+different part of the evidence: (A) the coordinates of the risk and nonrisk
+junctions resolve shared donors and acceptors; (B) the topology of all junctions
+in the cluster, together with internal exons from GENCODE v38 and the long-read
+models, resolves cassette and mutually exclusive exons; and (C) exon-by-exon
+comparison of the paired long-read transcripts resolves events, such as
+alternative first or last exons, that need transcript context. The three calls
+are reconciled to one consensus label per cluster. Because the manuscript asks
+whether CAD-associated events alter the protein, the script also records a
+predicted protein consequence for each risk/nonrisk junction pair, using the
+single coding definition exported by `02_junction_isoform_mapping_and_pairs.Rmd`
+so that every downstream script stratifies junctions identically.
+
+## Manuscript outputs produced
+
+- Extended Data Fig. 5a — AS class distribution, CAD versus non-CAD VSMC sQTL
+  clusters (data table; the panel is drawn by `10_figure_and_table_generation.Rmd`).
+- Fig. 4e — predicted protein consequence of the long-read-captured CAD sQTL
+  junctions (per-junction-pair effects; collapsed to one call per junction in
+  script 10).
+- Supplementary Table 14 — AS event classification per cluster (consensus table).
+- Methods, "Alternative-splicing event classification".
+
+## Inputs
+
+- `OUT_CAD_JUNCTION_PAIRS`, `OUT_CAD_CLUSTER_SIBLINGS`, `OUT_PAIRS_UNIFIED_FLAGGED`,
+  `OUT_CAD_JUNCTION_CODING`, `OUT_NONCAD_JUNCTION_CODING`, `OUT_JUNCTION_UNIVERSE`
+  — risk/nonrisk junction pairs, cluster membership, isoform pairs and the
+  junction coding classification from script 02.
+- `OUT_LFC_INTEGRATED` — the integrated CAD sQTL junction table from script 01
+  (defines the CAD junction universe and the CAD clusters excluded from the
+  background).
+- `F_GENERAL_SQTL_LR` — all VSMC sQTL junctions (non-CAD background).
+- `F_SMC_GTF` — long-read VSMC transcript models (exon structure of the paired
+  isoforms).
+- `F_GENCODE_V38_GTF` — GENCODE v38 annotation (first, last and internal exons).
+- `F_LEAFCUTTER_BED_PROLIF`, `F_LEAFCUTTER_BED_QUIESC` — LeafCutter cluster BEDs
+  (all junctions of the non-CAD clusters).
+
+## Outputs (in `RES_04`)
+
+- `as_event_classification_consensus.csv` — per-cluster calls from methods A, B
+  and C and the consensus (Supplementary Table 14; read by script 10).
+- `as_type_distribution_cad_vs_noncad.csv` — cluster counts per AS class for CAD
+  and non-CAD clusters (Extended Data Fig. 5a; read by script 10).
+- `protein_effects_per_junction.csv` — predicted protein consequence per
+  risk/nonrisk junction pair (Fig. 4e and Supplementary Table 13; read by
+  script 10).
+
+## Run order
+
+Scripts 01 and 02 must have been run.
+
+```{r setup, message=FALSE, warning=FALSE}
+source("config.R")
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(data.table)
+
+set.seed(42)
+ensure_dir(RES_04)
+
+require_files(OUT_CAD_JUNCTION_PAIRS, OUT_CAD_CLUSTER_SIBLINGS, OUT_PAIRS_UNIFIED_FLAGGED,
+              OUT_CAD_JUNCTION_CODING, OUT_NONCAD_JUNCTION_CODING, OUT_JUNCTION_UNIVERSE,
+              OUT_LFC_INTEGRATED, F_GENERAL_SQTL_LR, F_SMC_GTF, F_GENCODE_V38_GTF,
+              F_LEAFCUTTER_BED_PROLIF, F_LEAFCUTTER_BED_QUIESC)
+
+# A junction is coding when script 02 labelled it "CDS (at least partial)": it
+# overlaps a CDS feature and at least one long-read isoform containing it is
+# coding. This single label is the coding filter shared by scripts 02-06 and 10.
+CODING_CLASS_KEEP <- "CDS (at least partial)"
+
+# Parse a "chr:start:end" junction key into its components (NA-safe).
+parse_junction_key <- function(jk) {
+  jk <- as.character(jk)
+  parts <- str_split_fixed(jk, ":", 3)
+  parts[is.na(jk), ] <- NA_character_
+  tibble(chr   = as.character(parts[, 1]),
+         start = suppressWarnings(as.integer(parts[, 2])),
+         end   = suppressWarnings(as.integer(parts[, 3])))
+}
+```
+
+# 1. Load data
+
+The CAD side of the analysis is built entirely from script 02's exports, so the
+pairs, cluster membership and isoform pairs are the same objects used for the
+property and peptide analyses. Exon annotations are taken from both GENCODE v38
+and the long-read models because LeafCutter frequently captures the two flanking
+introns of a cassette exon without the skip junction; recognizing that signature
+requires knowing that an annotated internal exon sits in the gap between them.
+
+```{r load_data}
+pairs_df  <- read_csv(OUT_CAD_JUNCTION_PAIRS,   show_col_types = FALSE)
+siblings  <- read_csv(OUT_CAD_CLUSTER_SIBLINGS, show_col_types = FALSE)
+iso_pairs <- read_csv(OUT_PAIRS_UNIFIED_FLAGGED, show_col_types = FALSE)
+stopifnot("isoform pair table must carry cluster_bed" =
+            "cluster_bed" %in% names(iso_pairs) && any(!is.na(iso_pairs$cluster_bed)))
+message(sprintf("CAD junction pairs: %d | sibling junctions: %d in %d clusters | isoform pairs: %d",
+                nrow(pairs_df), nrow(siblings), n_distinct(siblings$cluster_bed), nrow(iso_pairs)))
+
+# ---- long-read transcript models: exons per PB isoform (sorted by genomic start) ----
+smc_gtf <- rtracklayer::import(F_SMC_GTF)
+seqlevelsStyle(smc_gtf) <- "UCSC"
+smc_exons <- smc_gtf[smc_gtf$type == "exon"]
+smc_exons$pb_id <- str_extract(smc_exons$transcript_id, "PB\\.[0-9]+\\.[0-9]+")
+smc_exons <- smc_exons[!is.na(smc_exons$pb_id)]
+smc_exons_by_pb <- endoapply(split(smc_exons, smc_exons$pb_id), sort)
+
+# ---- GENCODE v38: first, last and internal exons per transcript ----
+gencode <- rtracklayer::import(F_GENCODE_V38_GTF)
+seqlevelsStyle(gencode) <- "UCSC"
+gencode_exons <- gencode[gencode$type == "exon"]
+ex_df <- as.data.frame(gencode_exons) %>%
+  mutate(exon_n = suppressWarnings(as.integer(exon_number))) %>%
+  filter(!is.na(exon_n))
+
+gencode_first_exon <- gencode_exons[gencode_exons$exon_number == "1"]
+last_idx <- ex_df %>% group_by(transcript_id) %>% filter(exon_n == max(exon_n)) %>% ungroup()
+gencode_last_exon <- makeGRangesFromDataFrame(last_idx, keep.extra.columns = TRUE)
+seqlevelsStyle(gencode_last_exon) <- "UCSC"
+internal_idx <- ex_df %>%
+  group_by(transcript_id) %>% filter(exon_n > 1 & exon_n < max(exon_n)) %>% ungroup()
+gencode_internal_exon <- makeGRangesFromDataFrame(internal_idx, keep.extra.columns = TRUE)
+seqlevelsStyle(gencode_internal_exon) <- "UCSC"
+
+# ---- long-read internal exons (exon_number when present, otherwise genomic order) ----
+smc_internal_exon <- {
+  smc_ex_df <- as.data.frame(smc_exons)
+  has_exon_n <- "exon_number" %in% colnames(smc_ex_df)
+  if (has_exon_n) {
+    smc_ex_df <- smc_ex_df %>% mutate(exon_n = suppressWarnings(as.integer(exon_number)))
+    has_exon_n <- any(!is.na(smc_ex_df$exon_n))
+  }
+  int_smc <- if (has_exon_n) {
+    smc_ex_df %>% filter(!is.na(exon_n)) %>%
+      group_by(transcript_id) %>% filter(exon_n > 1 & exon_n < max(exon_n)) %>% ungroup()
+  } else {
+    smc_ex_df %>% group_by(transcript_id) %>% arrange(start, .by_group = TRUE) %>%
+      mutate(rank_idx = row_number(), max_rank = max(rank_idx)) %>%
+      filter(rank_idx > 1 & rank_idx < max_rank) %>% ungroup()
+  }
+  if (nrow(int_smc) > 0) {
+    g <- makeGRangesFromDataFrame(int_smc, keep.extra.columns = TRUE)
+    seqlevelsStyle(g) <- "UCSC"
+    g
+  } else GRanges()
+}
+
+# Internal exons from both annotations are pooled for cassette-inclusion detection.
+internal_exon_gr <- c(gencode_internal_exon, smc_internal_exon)
+message(sprintf("internal exons for inclusion detection: %d (GENCODE %d + long-read %d)",
+                length(internal_exon_gr), length(gencode_internal_exon), length(smc_internal_exon)))
+
+# ---- non-CAD VSMC sQTL background ----
+# Every cluster present in the integrated CAD sQTL table is removed from the
+# background, using the same exclusion key as script 02.
+general_sqtls <- read_tsv(F_GENERAL_SQTL_LR, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+lfc_final <- read_tsv(OUT_LFC_INTEGRATED, show_col_types = FALSE) %>%
+  mutate(junction_key = paste(chr, intron_start, intron_end, sep = ":"))
+stopifnot("cluster column expected in the integrated sQTL table" = "cluster" %in% names(lfc_final))
+cad_cluster_set <- unique(lfc_final$cluster)
+general_sqtls <- general_sqtls %>% filter(!cluster_id %in% cad_cluster_set)
+message(sprintf("non-CAD VSMC sQTL junctions after excluding %d CAD clusters: %d",
+                length(cad_cluster_set), nrow(general_sqtls)))
+
+# ---- LeafCutter BEDs: all junctions of every cluster (non-CAD cluster topology) ----
+parse_bed <- function(path, cond) {
+  bed <- fread(file = path, select = 1:4, header = TRUE)
+  colnames(bed) <- c("chrom", "start", "end", "ID")
+  as_tibble(bed) %>%
+    mutate(junction_key = paste0(chrom, ":", start, ":", end),
+           cluster_bed  = str_extract(ID, "clu_\\d+_[+-]"),
+           strand       = str_sub(cluster_bed, -1, -1),
+           condition    = cond) %>%
+    select(junction_key, cluster_bed, chrom, start, end, strand, condition)
+}
+bed_all <- bind_rows(parse_bed(F_LEAFCUTTER_BED_PROLIF, "Proliferative"),
+                     parse_bed(F_LEAFCUTTER_BED_QUIESC, "Quiescent")) %>%
+  distinct(junction_key, cluster_bed, .keep_all = TRUE)
+```
+
+# 2. Junction universe and coding status
+
+The distinct CAD sQTL junctions are taken from the integrated sQTL table and
+annotated with their provenance (GENCODE v38, long-read, both or neither) and
+with the coding label exported by script 02. The coding status is asserted to
+agree with script 02's full junction universe, because a disagreement here would
+make the coding stratification of this script diverge from the peptide and
+property analyses.
+
+```{r junction_annotation}
+unified_coding <- read_csv(OUT_CAD_JUNCTION_CODING, show_col_types = FALSE)
+
+junction_annot <- lfc_final %>%
+  distinct(junction_key, .keep_all = TRUE) %>%
+  mutate(in_lr = !is.na(smc_isoforms) & smc_isoforms != "",
+         in_gc = !is.na(gencode_v38_isoforms) & gencode_v38_isoforms != "",
+         provenance = case_when( in_gc &  in_lr ~ "both",
+                                 in_gc & !in_lr ~ "gencode_only",
+                                !in_gc &  in_lr ~ "lr_only",
+                                TRUE            ~ "neither")) %>%
+  left_join(unified_coding %>% select(junction_key, overlaps_cds, any_coding, coding_class),
+            by = "junction_key") %>%
+  mutate(in_cds_isoform = coding_class %in% CODING_CLASS_KEEP)
+message(sprintf("distinct CAD sQTL junctions: %d | in long-read isoform: %d | coding: %d",
+                nrow(junction_annot), sum(junction_annot$in_lr), sum(junction_annot$in_cds_isoform)))
+
+# Coding status must match script 02's exported universe on every shared junction.
+as_universe_02 <- read_csv(OUT_JUNCTION_UNIVERSE, show_col_types = FALSE)
+cmp <- junction_annot %>%
+  transmute(junction_key, coding_here = in_cds_isoform) %>%
+  inner_join(as_universe_02 %>% filter(set == "CAD") %>%
+               transmute(junction_key, coding_02 = coding_class %in% CODING_CLASS_KEEP),
+             by = "junction_key")
+stopifnot("no junctions shared with the script-02 universe" = nrow(cmp) > 0,
+          "coding status differs from script 02" = all(cmp$coding_here == cmp$coding_02))
+```
+
+# 3. Classifiers
+
+## 3a. Method A — pairwise junction classifier
+
+Two introns on the same chromosome and strand are compared on genomic
+coordinates (start = lower coordinate), so the donor/acceptor assignment depends
+on strand: on the + strand the start is the donor and the end the acceptor, and
+the reverse on the − strand. A shared endpoint gives an alternative splice site,
+strict containment gives exon skipping with an explicit skip junction, and two
+non-overlapping junctions are called exon skipping when an annotated internal
+exon lies entirely in the gap between them (the inclusion signature of a
+cassette), AFE/ALE when a donor or acceptor sits in an annotated first or last
+exon, and complex otherwise.
+
+```{r fn_classify_pair}
+classify_junction_pair <- function(s_a, e_a, s_b, e_b, strand,
+                                   first_exon_gr = NULL, last_exon_gr = NULL,
+                                   internal_exon_gr = NULL, chr = NULL) {
+  if (any(is.na(c(s_a, e_a, s_b, e_b)))) {
+    return(tibble(as_type = NA_character_, confidence = "missing",
+                  reason = "NA junction coordinates", sub_event = NA_character_))
+  }
+  if (s_a == s_b && e_a == e_b) {
+    return(tibble(as_type = "no_event", confidence = "high",
+                  reason = "junctions identical", sub_event = NA_character_))
+  }
+  shared_start <- (s_a == s_b)
+  shared_end   <- (e_a == e_b)
+
+  # Shared endpoint: alternative acceptor (AAS) or donor (ADS) site
+  if (shared_start && !shared_end) {
+    as_type <- if (strand == "+") "AAS" else "ADS"
+    return(tibble(as_type = as_type, confidence = "high",
+                  reason = sprintf("shared %s; alt %s",
+                                   if (strand == "+") "donor" else "acceptor",
+                                   if (strand == "+") "acceptor" else "donor"),
+                  sub_event = NA_character_))
+  }
+  if (!shared_start && shared_end) {
+    as_type <- if (strand == "+") "ADS" else "AAS"
+    return(tibble(as_type = as_type, confidence = "high",
+                  reason = sprintf("shared %s; alt %s",
+                                   if (strand == "+") "acceptor" else "donor",
+                                   if (strand == "+") "donor" else "acceptor"),
+                  sub_event = NA_character_))
+  }
+
+  # Containment: the longer junction skips the cassette exon, the shorter is one inclusion arm
+  a_contains_b <- (s_a < s_b) && (e_a > e_b)
+  b_contains_a <- (s_a > s_b) && (e_a < e_b)
+  if (a_contains_b || b_contains_a) {
+    return(tibble(as_type = "ES", confidence = "high",
+                  reason = "one junction strictly contains the other (skip + inclusion arm)",
+                  sub_event = "skip_plus_inclusion"))
+  }
+
+  # Non-overlapping junctions: cassette inclusion, AFE/ALE, or complex
+  nonoverlap <- (e_a < s_b) || (e_b < s_a)
+  if (nonoverlap) {
+    if (e_a < s_b) { j1_end <- e_a; j2_start <- s_b } else { j1_end <- e_b; j2_start <- s_a }
+    gap_lo <- j1_end + 1
+    gap_hi <- j2_start - 1
+
+    if (!is.null(internal_exon_gr) && !is.null(chr) && gap_lo <= gap_hi) {
+      gap_gr <- GRanges(chr, IRanges(gap_lo, gap_hi), strand = strand)
+      # An exon contained within the gap (not merely overlapping it) is a cassette exon
+      cassette_hits <- countOverlaps(internal_exon_gr, gap_gr, type = "within") > 0
+      if (any(cassette_hits)) {
+        return(tibble(as_type = "ES", confidence = "high",
+                      reason = "non-overlapping junctions flank an annotated internal exon (cassette inclusion)",
+                      sub_event = "inclusion_only"))
+      }
+    }
+    if (!is.null(first_exon_gr) && !is.null(chr)) {
+      donor_gr <- GRanges(chr, IRanges(c(s_a, s_b) - 1, c(s_a, s_b) + 1), strand = strand)
+      if (any(countOverlaps(donor_gr, first_exon_gr) > 0)) {
+        return(tibble(as_type = "AFE", confidence = "medium",
+                      reason = "non-overlapping junctions; donor at annotated first exon",
+                      sub_event = NA_character_))
+      }
+    }
+    if (!is.null(last_exon_gr) && !is.null(chr)) {
+      acc_gr <- GRanges(chr, IRanges(c(e_a, e_b) - 1, c(e_a, e_b) + 1), strand = strand)
+      if (any(countOverlaps(acc_gr, last_exon_gr) > 0)) {
+        return(tibble(as_type = "ALE", confidence = "medium",
+                      reason = "non-overlapping junctions; acceptor at annotated last exon",
+                      sub_event = NA_character_))
+      }
+    }
+    return(tibble(as_type = "complex", confidence = "low",
+                  reason = "non-overlapping junctions, no exon in gap and no AFE/ALE match",
+                  sub_event = NA_character_))
+  }
+
+  # Partial overlap without a shared splice site
+  tibble(as_type = "complex", confidence = "low",
+         reason = "overlapping but no shared splice site", sub_event = NA_character_)
+}
+```
+
+## 3b. Method B — cluster topology classifier
+
+All junctions of one LeafCutter cluster are examined together, which is the only
+way to see patterns that a single junction pair cannot show: a three-junction
+cassette (skip junction plus two inclusion arms), the four-junction signature of
+mutually exclusive exons (two shared flanks enclosing two non-overlapping
+cassettes), and multi-way alternative splice sites. Clusters of four or more
+junctions that match no exact pattern are classified by the dominant pairwise
+evidence (containment or inclusion versus shared splice sites).
+
+```{r fn_classify_cluster}
+classify_cluster_topology <- function(junctions_df, first_exon_gr = NULL, last_exon_gr = NULL,
+                                      internal_exon_gr = NULL) {
+  n <- nrow(junctions_df)
+  strand <- unique(junctions_df$strand)
+  if (length(strand) != 1) strand <- strand[1]
+  chr <- unique(junctions_df$chrom)[1]
+
+  if (n < 2) {
+    return(tibble(as_type = NA_character_, n_junctions = n, confidence = "missing",
+                  reason = "cluster has < 2 junctions"))
+  }
+  jdf <- junctions_df %>% arrange(start, end)
+  s <- jdf$start; e <- jdf$end
+
+  has_exon_in_gap <- function(gap_lo, gap_hi) {
+    if (is.null(internal_exon_gr) || is.na(chr) || gap_lo > gap_hi) return(FALSE)
+    gap_gr <- GRanges(chr, IRanges(gap_lo, gap_hi), strand = strand)
+    any(countOverlaps(internal_exon_gr, gap_gr, type = "within") > 0)
+  }
+
+  # ---- two junctions ----
+  if (n == 2) {
+    if (s[1] == s[2] && e[1] != e[2]) {
+      as_type <- if (strand == "+") "AAS" else "ADS"
+      return(tibble(as_type = as_type, n_junctions = n, confidence = "high",
+                    reason = "2 junctions sharing donor end"))
+    }
+    if (e[1] == e[2] && s[1] != s[2]) {
+      as_type <- if (strand == "+") "ADS" else "AAS"
+      return(tibble(as_type = as_type, n_junctions = n, confidence = "high",
+                    reason = "2 junctions sharing acceptor end"))
+    }
+    if ((s[1] < s[2] && e[1] > e[2]) || (s[2] < s[1] && e[2] > e[1])) {
+      return(tibble(as_type = "ES", n_junctions = n, confidence = "high",
+                    reason = "2 junctions, one contains the other (skip + inclusion arm)"))
+    }
+    if (e[1] < s[2] && has_exon_in_gap(e[1] + 1, s[2] - 1)) {
+      return(tibble(as_type = "ES", n_junctions = n, confidence = "high",
+                    reason = "2 non-overlapping junctions flanking an annotated internal exon (cassette inclusion)"))
+    }
+    if (!is.null(first_exon_gr) && !is.na(chr)) {
+      donor_gr <- GRanges(chr, IRanges(c(s[1], s[2]) - 1, c(s[1], s[2]) + 1), strand = strand)
+      if (any(countOverlaps(donor_gr, first_exon_gr) > 0)) {
+        return(tibble(as_type = "AFE", n_junctions = n, confidence = "medium",
+                      reason = "2 non-overlapping junctions; donor at annotated first exon"))
+      }
+    }
+    if (!is.null(last_exon_gr) && !is.na(chr)) {
+      acc_gr <- GRanges(chr, IRanges(c(e[1], e[2]) - 1, c(e[1], e[2]) + 1), strand = strand)
+      if (any(countOverlaps(acc_gr, last_exon_gr) > 0)) {
+        return(tibble(as_type = "ALE", n_junctions = n, confidence = "medium",
+                      reason = "2 non-overlapping junctions; acceptor at annotated last exon"))
+      }
+    }
+    return(tibble(as_type = "complex", n_junctions = n, confidence = "low",
+                  reason = "2 junctions, no cassette/AFE/ALE match"))
+  }
+
+  # ---- three junctions ----
+  if (n == 3) {
+    # Canonical cassette: one skip junction spanning two inclusion junctions
+    skip_idx <- which(s == min(s) & e == max(e))
+    if (length(skip_idx) == 1) {
+      others <- jdf[-skip_idx, ]
+      shares_start <- others$start == s[skip_idx]
+      shares_end   <- others$end   == e[skip_idx]
+      if (sum(shares_start) == 1 && sum(shares_end) == 1 && !any(shares_start & shares_end)) {
+        return(tibble(as_type = "ES", n_junctions = n, confidence = "high",
+                      reason = "3-junction cassette: skip + two flanking inclusion junctions"))
+      }
+    }
+    if (length(unique(s)) == 1) {
+      as_type <- if (strand == "+") "AAS" else "ADS"
+      return(tibble(as_type = as_type, n_junctions = n, confidence = "high",
+                    reason = "3 junctions sharing one endpoint (multi-way alt splice site)"))
+    }
+    if (length(unique(e)) == 1) {
+      as_type <- if (strand == "+") "ADS" else "AAS"
+      return(tibble(as_type = as_type, n_junctions = n, confidence = "high",
+                    reason = "3 junctions sharing one endpoint (multi-way alt splice site)"))
+    }
+    for (i in 1:2) for (j in (i + 1):3) {
+      if ((s[i] < s[j] && e[i] > e[j]) || (s[j] < s[i] && e[j] > e[i])) {
+        return(tibble(as_type = "ES", n_junctions = n, confidence = "medium",
+                      reason = "3-junction cluster with one pair showing containment (likely cassette)"))
+      }
+      if (e[i] < s[j] && has_exon_in_gap(e[i] + 1, s[j] - 1)) {
+        return(tibble(as_type = "ES", n_junctions = n, confidence = "medium",
+                      reason = "3-junction cluster with one pair flanking an internal exon (cassette inclusion)"))
+      }
+      if (e[j] < s[i] && has_exon_in_gap(e[j] + 1, s[i] - 1)) {
+        return(tibble(as_type = "ES", n_junctions = n, confidence = "medium",
+                      reason = "3-junction cluster with one pair flanking an internal exon (cassette inclusion)"))
+      }
+    }
+    return(tibble(as_type = "complex", n_junctions = n, confidence = "low",
+                  reason = "3-junction cluster, no clean ES / A5SS / A3SS pattern"))
+  }
+
+  # ---- four junctions: mutually exclusive exons ----
+  if (n == 4) {
+    n_share_min_s <- sum(s == min(s))
+    n_share_max_e <- sum(e == max(e))
+    if (n_share_min_s == 2 && n_share_max_e == 2) {
+      ups   <- jdf %>% filter(start == min(s)) %>% arrange(end)
+      downs <- jdf %>% filter(end   == max(e)) %>% arrange(start)
+      if (nrow(ups) == 2 && nrow(downs) == 2) {
+        cas_A <- c(ups$end[1] + 1, downs$start[1] - 1)
+        cas_B <- c(ups$end[2] + 1, downs$start[2] - 1)
+        if (cas_A[2] < cas_B[1] || cas_B[2] < cas_A[1]) {
+          return(tibble(as_type = "MXE", n_junctions = n, confidence = "high",
+                        reason = "4-junction MXE: two non-overlapping cassettes between shared flanks"))
+        }
+      }
+    }
+  }
+
+  # ---- four or more junctions: dominant pairwise evidence ----
+  n_contain <- 0L; n_inclusion <- 0L; n_share_s <- 0L; n_share_e <- 0L
+  for (i in 1:(n - 1)) for (j in (i + 1):n) {
+    if (s[i] == s[j] && e[i] != e[j]) n_share_s <- n_share_s + 1L
+    if (e[i] == e[j] && s[i] != s[j]) n_share_e <- n_share_e + 1L
+    if ((s[i] < s[j] && e[i] > e[j]) || (s[j] < s[i] && e[j] > e[i])) n_contain <- n_contain + 1L
+    if (e[i] < s[j] && has_exon_in_gap(e[i] + 1, s[j] - 1)) n_inclusion <- n_inclusion + 1L
+    if (e[j] < s[i] && has_exon_in_gap(e[j] + 1, s[i] - 1)) n_inclusion <- n_inclusion + 1L
+  }
+  es_evidence <- n_contain + n_inclusion
+  if (es_evidence > 0 && es_evidence >= max(n_share_s, n_share_e)) {
+    return(tibble(as_type = "ES", n_junctions = n, confidence = "medium",
+                  reason = sprintf("multi-junction cluster (n=%d): %d ES-supporting pair(s) [%d skip, %d inclusion]",
+                                   n, es_evidence, n_contain, n_inclusion)))
+  }
+  if (n_share_s > 0 && n_share_s >= n_share_e) {
+    as_type <- if (strand == "+") "AAS" else "ADS"
+    return(tibble(as_type = as_type, n_junctions = n, confidence = "medium",
+                  reason = sprintf("multi-junction cluster: %d pair(s) share donor", n_share_s)))
+  }
+  if (n_share_e > 0) {
+    as_type <- if (strand == "+") "ADS" else "AAS"
+    return(tibble(as_type = as_type, n_junctions = n, confidence = "medium",
+                  reason = sprintf("multi-junction cluster: %d pair(s) share acceptor", n_share_e)))
+  }
+  tibble(as_type = "complex", n_junctions = n, confidence = "low",
+         reason = sprintf("complex cluster with %d junctions, no dominant pattern", n))
+}
+```
+
+## 3c. Method C — transcript-pair classifier
+
+The risk and nonrisk long-read isoforms are compared exon by exon in
+transcription order. Non-overlapping first or last exons give AFE/ALE, an
+internal exon with no counterpart gives ES (or MXE when both isoforms carry an
+unmatched exon in the same region), matched exons with one differing boundary
+give an alternative donor or acceptor, and an intron of one isoform contained in
+an exon of the other gives intron retention. When several event types co-occur
+the primary label follows the Song et al. convention (MXE with AFE/ALE becomes
+MXE-AFE/MXE-ALE; otherwise a single accompanying event is subsumed under the
+AFE, ALE or ES call).
+
+```{r fn_classify_transcripts}
+classify_transcript_pair <- function(exons_a, exons_b) {
+  if (length(exons_a) == 0 || length(exons_b) == 0) {
+    return(tibble(as_type = NA_character_, n_events = 0L, sub_events = NA_character_,
+                  confidence = "missing"))
+  }
+  strand <- as.character(unique(strand(exons_a)))[1]
+  if (strand == "-") {
+    exons_a <- sort(exons_a, decreasing = TRUE); exons_b <- sort(exons_b, decreasing = TRUE)
+  } else {
+    exons_a <- sort(exons_a); exons_b <- sort(exons_b)
+  }
+  if (length(exons_a) == length(exons_b) &&
+      all(start(exons_a) == start(exons_b)) && all(end(exons_a) == end(exons_b))) {
+    return(tibble(as_type = "no_event", n_events = 0L, sub_events = NA_character_,
+                  confidence = "high"))
+  }
+
+  events <- c()
+
+  # AFE / ALE: terminal exons do not overlap
+  first_a <- exons_a[1]; first_b <- exons_b[1]
+  if (length(intersect(first_a, first_b)) == 0) events <- c(events, "AFE")
+  last_a <- exons_a[length(exons_a)]; last_b <- exons_b[length(exons_b)]
+  if (length(intersect(last_a, last_b)) == 0) events <- c(events, "ALE")
+
+  # Internal exons: unmatched exons (ES / MXE) and boundary differences (ADS / AAS)
+  internal_a <- if (length(exons_a) > 2) exons_a[2:(length(exons_a) - 1)] else GRanges()
+  internal_b <- if (length(exons_b) > 2) exons_b[2:(length(exons_b) - 1)] else GRanges()
+  hits_ab <- findOverlaps(internal_a, internal_b)
+  hits_ba <- findOverlaps(internal_b, internal_a)
+  unmapped_a <- setdiff(seq_along(internal_a), queryHits(hits_ab))
+  unmapped_b <- setdiff(seq_along(internal_b), queryHits(hits_ba))
+  if (length(unmapped_a) > 0 || length(unmapped_b) > 0) events <- c(events, "ES")
+
+  # MXE: unmatched exons in both isoforms that do not overlap but lie within 5 kb
+  if (length(unmapped_a) > 0 && length(unmapped_b) > 0) {
+    mxe_pairs <- 0
+    for (ia in unmapped_a) {
+      ex_a <- internal_a[ia]
+      for (ib in unmapped_b) {
+        ex_b <- internal_b[ib]
+        if (length(intersect(ex_a, ex_b)) == 0 &&
+            min(abs(start(ex_a) - end(ex_b)), abs(start(ex_b) - end(ex_a))) < 5000) {
+          mxe_pairs <- mxe_pairs + 1
+        }
+      }
+    }
+    if (mxe_pairs > 0) events <- c(events, "MXE")
+  }
+
+  if (length(hits_ab) > 0) {
+    for (k in seq_along(hits_ab)) {
+      ex_a <- internal_a[queryHits(hits_ab)[k]]
+      ex_b <- internal_b[subjectHits(hits_ab)[k]]
+      same_start <- start(ex_a) == start(ex_b)
+      same_end   <- end(ex_a)   == end(ex_b)
+      if (same_start && !same_end) {
+        events <- c(events, if (strand == "+") "AAS" else "ADS")
+      } else if (!same_start && same_end) {
+        events <- c(events, if (strand == "+") "ADS" else "AAS")
+      } else if (!same_start && !same_end) {
+        events <- c(events, "complex")
+      }
+    }
+  }
+
+  # IR: an intron of one isoform fully covered by an exon of the other
+  introns_a <- gaps(exons_a, start = min(start(exons_a)), end = max(end(exons_a)))
+  introns_a <- introns_a[as.character(strand(introns_a)) == strand]
+  introns_b <- gaps(exons_b, start = min(start(exons_b)), end = max(end(exons_b)))
+  introns_b <- introns_b[as.character(strand(introns_b)) == strand]
+  ir_ab <- countOverlaps(introns_a, exons_b, type = "within") > 0
+  ir_ba <- countOverlaps(introns_b, exons_a, type = "within") > 0
+  if (any(ir_ab) || any(ir_ba)) events <- c(events, "IR")
+
+  events <- unique(events)
+  if (length(events) == 0) {
+    return(tibble(as_type = "complex", n_events = 0L, sub_events = NA_character_,
+                  confidence = "low"))
+  }
+
+  primary <- if ("MXE" %in% events && "AFE" %in% events) {
+    "MXE-AFE"
+  } else if ("MXE" %in% events && "ALE" %in% events) {
+    "MXE-ALE"
+  } else if ("MXE" %in% events) {
+    "MXE"
+  } else if (length(events) == 1) {
+    events
+  } else if (all(events %in% c("AFE", "ALE"))) {
+    paste(events, collapse = "+")
+  } else if ("AFE" %in% events && length(events) <= 2) {
+    "AFE"
+  } else if ("ALE" %in% events && length(events) <= 2) {
+    "ALE"
+  } else if ("ES" %in% events && length(events) <= 2) {
+    "ES"
+  } else {
+    "complex"
+  }
+  tibble(as_type = primary, n_events = length(events),
+         sub_events = paste(events, collapse = ";"),
+         confidence = if (length(events) == 1) "high" else "medium")
+}
+```
+
+# 4. Apply the three classifiers to the CAD clusters
+
+Method A runs on each risk/nonrisk junction pair, Method B on the complete
+junction set of each CAD cluster, and Method C on each (risk, nonrisk) long-read
+isoform pair. Strand is taken from the cluster identifier (`clu_NNNN_+/-`).
+
+```{r apply_classifiers}
+# ---- Method A ----
+pairs_with_strand <- pairs_df %>% mutate(strand = str_sub(cluster_bed, -1, -1))
+risk_coords <- parse_junction_key(pairs_with_strand$risk_junction)
+names(risk_coords) <- c("risk_chr", "risk_start", "risk_end")
+nonrisk_coords <- parse_junction_key(pairs_with_strand$nonrisk_junction)
+names(nonrisk_coords) <- c("nonrisk_chr", "nonrisk_start", "nonrisk_end")
+pairs_coords <- bind_cols(pairs_with_strand, risk_coords, nonrisk_coords)
+
+method_a <- pairs_coords %>%
+  rowwise() %>%
+  mutate(cls = list(classify_junction_pair(
+    risk_start, risk_end, nonrisk_start, nonrisk_end, strand,
+    first_exon_gr = gencode_first_exon, last_exon_gr = gencode_last_exon,
+    internal_exon_gr = internal_exon_gr, chr = risk_chr))) %>%
+  ungroup() %>%
+  unnest(cls) %>%
+  as.data.frame()
+# Base-R renaming avoids a dplyr/data.table name-resolution conflict on these columns
+names(method_a)[names(method_a) == "as_type"]    <- "as_type_A"
+names(method_a)[names(method_a) == "confidence"] <- "confidence_A"
+names(method_a)[names(method_a) == "sub_event"]  <- "sub_event_A"
+names(method_a)[names(method_a) == "reason"]     <- "reason_A"
+method_a <- as_tibble(method_a)
+
+# ---- Method B ----
+sibs_for_topo <- siblings %>%
+  mutate(strand = str_sub(cluster_bed, -1, -1)) %>%
+  select(cluster_bed, junction_key, chrom = chrom, start, end, strand) %>%
+  distinct()
+method_b <- sibs_for_topo %>%
+  group_by(cluster_bed) %>%
+  group_modify(~ classify_cluster_topology(.x, first_exon_gr = gencode_first_exon,
+                                           last_exon_gr = gencode_last_exon,
+                                           internal_exon_gr = internal_exon_gr)) %>%
+  ungroup() %>%
+  as.data.frame()
+names(method_b)[names(method_b) == "as_type"]     <- "as_type_B"
+names(method_b)[names(method_b) == "n_junctions"] <- "n_junctions_B"
+names(method_b)[names(method_b) == "confidence"]  <- "confidence_B"
+names(method_b)[names(method_b) == "reason"]      <- "reason_B"
+method_b <- as_tibble(method_b)
+
+# ---- Method C ----
+iso_pairs_clean <- iso_pairs %>%
+  filter(!is.na(risk_pb), !is.na(nonrisk_pb), risk_pb != nonrisk_pb) %>%
+  distinct(gene_name, risk_pb, nonrisk_pb, .keep_all = TRUE)
+method_c_results <- vector("list", nrow(iso_pairs_clean))
+for (i in seq_len(nrow(iso_pairs_clean))) {
+  ex_r  <- smc_exons_by_pb[[iso_pairs_clean$risk_pb[i]]]
+  ex_nr <- smc_exons_by_pb[[iso_pairs_clean$nonrisk_pb[i]]]
+  method_c_results[[i]] <- if (is.null(ex_r) || is.null(ex_nr)) {
+    tibble(as_type = NA_character_, n_events = 0L, sub_events = NA_character_,
+           confidence = "missing")
+  } else {
+    classify_transcript_pair(ex_r, ex_nr)
+  }
+}
+method_c <- bind_cols(iso_pairs_clean, bind_rows(method_c_results)) %>% as.data.frame()
+names(method_c)[names(method_c) == "as_type"]    <- "as_type_C"
+names(method_c)[names(method_c) == "n_events"]   <- "n_events_C"
+names(method_c)[names(method_c) == "sub_events"] <- "sub_events_C"
+names(method_c)[names(method_c) == "confidence"] <- "confidence_C"
+method_c <- as_tibble(method_c)
+stopifnot("Method C table must carry cluster_bed" = any(!is.na(method_c$cluster_bed)))
+
+message("Method A: "); print(table(method_a$as_type_A, useNA = "ifany"))
+message("Method B: "); print(table(method_b$as_type_B, useNA = "ifany"))
+message("Method C: "); print(table(method_c$as_type_C, useNA = "ifany"))
+```
+
+# 5. Consensus AS class per cluster
+
+Method C is collapsed from isoform pairs to clusters by the modal call. The
+consensus takes Method C when it makes a positive call, because the transcript
+pair carries the most complete structural evidence; "complex" and "no_event"
+from Method C are declinations rather than classifications and therefore do not
+override a Method B call. Method B is used next, and Method A is the fallback.
+
+```{r consensus}
+method_c_per_cluster <- method_c %>%
+  filter(!is.na(cluster_bed)) %>%
+  group_by(cluster_bed) %>%
+  summarise(
+    as_type_C_modal = {
+      tt <- sort(table(as_type_C), decreasing = TRUE)
+      if (length(tt) == 0) NA_character_ else names(tt)[1]
+    },
+    as_type_C_all = paste(unique(as_type_C[!is.na(as_type_C)]), collapse = ";"),
+    n_iso_pairs   = n(),
+    .groups = "drop")
+
+consensus <- method_a %>%
+  select(cluster_bed, gene_name, risk_junction, nonrisk_junction, slope, direction,
+         complement_source, as_type_A, confidence_A, reason_A) %>%
+  left_join(method_b %>% select(cluster_bed, as_type_B, n_junctions_B, confidence_B, reason_B),
+            by = "cluster_bed") %>%
+  left_join(method_c_per_cluster, by = "cluster_bed") %>%
+  mutate(
+    C_usable = !is.na(as_type_C_modal) & !as_type_C_modal %in% c("complex", "no_event"),
+    consensus_as_type = case_when(C_usable          ~ as_type_C_modal,
+                                  !is.na(as_type_B) ~ as_type_B,
+                                  TRUE              ~ as_type_A),
+    consensus_source  = case_when(C_usable          ~ "C_transcript",
+                                  !is.na(as_type_B) ~ "B_topology",
+                                  TRUE              ~ "A_pair")) %>%
+  select(-C_usable)
+
+message("Consensus AS class per cluster:"); print(table(consensus$consensus_as_type, useNA = "ifany"))
+print(table(consensus$consensus_source, useNA = "ifany"))
+```
+
+# 6. CAD versus non-CAD AS class distribution (Extended Data Fig. 5a)
+
+The background comparison uses Method B for both groups, because Method B is the
+only classifier that can be applied identically to CAD clusters and to the
+thousands of non-CAD VSMC sQTL clusters (which have no risk/nonrisk pairing and
+no paired isoforms). The χ² test on the overall distribution and the per-class
+Fisher tests are recomputed from the exported table in script 10; they are
+printed here for the log.
+
+```{r cad_vs_noncad}
+noncad_cluster_set <- str_extract(unique(general_sqtls$cluster_id), "clu_\\d+_[+-]")
+noncad_cluster_set <- unique(noncad_cluster_set[!is.na(noncad_cluster_set)])
+
+noncad_topo_input <- bed_all %>%
+  filter(cluster_bed %in% noncad_cluster_set) %>%
+  select(cluster_bed, junction_key, chrom, start, end, strand) %>%
+  distinct()
+method_b_noncad <- noncad_topo_input %>%
+  group_by(cluster_bed) %>%
+  group_modify(~ classify_cluster_topology(.x, first_exon_gr = gencode_first_exon,
+                                           last_exon_gr = gencode_last_exon,
+                                           internal_exon_gr = internal_exon_gr)) %>%
+  ungroup() %>%
+  as.data.frame()
+names(method_b_noncad)[names(method_b_noncad) == "as_type"]     <- "as_type_B"
+names(method_b_noncad)[names(method_b_noncad) == "n_junctions"] <- "n_junctions_B"
+names(method_b_noncad)[names(method_b_noncad) == "confidence"]  <- "confidence_B"
+names(method_b_noncad)[names(method_b_noncad) == "reason"]      <- "reason_B"
+method_b_noncad <- as_tibble(method_b_noncad)
+
+combined_dist <- bind_rows(
+  method_b        %>% mutate(group = "CAD sQTL")           %>% select(cluster_bed, as_type_B, group),
+  method_b_noncad %>% mutate(group = "Non-CAD\nSMC sQTL")  %>% select(cluster_bed, as_type_B, group)
+) %>%
+  filter(!is.na(as_type_B))
+
+dist_summary <- combined_dist %>%
+  count(group, as_type_B) %>%
+  group_by(group) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+# AS classes ordered by their frequency among CAD clusters
+as_levels <- combined_dist %>% filter(group == "CAD sQTL") %>% count(as_type_B, sort = TRUE) %>%
+  pull(as_type_B)
+dist_summary$as_type_B <- factor(dist_summary$as_type_B, levels = as_levels)
+
+cad_n    <- sum(combined_dist$group == "CAD sQTL")
+noncad_n <- sum(combined_dist$group != "CAD sQTL")
+message(sprintf("clusters classified: CAD = %d, non-CAD = %d", cad_n, noncad_n))
+
+per_type_fisher <- map_dfr(unique(combined_dist$as_type_B), function(t) {
+  cad_y    <- sum(combined_dist$group == "CAD sQTL" & combined_dist$as_type_B == t)
+  noncad_y <- sum(combined_dist$group != "CAD sQTL" & combined_dist$as_type_B == t)
+  ft <- fisher.test(matrix(c(cad_y, cad_n - cad_y, noncad_y, noncad_n - noncad_y),
+                           nrow = 2, byrow = TRUE))
+  tibble(as_type = t, cad_pct = round(cad_y / cad_n * 100, 1),
+         noncad_pct = round(noncad_y / noncad_n * 100, 1),
+         odds_ratio = unname(ft$estimate), p = ft$p.value)
+}) %>%
+  mutate(p_adj = p.adjust(p, method = "BH"), sig = sig_label(p_adj)) %>%
+  arrange(p)
+print(per_type_fisher)
+
+chi_test <- suppressWarnings(chisq.test(xtabs(n ~ group + as_type_B, data = dist_summary)))
+message(sprintf("chi-square on the overall distribution: X^2 = %.2f, df = %d, P = %.3g",
+                chi_test$statistic, chi_test$parameter, chi_test$p.value))
+```
+
+# 7. Predicted protein consequence per junction pair (Fig. 4e)
+
+Each risk/nonrisk junction is flagged as coding using the shared script-02
+label, for CAD junctions from the CAD classification and for background
+junctions from the non-CAD classification. Each pair is then assigned one
+protein-consequence category in priority order: NMD candidate when either paired
+isoform is predicted NMD, then exon skipping/inclusion, alternative splice site,
+or alternative first/last exon when the event falls within an ORF, then a
+noncoding splice event when neither junction is coding, and complex/other
+otherwise. Script 10 collapses these pair-level calls to one dominant call per
+long-read-captured junction.
+
+```{r protein_effects}
+cad_junction_status <- junction_annot %>%
+  select(junction_key, in_cds_isoform, in_lr, coding_class)
+
+noncad_unified_coding <- read_csv(OUT_NONCAD_JUNCTION_CODING, show_col_types = FALSE)
+stopifnot("coding_class column expected in the non-CAD coding classification" =
+            "coding_class" %in% names(noncad_unified_coding))
+noncad_junction_status <- noncad_unified_coding %>%
+  mutate(in_cds_isoform = coding_class %in% CODING_CLASS_KEEP) %>%
+  select(junction_key, in_cds_isoform)
+
+master_junction_annot <- bind_rows(
+  cad_junction_status    %>% transmute(junction_key, in_cds = in_cds_isoform),
+  noncad_junction_status %>% transmute(junction_key, in_cds = in_cds_isoform %in% TRUE)
+) %>%
+  distinct(junction_key, .keep_all = TRUE)
+
+master_risk_df <- as.data.frame(master_junction_annot)
+colnames(master_risk_df) <- c("risk_junction", "risk_in_cds")
+master_nonrisk_df <- as.data.frame(master_junction_annot)
+colnames(master_nonrisk_df) <- c("nonrisk_junction", "nonrisk_in_cds")
+
+method_a_cds <- method_a %>%
+  left_join(as_tibble(master_risk_df),    by = "risk_junction") %>%
+  left_join(as_tibble(master_nonrisk_df), by = "nonrisk_junction") %>%
+  filter(!is.na(as_type_A), as_type_A != "no_event") %>%
+  as_tibble()
+
+# NMD status of the paired isoforms, per cluster
+stopifnot(all(c("risk_nmd", "nonrisk_nmd") %in% colnames(iso_pairs)))
+cluster_nmd <- iso_pairs %>%
+  group_by(cluster_bed) %>%
+  summarise(any_nmd = any((risk_nmd %in% TRUE) | (nonrisk_nmd %in% TRUE)), .groups = "drop")
+
+pair_effects <- method_a_cds %>%
+  left_join(cluster_nmd, by = "cluster_bed") %>%
+  mutate(
+    any_cds = (risk_in_cds %in% TRUE) | (nonrisk_in_cds %in% TRUE),
+    protein_effect = case_when(
+      any_nmd %in% TRUE                        ~ "NMD candidate",
+      as_type_A == "ES"  & any_cds             ~ "ES / inclusion in ORF",
+      as_type_A %in% c("ADS", "AAS") & any_cds ~ "Alt splice site in ORF",
+      as_type_A %in% c("AFE", "ALE") & any_cds ~ "AFE/ALE in ORF",
+      !any_cds                                 ~ "Non-coding splice event",
+      TRUE                                     ~ "Complex / other"))
+
+message("Protein consequence per junction pair:"); print(count(pair_effects, protein_effect))
+```
+
+# 8. Export
+
+```{r export}
+write_excel_csv(consensus, OUT_AS_CONSENSUS)
+write_csv(dist_summary, OUT_AS_DISTRIBUTION)
+write_csv(pair_effects, OUT_PROTEIN_EFFECTS)
+message("written: ", paste(basename(c(OUT_AS_CONSENSUS, OUT_AS_DISTRIBUTION, OUT_PROTEIN_EFFECTS)),
+                           collapse = ", "))
+```
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```
