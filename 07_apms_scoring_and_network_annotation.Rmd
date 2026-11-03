@@ -613,8 +613,26 @@ summary_tbl <- recovery %>%
             .groups = "drop")
 print(summary_tbl, width = Inf)
 
-# shared versus isoform-specific preys: prior BioGRID evidence (CAD baits only)
-spec_tbl <- obs %>%
+# Shared versus isoform-specific preys: prior BioGRID evidence (CAD baits only). The
+# primary test uses the same gene-level `in_biogrid` flag as Fig. 5e and Supplementary
+# Table 17 (any physical BioGRID record for the bait gene), so that the count of
+# annotated interactions and the enrichment statistic in the text share one definition.
+# The human AP-MS-restricted reference set used for the recovery analysis above is kept
+# as a sensitivity analysis.
+run_fisher <- function(d, label) {
+  ft <- fisher.test(table(d$class, d$known))
+  d %>% group_by(class) %>%
+    summarise(n = n(), n_known = sum(known), pct_known = 100 * mean(known), .groups = "drop") %>%
+    mutate(analysis = label, odds_ratio = unname(ft$estimate),
+           ci_low = ft$conf.int[1], ci_high = ft$conf.int[2], p = ft$p.value)
+}
+
+spec_biogrid <- edge_bg %>%
+  transmute(gene  = `Gene Name Source`, prey = `Gene Name Target`,
+            class = if_else(specificity == "shared", "shared", "isoform-specific"),
+            known = in_biogrid == "YES")
+
+spec_apms <- obs %>%
   filter(gene != CTRL_GENE) %>%
   mutate(class = if_else(sc == "shared", "shared", "isoform-specific")) %>%
   distinct(gene, prey, class) %>%
@@ -623,17 +641,13 @@ spec_tbl <- obs %>%
   mutate(known = coalesce(known, FALSE))
 flagged <- retained %>% transmute(gene = bait, prey = prey_u)
 
-run_fisher <- function(d, label) {
-  ft <- fisher.test(table(d$class, d$known))
-  d %>% group_by(class) %>%
-    summarise(n = n(), n_known = sum(known), pct_known = 100 * mean(known), .groups = "drop") %>%
-    mutate(analysis = label, odds_ratio = unname(ft$estimate),
-           ci_low = ft$conf.int[1], ci_high = ft$conf.int[2], p = ft$p.value)
-}
 spec_results <- bind_rows(
-  run_fisher(spec_tbl, "all genes"),
-  run_fisher(spec_tbl %>% filter(gene != "RP11-77K12-1"), "excl. CFDP1 (RP11-77K12.1)"),
-  run_fisher(spec_tbl %>% anti_join(flagged, by = c("gene", "prey")), "excl. bead-flagged"))
+  run_fisher(spec_biogrid, "any BioGRID physical record (Fig. 5e definition)"),
+  run_fisher(spec_apms, "human AP-MS records only"),
+  run_fisher(spec_apms %>% filter(gene != "RP11-77K12-1"),
+             "human AP-MS records only, excl. CFDP1 (RP11-77K12.1)"),
+  run_fisher(spec_apms %>% anti_join(flagged, by = c("gene", "prey")),
+             "human AP-MS records only, excl. bead-flagged"))
 print(spec_results, width = Inf)
 
 write_csv(recovery,     file.path(RES_07, "known_partner_recovery_per_gene.csv"))
